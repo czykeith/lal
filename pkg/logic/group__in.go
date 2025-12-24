@@ -366,9 +366,13 @@ func (group *Group) addIn() {
 	}
 
 	group.startPushIfNeeded()
-	group.startHlsIfNeeded()
-	group.startRecordFlvIfNeeded(now)
-	group.startRecordMpegtsIfNeeded(now)
+
+	// 转推模式下不启动存储功能（HLS、录制等），只做数据转发
+	if group.relayProxy == nil || !group.relayProxy.isRelaying {
+		group.startHlsIfNeeded()
+		group.startRecordFlvIfNeeded(now)
+		group.startRecordMpegtsIfNeeded(now)
+	}
 }
 
 // delIn 有pub或pull的输入型session离开时，需要调用该函数

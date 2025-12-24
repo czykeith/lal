@@ -93,6 +93,11 @@ func (group *Group) StartRelay(info base.ApiCtrlStartRelayReq) (string, string, 
 	// 转推模式下，不进行数据落盘，强制设置为空字符串
 	group.pullProxy.debugDumpPacket = ""
 
+	// 转推模式下，停止存储功能（HLS、录制等），只做数据转发
+	group.stopHlsIfNeeded()
+	group.stopRecordFlvIfNeeded()
+	group.stopRecordMpegtsIfNeeded()
+
 	// 调用 pullIfNeeded 启动拉流（不获取锁，因为我们已经持有锁）
 	pullSessionId, err := group.pullIfNeeded()
 	if err != nil {
