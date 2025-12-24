@@ -51,6 +51,20 @@ type ApiCtrlAddIpBlacklistReq struct {
 	DurationSec int    `json:"duration_sec"`
 }
 
+// ApiCtrlStartRelayReq 转推请求
+// 从 RTSP 或 RTMP 拉流，然后转推到 RTMP 或 RTSP
+// 注意：转推模式下，auto_stop_pull_after_no_out_ms 参数会被忽略，始终设置为 -1（不自动停止）
+type ApiCtrlStartRelayReq struct {
+	PullUrl                  string `json:"pull_url"`                       // 拉流地址，支持 rtmp:// 或 rtsp://
+	PushUrl                  string `json:"push_url"`                       // 推流地址，支持 rtmp:// 或 rtsp://
+	StreamName               string `json:"stream_name"`                    // 流名称（可选，如果不提供则从 pull_url 解析）
+	TimeoutMs                int    `json:"timeout_ms"`                     // 拉流和推流的超时时间（毫秒），默认 10000
+	RetryNum                 int    `json:"retry_num"`                      // 拉流和推流的重试次数，-1表示永远重试，大于0表示重试次数，0表示不重试，默认 0
+	AutoStopPullAfterNoOutMs int    `json:"auto_stop_pull_after_no_out_ms"` // 转推模式下此参数会被忽略，始终为 -1（不自动停止）
+	RtspMode                 int    `json:"rtsp_mode"`                      // RTSP 模式，0=TCP，1=UDP，默认 0
+	DebugDumpPacket          string `json:"debug_dump_packet"`              // 转推模式下此参数会被忽略，数据不会落盘，直接转发
+}
+
 // ----- response ------------------------------------------------------------------------------------------------------
 
 const (
@@ -68,6 +82,10 @@ const (
 
 	ErrorCodeStartRelayPullFail = 2001
 	ErrorCodeListenUdpPortFail  = 2002
+	ErrorCodeStartRelayFail     = 2003
+	DespStartRelayFail          = "start relay fail"
+	ErrorCodeStopRelayFail      = 2004
+	DespStopRelayFail           = "stop relay fail"
 )
 
 type ApiRespBasic struct {
@@ -129,4 +147,22 @@ type ApiCtrlStartRtpPubResp struct {
 
 type ApiCtrlAddIpBlacklistResp struct {
 	ApiRespBasic
+}
+
+type ApiCtrlStartRelayResp struct {
+	ApiRespBasic
+	Data struct {
+		StreamName    string `json:"stream_name"`
+		PullSessionId string `json:"pull_session_id"`
+		PushSessionId string `json:"push_session_id"`
+	} `json:"data"`
+}
+
+type ApiCtrlStopRelayResp struct {
+	ApiRespBasic
+	Data struct {
+		StreamName    string `json:"stream_name"`
+		PullSessionId string `json:"pull_session_id"`
+		PushSessionId string `json:"push_session_id"`
+	} `json:"data"`
 }

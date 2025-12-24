@@ -101,6 +101,8 @@ type Group struct {
 	rtmp2MpegtsRemuxer  *remux.Rtmp2MpegtsRemuxer
 	// pull
 	pullProxy *pullProxy
+	// relay
+	relayProxy *relayProxy
 	// rtmp pub使用 TODO(chef): [doc] 更新这个注释，是共同使用 202210
 	dummyAudioFilter *remux.DummyAudioFilter
 	// ps pub使用

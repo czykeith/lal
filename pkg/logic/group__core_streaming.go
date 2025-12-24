@@ -306,7 +306,9 @@ func (group *Group) broadcastByRtmpMsg(msg base.RtmpMsg) {
 	}
 
 	// TODO chef: rtmp sub, rtmp push, httpflv sub 的发送逻辑都差不多，可以考虑封装一下
-	if group.pushEnable {
+	// 转推功能：如果有 url2PushProxy 中的推流 session，即使 pushEnable 为 false 也要转发数据
+	// 因为转推功能不依赖于配置文件中的 RelayPushConfig.Enable
+	if group.pushEnable || (group.url2PushProxy != nil && len(group.url2PushProxy) > 0) {
 		for _, v := range group.url2PushProxy {
 			if v.pushSession == nil {
 				continue

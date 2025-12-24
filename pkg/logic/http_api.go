@@ -63,6 +63,8 @@ func (h *HttpApiServer) RunLoop() error {
 	mux.HandleFunc("/api/ctrl/kick_session", h.ctrlKickSessionHandler)
 	mux.HandleFunc("/api/ctrl/start_rtp_pub", h.ctrlStartRtpPubHandler)
 	mux.HandleFunc("/api/ctrl/add_ip_blacklist", h.ctrlAddIpBlacklistHandler)
+	mux.HandleFunc("/api/ctrl/start_relay", h.ctrlStartRelayHandler)
+	mux.HandleFunc("/api/ctrl/stop_relay", h.ctrlStopRelayHandler)
 	// 所有没有注册路由的走下面这个处理函数
 	mux.HandleFunc("/", h.notFoundHandler)
 
@@ -233,6 +235,57 @@ func (h *HttpApiServer) ctrlAddIpBlacklistHandler(w http.ResponseWriter, req *ht
 	Log.Infof("http api add ip blacklist. req info=%+v", info)
 
 	resp := h.sm.CtrlAddIpBlacklist(info)
+	feedback(resp, w)
+}
+
+func (h *HttpApiServer) ctrlStartRelayHandler(w http.ResponseWriter, req *http.Request) {
+	var v base.ApiCtrlStartRelayResp
+	var info base.ApiCtrlStartRelayReq
+
+	j, err := unmarshalRequestJsonBody(req, &info, "pull_url", "push_url")
+	if err != nil {
+		Log.Warnf("http api start relay error. err=%+v", err)
+		v.ErrorCode = base.ErrorCodeParamMissing
+		v.Desp = base.DespParamMissing
+		feedback(v, w)
+		return
+	}
+
+	// 设置默认值
+	if !j.Exist("timeout_ms") {
+		info.TimeoutMs = DefaultApiCtrlStartRelayPullReqPullTimeoutMs
+	}
+	if !j.Exist("retry_num") {
+		info.RetryNum = base.PullRetryNumNever
+	}
+	if !j.Exist("auto_stop_pull_after_no_out_ms") {
+		info.AutoStopPullAfterNoOutMs = base.AutoStopPullAfterNoOutMsNever
+	}
+	if !j.Exist("rtsp_mode") {
+		info.RtspMode = base.RtspModeTcp
+	}
+
+	Log.Infof("http api start relay. req info=%+v", info)
+
+	resp := h.sm.CtrlStartRelay(info)
+	feedback(resp, w)
+}
+
+func (h *HttpApiServer) ctrlStopRelayHandler(w http.ResponseWriter, req *http.Request) {
+	var v base.ApiCtrlStopRelayResp
+
+	q := req.URL.Query()
+	streamName := q.Get("stream_name")
+	if streamName == "" {
+		v.ErrorCode = base.ErrorCodeParamMissing
+		v.Desp = base.DespParamMissing
+		feedback(v, w)
+		return
+	}
+
+	Log.Infof("http api stop relay. stream_name=%s", streamName)
+
+	resp := h.sm.CtrlStopRelay(streamName)
 	feedback(resp, w)
 }
 

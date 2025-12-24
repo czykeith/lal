@@ -125,6 +125,150 @@ $ffplay http://127.0.0.1:8080/hls/test110.m3u8
 $ffplay http://127.0.0.1:8080/live/test110.ts
 ```
 
+## HTTP API
+
+LAL 提供了丰富的 HTTP API 接口，用于控制和管理流媒体服务。默认 API 地址为 `http://127.0.0.1:8083`（可在配置文件中修改）。
+
+### 转推 API
+
+转推功能支持从 RTSP 或 RTMP 拉流，然后转推到 RTMP 或 RTSP。
+
+#### 启动转推
+
+**接口地址：** `POST /api/ctrl/start_relay`
+
+**请求参数：**
+
+```json
+{
+  "pull_url": "rtsp://example.com/stream",           // 拉流地址，支持 rtmp:// 或 rtsp://
+  "push_url": "rtmp://example.com/live/stream",     // 推流地址，支持 rtmp:// 或 rtsp://
+  "stream_name": "test_stream",                      // 流名称（可选，如果不提供则从 pull_url 解析）
+  "timeout_ms": 10000,                               // 拉流和推流的超时时间（毫秒），默认 10000
+  "retry_num": -1,                                   // 拉流和推流的重试次数，-1表示永远重试，大于0表示重试次数，0表示不重试，默认 0
+  "rtsp_mode": 0                                     // RTSP 模式，0=TCP，1=UDP，默认 0
+}
+```
+
+**注意：** 
+- 转推模式下，`auto_stop_pull_after_no_out_ms` 参数会被忽略，系统会自动将其设置为 -1（不自动停止拉流），因为转推的目的是将流推送到远程服务器，而不是为了本地观看。
+- `timeout_ms` 和 `retry_num` 参数同时应用于拉流和推流操作。
+- 转推模式下，数据不会落盘，直接转发到目标服务器，以提高性能和减少磁盘I/O。
+
+**响应示例：**
+
+```json
+{
+  "error_code": 0,
+  "desp": "succ",
+  "data": {
+    "stream_name": "test_stream",
+    "pull_session_id": "RTMPPULL...",
+    "push_session_id": "RTMPPUSH..."
+  }
+}
+```
+
+**使用示例：**
+
+```bash
+# 使用 curl 启动转推
+curl -X POST http://127.0.0.1:8083/api/ctrl/start_relay \
+  -H "Content-Type: application/json" \
+  -d '{
+    "pull_url": "rtsp://example.com/stream",
+    "push_url": "rtmp://example.com/live/stream",
+    "stream_name": "test_stream",
+    "timeout_ms": 10000,
+    "retry_num": -1
+  }'
+```
+
+#### 停止转推
+
+**接口地址：** `GET /api/ctrl/stop_relay?stream_name=test_stream`
+
+**请求参数：**
+- `stream_name`: 流名称（必填）
+
+**响应示例：**
+
+```json
+{
+  "error_code": 0,
+  "desp": "succ",
+  "data": {
+    "stream_name": "test_stream",
+    "pull_session_id": "RTMPPULL...",
+    "push_session_id": "RTMPPUSH..."
+  }
+}
+```
+
+**使用示例：**
+
+```bash
+# 使用 curl 停止转推
+curl "http://127.0.0.1:8083/api/ctrl/stop_relay?stream_name=test_stream"
+```
+
+### 其他常用 API
+
+#### 查询所有流信息
+
+**接口地址：** `GET /api/stat/all_group`
+
+**使用示例：**
+
+```bash
+curl http://127.0.0.1:8083/api/stat/all_group
+```
+
+#### 查询指定流信息
+
+**接口地址：** `GET /api/stat/group?stream_name=test_stream`
+
+**使用示例：**
+
+```bash
+curl "http://127.0.0.1:8083/api/stat/group?stream_name=test_stream"
+```
+
+#### 启动拉流
+
+**接口地址：** `POST /api/ctrl/start_relay_pull`
+
+**请求参数：**
+
+```json
+{
+  "url": "rtmp://example.com/live/stream",
+  "stream_name": "test_stream",
+  "pull_timeout_ms": 10000,
+  "pull_retry_num": -1,
+  "rtsp_mode": 0
+}
+```
+
+#### 停止拉流
+
+**接口地址：** `GET /api/ctrl/stop_relay_pull?stream_name=test_stream`
+
+#### 踢出会话
+
+**接口地址：** `POST /api/ctrl/kick_session`
+
+**请求参数：**
+
+```json
+{
+  "stream_name": "test_stream",
+  "session_id": "RTMPPUBSUB..."
+}
+```
+
+更多 API 文档请参考：https://pengrl.com/lal/#/HTTPAPI
+
 ## More than a server, act as package and client
 
 Besides a live stream broadcast server which named `lalserver` precisely, `project lal` even provides many other applications, e.g. push/pull/remux stream clients, bench tools, examples. Each subdirectory under the `./app/demo` directory represents a tiny demo.

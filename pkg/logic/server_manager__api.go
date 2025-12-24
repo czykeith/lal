@@ -9,6 +9,7 @@
 package logic
 
 import (
+	"fmt"
 	"math"
 	"strings"
 
@@ -164,5 +165,72 @@ func (sm *ServerManager) CtrlStartRtpPub(info base.ApiCtrlStartRtpPubReq) (ret b
 	g := sm.getOrCreateGroup("", info.StreamName)
 	ret = g.StartRtpPub(info)
 
+	return
+}
+
+// CtrlStartRelay 启动转推
+func (sm *ServerManager) CtrlStartRelay(info base.ApiCtrlStartRelayReq) (ret base.ApiCtrlStartRelayResp) {
+	sm.mutex.Lock()
+	defer sm.mutex.Unlock()
+
+	// 解析 stream_name
+	streamName := info.StreamName
+	if streamName == "" {
+		ctx, err := base.ParseUrl(info.PullUrl, -1)
+		if err != nil {
+			ret.ErrorCode = base.ErrorCodeStartRelayFail
+			ret.Desp = fmt.Sprintf("parse pull url failed: %v", err)
+			return
+		}
+		streamName = ctx.LastItemOfPath
+	}
+
+	// 创建或获取 Group
+	g := sm.getOrCreateGroup("", streamName)
+
+	// 启动转推
+	pullSessionId, pushSessionId, err := g.StartRelay(info)
+	if err != nil {
+		ret.ErrorCode = base.ErrorCodeStartRelayFail
+		ret.Desp = err.Error()
+		return
+	}
+
+	ret.ErrorCode = base.ErrorCodeSucc
+	ret.Desp = base.DespSucc
+	ret.Data.StreamName = streamName
+	ret.Data.PullSessionId = pullSessionId
+	ret.Data.PushSessionId = pushSessionId
+	return
+}
+
+// CtrlStopRelay 停止转推
+func (sm *ServerManager) CtrlStopRelay(streamName string) (ret base.ApiCtrlStopRelayResp) {
+	sm.mutex.Lock()
+	defer sm.mutex.Unlock()
+
+	g := sm.getGroup("", streamName)
+	if g == nil {
+		ret.ErrorCode = base.ErrorCodeGroupNotFound
+		ret.Desp = base.DespGroupNotFound
+		return
+	}
+
+	pullSessionId, pushSessionId := g.StopRelay()
+	if pullSessionId == "" && pushSessionId == "" {
+		ret.ErrorCode = base.ErrorCodeStopRelayFail
+		ret.Desp = base.DespStopRelayFail
+		return
+	}
+
+	ret.ErrorCode = base.ErrorCodeSucc
+	ret.Desp = base.DespSucc
+	ret.Data.StreamName = streamName
+	ret.Data.PullSessionId = pullSessionId
+	ret.Data.PushSessionId = pushSessionId
+	ret.Desp = base.DespSucc
+	ret.Data.StreamName = streamName
+	ret.Data.PullSessionId = pullSessionId
+	ret.Data.PushSessionId = pushSessionId
 	return
 }
