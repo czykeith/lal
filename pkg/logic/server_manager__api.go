@@ -9,9 +9,11 @@
 package logic
 
 import (
+	"math"
+	"strings"
+
 	"github.com/q191201771/lal/pkg/base"
 	"github.com/q191201771/naza/pkg/bininfo"
-	"math"
 )
 
 // server_manager__api.go
@@ -125,6 +127,14 @@ func (sm *ServerManager) CtrlKickSession(info base.ApiCtrlKickSessionReq) (ret b
 	}
 
 	if !g.KickSession(info.SessionId) {
+		// 如果是 HLS session，尝试在 ServerHandler 中查找并关闭
+		if strings.HasPrefix(info.SessionId, base.UkPreHlsSubSession) && sm.hlsServerHandler != nil {
+			if sm.hlsServerHandler.CloseSubSessionByUniqueKey(info.SessionId) {
+				ret.ErrorCode = base.ErrorCodeSucc
+				ret.Desp = base.DespSucc
+				return
+			}
+		}
 		ret.ErrorCode = base.ErrorCodeSessionNotFound
 		ret.Desp = base.DespSessionNotFound
 		return

@@ -383,9 +383,11 @@ func (group *Group) KickSession(sessionId string) bool {
 		for s := range group.hlsSubSessionSet {
 			if s.UniqueKey() == sessionId {
 				s.Dispose()
+				Log.Infof("[%s] kick hls session success. session id=%s", group.UniqueKey, sessionId)
 				return true
 			}
 		}
+		Log.Warnf("[%s] kick hls session failed, session not found in hlsSubSessionSet. session id=%s, set size=%d", group.UniqueKey, sessionId, len(group.hlsSubSessionSet))
 	} else {
 		Log.Errorf("[%s] kick session while session id format invalid. %s", group.UniqueKey, sessionId)
 	}

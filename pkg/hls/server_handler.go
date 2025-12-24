@@ -237,6 +237,24 @@ func (s *ServerHandler) isSubSessionModeEnable() bool {
 	return s.subSessionHashKey != ""
 }
 
+// CloseSubSessionByUniqueKey 通过 UniqueKey 关闭 SubSession
+// 用于 kick_session API
+func (s *ServerHandler) CloseSubSessionByUniqueKey(uniqueKey string) bool {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	// 遍历所有 session，查找匹配的 UniqueKey
+	for sessionIdHash, session := range s.sessionMap {
+		if session.UniqueKey() == uniqueKey {
+			delete(s.sessionMap, sessionIdHash)
+			session.Dispose()
+			s.observer.OnDelHlsSubSession(session)
+			return true
+		}
+	}
+	return false
+}
+
 func (s *ServerHandler) runLoop() {
 	// TODO(chef): [refactor] 也许可以弄到group中管理超时，和其他协议的session管理方式保持一致 202211
 	ticker := time.NewTicker(1 * time.Second)
