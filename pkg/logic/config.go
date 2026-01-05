@@ -48,6 +48,7 @@ type Config struct {
 	PprofConfig      PprofConfig      `json:"pprof"`
 	LogConfig        nazalog.Option   `json:"log"`
 	DebugConfig      DebugConfig      `json:"debug"`
+	Gb28181Config    Gb28181Config    `json:"gb28181"`
 }
 
 type RtmpConfig struct {
@@ -165,6 +166,17 @@ type DebugConfig struct {
 	LogGroupIntervalSec       int `json:"log_group_interval_sec"`
 	LogGroupMaxGroupNum       int `json:"log_group_max_group_num"`
 	LogGroupMaxSubNumPerGroup int `json:"log_group_max_sub_num_per_group"`
+}
+
+type Gb28181Config struct {
+	Enable         bool   `json:"enable"`
+	LocalSipId     string `json:"local_sip_id"`     // 本地SIP ID（20位国标编码）
+	LocalSipIp     string `json:"local_sip_ip"`     // 本地SIP IP地址
+	LocalSipPort   int    `json:"local_sip_port"`   // 本地SIP端口（默认5060）
+	LocalSipDomain string `json:"local_sip_domain"` // 本地SIP域（可选，默认使用local_sip_id）
+	Username       string `json:"username"`         // 认证用户名（可选）
+	Password       string `json:"password"`         // 认证密码（可选）
+	Expires        int    `json:"expires"`          // 注册过期时间（秒，默认3600）
 }
 
 type CommonHttpServerConfig struct {

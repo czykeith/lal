@@ -21,6 +21,7 @@ import (
 	"github.com/q191201771/naza/pkg/taskpool"
 
 	"github.com/q191201771/lal/pkg/base"
+	"github.com/q191201771/lal/pkg/gb28181"
 	"github.com/q191201771/lal/pkg/hls"
 	"github.com/q191201771/lal/pkg/httpflv"
 	"github.com/q191201771/lal/pkg/httpts"
@@ -46,6 +47,7 @@ type ServerManager struct {
 	httpApiServer *HttpApiServer
 	pprofServer   *http.Server
 	wsrtspServer  *rtsp.WebsocketServer
+	gb28181Server *gb28181.Gb28181Server
 	exitChan      chan struct{}
 
 	mutex        sync.Mutex
@@ -129,6 +131,28 @@ Doc: %s
 	}
 	if sm.config.HttpApiConfig.Enable {
 		sm.httpApiServer = NewHttpApiServer(sm.config.HttpApiConfig.Addr, sm)
+	}
+
+	if sm.config.Gb28181Config.Enable {
+		gb28181Config := &gb28181.ServerConfig{
+			LocalSipId:     sm.config.Gb28181Config.LocalSipId,
+			LocalSipIp:     sm.config.Gb28181Config.LocalSipIp,
+			LocalSipPort:   sm.config.Gb28181Config.LocalSipPort,
+			LocalSipDomain: sm.config.Gb28181Config.LocalSipDomain,
+			Username:       sm.config.Gb28181Config.Username,
+			Password:       sm.config.Gb28181Config.Password,
+			Expires:        sm.config.Gb28181Config.Expires,
+		}
+		if gb28181Config.LocalSipPort == 0 {
+			gb28181Config.LocalSipPort = 5060
+		}
+		sm.gb28181Server = gb28181.NewGb28181Server(gb28181Config)
+		sm.gb28181Server.SetOnInvite(func(deviceId, channelId, streamName string, port int, isTcp bool) error {
+			return sm.onGb28181Invite(deviceId, channelId, streamName, port, isTcp)
+		})
+		sm.gb28181Server.SetOnBye(func(deviceId, channelId, streamName string) error {
+			return sm.onGb28181Bye(deviceId, channelId, streamName)
+		})
 	}
 
 	if sm.config.PprofConfig.Enable {
@@ -276,6 +300,17 @@ func (sm *ServerManager) RunLoop() error {
 		}()
 	}
 
+	if sm.gb28181Server != nil {
+		if err := sm.gb28181Server.Listen(); err != nil {
+			return err
+		}
+		go func() {
+			if err := sm.gb28181Server.RunLoop(); err != nil {
+				Log.Error(err)
+			}
+		}()
+	}
+
 	uis := uint32(sm.config.HttpNotifyConfig.UpdateIntervalSec)
 	var updateInfo base.UpdateInfo
 	updateInfo.Groups = sm.StatAllGroup()
@@ -352,6 +387,10 @@ func (sm *ServerManager) Dispose() {
 
 	if sm.rtspsServer != nil {
 		sm.rtspsServer.Dispose()
+	}
+
+	if sm.gb28181Server != nil {
+		sm.gb28181Server.Dispose()
 	}
 
 	if sm.httpServerManager != nil {

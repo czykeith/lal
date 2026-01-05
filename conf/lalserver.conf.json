@@ -128,5 +128,15 @@
     "log_group_interval_sec": 30,
     "log_group_max_group_num": 10,
     "log_group_max_sub_num_per_group": 10
+  },
+"gb28181": {
+    "enable": true,
+    "local_sip_id": "34020000002000000001",
+    "local_sip_ip": "192.168.110.164",
+    "local_sip_port": 5060,
+    "local_sip_domain": "34020000",
+    "username": "",
+    "password": "",
+    "expires": 3600
   }
 }

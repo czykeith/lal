@@ -224,13 +224,189 @@ func (sm *ServerManager) CtrlStopRelay(streamName string) (ret base.ApiCtrlStopR
 	}
 
 	ret.ErrorCode = base.ErrorCodeSucc
-	ret.Desp = base.DespSucc
-	ret.Data.StreamName = streamName
-	ret.Data.PullSessionId = pullSessionId
-	ret.Data.PushSessionId = pushSessionId
+	ret.ErrorCode = base.ErrorCodeSucc
 	ret.Desp = base.DespSucc
 	ret.Data.StreamName = streamName
 	ret.Data.PullSessionId = pullSessionId
 	ret.Data.PushSessionId = pushSessionId
 	return
+}
+
+// CtrlGb28181Invite GB28181拉流
+func (sm *ServerManager) CtrlGb28181Invite(info base.ApiCtrlGb28181InviteReq) (ret base.ApiCtrlGb28181InviteResp) {
+	sm.mutex.Lock()
+	defer sm.mutex.Unlock()
+
+	if sm.gb28181Server == nil {
+		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
+		ret.Desp = "gb28181 server not enabled"
+		return
+	}
+
+	// 生成流名称
+	streamName := info.StreamName
+	if streamName == "" {
+		streamName = fmt.Sprintf("%s_%s", info.DeviceId, info.ChannelId)
+	}
+
+	// 获取或创建Group
+	group := sm.getOrCreateGroup("", streamName)
+
+	// 启动RTP Pub
+	var port int
+	if info.Port > 0 {
+		port = info.Port
+	}
+	isTcp := info.IsTcpFlag == 1
+
+	rtpPubReq := base.ApiCtrlStartRtpPubReq{
+		StreamName: streamName,
+		Port:       port,
+		TimeoutMs:  10000,
+		IsTcpFlag:  info.IsTcpFlag,
+	}
+
+	rtpPubResp := group.StartRtpPub(rtpPubReq)
+	if rtpPubResp.ErrorCode != base.ErrorCodeSucc {
+		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
+		ret.Desp = rtpPubResp.Desp
+		return
+	}
+
+	// 发送INVITE信令
+	err := sm.gb28181Server.Invite(info.DeviceId, info.ChannelId, streamName, rtpPubResp.Data.Port, isTcp)
+	if err != nil {
+		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
+		ret.Desp = err.Error()
+		// 如果INVITE失败，需要停止RTP Pub
+		group.StopRtpPub(streamName)
+		return
+	}
+
+	ret.ErrorCode = base.ErrorCodeSucc
+	ret.Desp = base.DespSucc
+	ret.Data.StreamName = streamName
+	ret.Data.SessionId = rtpPubResp.Data.SessionId
+	ret.Data.Port = rtpPubResp.Data.Port
+	return
+}
+
+// CtrlGb28181Bye GB28181停止拉流
+func (sm *ServerManager) CtrlGb28181Bye(info base.ApiCtrlGb28181ByeReq) (ret base.ApiCtrlGb28181ByeResp) {
+	sm.mutex.Lock()
+	defer sm.mutex.Unlock()
+
+	if sm.gb28181Server == nil {
+		ret.ErrorCode = base.ErrorCodeGb28181ByeFail
+		ret.Desp = "gb28181 server not enabled"
+		return
+	}
+
+	// 确定流名称
+	streamName := info.StreamName
+	if streamName == "" {
+		streamName = fmt.Sprintf("%s_%s", info.DeviceId, info.ChannelId)
+	}
+
+	// 发送BYE信令
+	err := sm.gb28181Server.Bye(info.DeviceId, info.ChannelId, streamName)
+	if err != nil {
+		ret.ErrorCode = base.ErrorCodeGb28181ByeFail
+		ret.Desp = err.Error()
+		return
+	}
+
+	// 停止RTP Pub
+	group := sm.getGroup("", streamName)
+	if group != nil {
+		sessionId := group.StopRtpPub(streamName)
+		ret.Data.SessionId = sessionId
+	}
+
+	ret.ErrorCode = base.ErrorCodeSucc
+	ret.Desp = base.DespSucc
+	ret.Data.StreamName = streamName
+	return
+}
+
+// StatGb28181Devices 获取GB28181设备列表
+func (sm *ServerManager) StatGb28181Devices() (ret base.ApiStatGb28181DeviceResp) {
+	sm.mutex.Lock()
+	defer sm.mutex.Unlock()
+
+	if sm.gb28181Server == nil {
+		ret.ErrorCode = base.ErrorCodeGb28181DeviceNotFound
+		ret.Desp = "gb28181 server not enabled"
+		return
+	}
+
+	devices := sm.gb28181Server.GetDevices()
+	deviceInfos := make([]base.Gb28181DeviceInfo, 0, len(devices))
+
+	for _, device := range devices {
+		deviceInfo := base.Gb28181DeviceInfo{
+			DeviceId:      device.DeviceId,
+			DeviceName:    device.DeviceName,
+			Status:        device.Status,
+			RegisterTime:  device.RegisterTime.Format("2006-01-02 15:04:05"),
+			KeepaliveTime: device.KeepaliveTime.Format("2006-01-02 15:04:05"),
+			Channels:      make([]base.Gb28181ChannelInfo, 0),
+		}
+
+		// 使用线程安全的方法获取通道列表
+		channels := device.GetChannels()
+		for _, channel := range channels {
+			channelInfo := base.Gb28181ChannelInfo{
+				ChannelId:   channel.ChannelId,
+				ChannelName: channel.ChannelName,
+				Status:      channel.Status,
+				StreamName:  channel.StreamName,
+			}
+			deviceInfo.Channels = append(deviceInfo.Channels, channelInfo)
+		}
+
+		deviceInfos = append(deviceInfos, deviceInfo)
+	}
+
+	ret.ErrorCode = base.ErrorCodeSucc
+	ret.Desp = base.DespSucc
+	ret.Data.Devices = deviceInfos
+	return
+}
+
+// onGb28181Invite GB28181 INVITE回调
+func (sm *ServerManager) onGb28181Invite(deviceId, channelId, streamName string, port int, isTcp bool) error {
+	sm.mutex.Lock()
+	defer sm.mutex.Unlock()
+
+	group := sm.getOrCreateGroup("", streamName)
+	rtpPubReq := base.ApiCtrlStartRtpPubReq{
+		StreamName: streamName,
+		Port:       port,
+		TimeoutMs:  10000,
+		IsTcpFlag:  0,
+	}
+	if isTcp {
+		rtpPubReq.IsTcpFlag = 1
+	}
+
+	rtpPubResp := group.StartRtpPub(rtpPubReq)
+	if rtpPubResp.ErrorCode != base.ErrorCodeSucc {
+		return fmt.Errorf("start rtp pub failed: %s", rtpPubResp.Desp)
+	}
+
+	return nil
+}
+
+// onGb28181Bye GB28181 BYE回调
+func (sm *ServerManager) onGb28181Bye(deviceId, channelId, streamName string) error {
+	sm.mutex.Lock()
+	defer sm.mutex.Unlock()
+
+	group := sm.getGroup("", streamName)
+	if group != nil {
+		group.StopRtpPub(streamName)
+	}
+
+	return nil
 }

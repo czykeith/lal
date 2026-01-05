@@ -159,6 +159,21 @@ func (group *Group) StartRtpPub(req base.ApiCtrlStartRtpPubReq) (ret base.ApiCtr
 	return
 }
 
+func (group *Group) StopRtpPub(streamName string) string {
+	group.mutex.Lock()
+	defer group.mutex.Unlock()
+
+	if group.psPubSession == nil {
+		return ""
+	}
+
+	sessionId := group.psPubSession.UniqueKey()
+	group.psPubSession.Dispose()
+	group.delPsPubSession(group.psPubSession)
+
+	return sessionId
+}
+
 func (group *Group) AddRtmpPullSession(session *rtmp.PullSession) error {
 	group.mutex.Lock()
 	defer group.mutex.Unlock()

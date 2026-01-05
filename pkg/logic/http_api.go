@@ -65,6 +65,11 @@ func (h *HttpApiServer) RunLoop() error {
 	mux.HandleFunc("/api/ctrl/add_ip_blacklist", h.ctrlAddIpBlacklistHandler)
 	mux.HandleFunc("/api/ctrl/start_relay", h.ctrlStartRelayHandler)
 	mux.HandleFunc("/api/ctrl/stop_relay", h.ctrlStopRelayHandler)
+
+	mux.HandleFunc("/api/ctrl/gb28181_invite", h.ctrlGb28181InviteHandler)
+	mux.HandleFunc("/api/ctrl/gb28181_bye", h.ctrlGb28181ByeHandler)
+	mux.HandleFunc("/api/stat/gb28181_devices", h.statGb28181DevicesHandler)
+
 	// 所有没有注册路由的走下面这个处理函数
 	mux.HandleFunc("/", h.notFoundHandler)
 
@@ -286,6 +291,58 @@ func (h *HttpApiServer) ctrlStopRelayHandler(w http.ResponseWriter, req *http.Re
 	Log.Infof("http api stop relay. stream_name=%s", streamName)
 
 	resp := h.sm.CtrlStopRelay(streamName)
+	feedback(resp, w)
+}
+
+func (h *HttpApiServer) ctrlGb28181InviteHandler(w http.ResponseWriter, req *http.Request) {
+	var v base.ApiCtrlGb28181InviteResp
+	var info base.ApiCtrlGb28181InviteReq
+
+	j, err := unmarshalRequestJsonBody(req, &info, "device_id", "channel_id")
+	if err != nil {
+		Log.Warnf("http api gb28181 invite error. err=%+v", err)
+		v.ErrorCode = base.ErrorCodeParamMissing
+		v.Desp = base.DespParamMissing
+		feedback(v, w)
+		return
+	}
+
+	if !j.Exist("port") {
+		info.Port = 0
+	}
+	if !j.Exist("is_tcp_flag") {
+		info.IsTcpFlag = 0
+	}
+
+	Log.Infof("http api gb28181 invite. req info=%+v", info)
+
+	resp := h.sm.CtrlGb28181Invite(info)
+	feedback(resp, w)
+}
+
+func (h *HttpApiServer) ctrlGb28181ByeHandler(w http.ResponseWriter, req *http.Request) {
+	var info base.ApiCtrlGb28181ByeReq
+
+	_, err := unmarshalRequestJsonBody(req, &info, "device_id", "channel_id")
+	if err != nil {
+		Log.Warnf("http api gb28181 bye error. err=%+v", err)
+		var v base.ApiCtrlGb28181ByeResp
+		v.ErrorCode = base.ErrorCodeParamMissing
+		v.Desp = base.DespParamMissing
+		feedback(v, w)
+		return
+	}
+
+	Log.Infof("http api gb28181 bye. req info=%+v", info)
+
+	resp := h.sm.CtrlGb28181Bye(info)
+	feedback(resp, w)
+}
+
+func (h *HttpApiServer) statGb28181DevicesHandler(w http.ResponseWriter, req *http.Request) {
+	Log.Infof("http api stat gb28181 devices")
+
+	resp := h.sm.StatGb28181Devices()
 	feedback(resp, w)
 }
 

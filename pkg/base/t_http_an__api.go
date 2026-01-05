@@ -65,6 +65,22 @@ type ApiCtrlStartRelayReq struct {
 	DebugDumpPacket          string `json:"debug_dump_packet"`              // 转推模式下此参数会被忽略，数据不会落盘，直接转发
 }
 
+// ApiCtrlGb28181InviteReq GB28181拉流请求
+type ApiCtrlGb28181InviteReq struct {
+	DeviceId   string `json:"device_id"`   // 设备ID（国标编码）
+	ChannelId  string `json:"channel_id"`  // 通道ID（国标编码）
+	StreamName string `json:"stream_name"` // 流名称（可选，默认使用 device_id_channel_id）
+	Port       int    `json:"port"`        // RTP接收端口（可选，0表示自动分配）
+	IsTcpFlag  int    `json:"is_tcp_flag"` // 是否使用TCP传输（0=UDP，1=TCP，默认0）
+}
+
+// ApiCtrlGb28181ByeReq GB28181停止拉流请求
+type ApiCtrlGb28181ByeReq struct {
+	DeviceId   string `json:"device_id"`   // 设备ID（国标编码）
+	ChannelId  string `json:"channel_id"`  // 通道ID（国标编码）
+	StreamName string `json:"stream_name"` // 流名称（可选）
+}
+
 // ----- response ------------------------------------------------------------------------------------------------------
 
 const (
@@ -86,6 +102,13 @@ const (
 	DespStartRelayFail          = "start relay fail"
 	ErrorCodeStopRelayFail      = 2004
 	DespStopRelayFail           = "stop relay fail"
+
+	ErrorCodeGb28181DeviceNotFound = 3001
+	DespGb28181DeviceNotFound      = "gb28181 device not found"
+	ErrorCodeGb28181InviteFail     = 3002
+	DespGb28181InviteFail          = "gb28181 invite fail"
+	ErrorCodeGb28181ByeFail        = 3003
+	DespGb28181ByeFail             = "gb28181 bye fail"
 )
 
 type ApiRespBasic struct {
@@ -165,4 +188,44 @@ type ApiCtrlStopRelayResp struct {
 		PullSessionId string `json:"pull_session_id"`
 		PushSessionId string `json:"push_session_id"`
 	} `json:"data"`
+}
+
+type ApiCtrlGb28181InviteResp struct {
+	ApiRespBasic
+	Data struct {
+		StreamName string `json:"stream_name"`
+		SessionId  string `json:"session_id"`
+		Port       int    `json:"port"`
+	} `json:"data"`
+}
+
+type ApiCtrlGb28181ByeResp struct {
+	ApiRespBasic
+	Data struct {
+		StreamName string `json:"stream_name"`
+		SessionId  string `json:"session_id"`
+	} `json:"data"`
+}
+
+type ApiStatGb28181DeviceResp struct {
+	ApiRespBasic
+	Data struct {
+		Devices []Gb28181DeviceInfo `json:"devices"`
+	} `json:"data"`
+}
+
+type Gb28181DeviceInfo struct {
+	DeviceId      string               `json:"device_id"`      // 设备ID
+	DeviceName    string               `json:"device_name"`    // 设备名称
+	Status        string               `json:"status"`         // 状态：online/offline
+	RegisterTime  string               `json:"register_time"`  // 注册时间
+	KeepaliveTime string               `json:"keepalive_time"` // 最后心跳时间
+	Channels      []Gb28181ChannelInfo `json:"channels"`       // 通道列表
+}
+
+type Gb28181ChannelInfo struct {
+	ChannelId   string `json:"channel_id"`   // 通道ID
+	ChannelName string `json:"channel_name"` // 通道名称
+	Status      string `json:"status"`       // 状态：idle/streaming
+	StreamName  string `json:"stream_name"`  // 流名称（如果正在推流）
 }

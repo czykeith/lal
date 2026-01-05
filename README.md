@@ -212,6 +212,189 @@ curl -X POST http://127.0.0.1:8083/api/ctrl/start_relay \
 curl "http://127.0.0.1:8083/api/ctrl/stop_relay?stream_name=test_stream"
 ```
 
+### GB28181 API
+
+GB28181 功能支持通过 SIP 信令协议与国标设备进行通信，实现设备注册、心跳、拉流和停止拉流等操作。
+
+#### 配置说明
+
+首先需要在配置文件中启用 GB28181 功能：
+
+```json
+{
+  "gb28181": {
+    "enable": true,
+    "local_sip_id": "34020000002000000001",      // 本地SIP ID（20位国标编码）
+    "local_sip_ip": "192.168.1.100",            // 本地SIP IP地址
+    "local_sip_port": 5060,                     // 本地SIP端口（默认5060）
+    "local_sip_domain": "34020000002000000001",  // 本地SIP域（可选，默认使用local_sip_id）
+    "username": "",                               // 认证用户名（可选）
+    "password": "",                               // 认证密码（可选）
+    "expires": 3600                               // 注册过期时间（秒，默认3600）
+  }
+}
+```
+
+**注意事项：**
+- `local_sip_id` 必须是20位数字的国标编码
+- `local_sip_ip` 应该设置为服务器实际IP地址，设备会向此地址发送SIP信令
+- `local_sip_port` 默认使用5060，确保防火墙开放此端口（UDP）
+- 如果使用Docker部署，需要映射UDP端口：`-p 5060:5060/udp`
+
+#### 启动GB28181拉流
+
+**接口地址：** `POST /api/ctrl/gb28181_invite`
+
+**请求参数：**
+
+```json
+{
+  "device_id": "34020000001320000001",    // 设备ID（国标编码，必填）
+  "channel_id": "34020000001320000001",   // 通道ID（国标编码，必填）
+  "stream_name": "test_stream",           // 流名称（可选，默认使用 device_id_channel_id）
+  "port": 0,                               // RTP接收端口（可选，0表示自动分配）
+  "is_tcp_flag": 0                         // 是否使用TCP传输（0=UDP，1=TCP，默认0）
+}
+```
+
+**响应示例：**
+
+```json
+{
+  "error_code": 0,
+  "desp": "succ",
+  "data": {
+    "stream_name": "test_stream",
+    "session_id": "PSPUB...",
+    "port": 30000
+  }
+}
+```
+
+**使用示例：**
+
+```bash
+# 使用 curl 启动GB28181拉流
+curl -X POST http://127.0.0.1:8083/api/ctrl/gb28181_invite \
+  -H "Content-Type: application/json" \
+  -d '{
+    "device_id": "34020000001320000001",
+    "channel_id": "34020000001320000001",
+    "stream_name": "test_stream",
+    "port": 0,
+    "is_tcp_flag": 0
+  }'
+```
+
+**工作流程：**
+1. 服务器向设备发送 SIP INVITE 请求
+2. 设备响应 200 OK，开始推送 RTP 流
+3. 服务器在指定端口接收 RTP 流并解析为音视频数据
+4. 流可以通过 RTMP、RTSP、HLS、HTTP-FLV 等协议播放
+
+#### 停止GB28181拉流
+
+**接口地址：** `POST /api/ctrl/gb28181_bye`
+
+**请求参数：**
+
+```json
+{
+  "device_id": "34020000001320000001",    // 设备ID（国标编码，必填）
+  "channel_id": "34020000001320000001",   // 通道ID（国标编码，必填）
+  "stream_name": "test_stream"            // 流名称（可选）
+}
+```
+
+**响应示例：**
+
+```json
+{
+  "error_code": 0,
+  "desp": "succ",
+  "data": {
+    "stream_name": "test_stream",
+    "session_id": "PSPUB..."
+  }
+}
+```
+
+**使用示例：**
+
+```bash
+# 使用 curl 停止GB28181拉流
+curl -X POST http://127.0.0.1:8083/api/ctrl/gb28181_bye \
+  -H "Content-Type: application/json" \
+  -d '{
+    "device_id": "34020000001320000001",
+    "channel_id": "34020000001320000001",
+    "stream_name": "test_stream"
+  }'
+```
+
+#### 查询GB28181设备列表
+
+**接口地址：** `GET /api/stat/gb28181_devices`
+
+**响应示例：**
+
+```json
+{
+  "error_code": 0,
+  "desp": "succ",
+  "data": {
+    "devices": [
+      {
+        "device_id": "34020000001320000001",
+        "device_name": "34020000001320000001",
+        "status": "online",
+        "register_time": "2024-01-01 10:00:00",
+        "keepalive_time": "2024-01-01 10:05:00",
+        "channels": [
+          {
+            "channel_id": "34020000001320000001",
+            "channel_name": "通道1",
+            "status": "streaming",
+            "stream_name": "test_stream"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+**使用示例：**
+
+```bash
+# 使用 curl 查询设备列表
+curl http://127.0.0.1:8083/api/stat/gb28181_devices
+```
+
+**设备状态说明：**
+- `status`: 设备状态，`online` 表示在线，`offline` 表示离线
+- `register_time`: 设备注册时间
+- `keepalive_time`: 最后心跳时间
+- `channels`: 通道列表，每个通道包含通道ID、名称、状态和流名称
+
+#### 播放GB28181流
+
+启动拉流后，可以通过以下方式播放流：
+
+```bash
+# RTMP播放
+ffplay rtmp://127.0.0.1/live/test_stream
+
+# RTSP播放
+ffplay rtsp://127.0.0.1:5544/live/test_stream
+
+# HTTP-FLV播放
+ffplay http://127.0.0.1:8080/live/test_stream.flv
+
+# HLS播放
+ffplay http://127.0.0.1:8080/hls/test_stream/playlist.m3u8
+```
+
 ### 其他常用 API
 
 #### 查询所有流信息
