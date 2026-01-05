@@ -9,7 +9,6 @@
 package gb28181
 
 import (
-	"crypto/md5"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -193,9 +192,7 @@ func GenerateBranch() string {
 	return fmt.Sprintf("z9hG4bK%d", time.Now().UnixNano())
 }
 
-// GenerateStreamName 生成流名称（使用device_id+channel_id的MD5值）
+// GenerateStreamName 生成流名称（使用device_id+channel_id）
 func GenerateStreamName(deviceId, channelId string) string {
-	data := deviceId + channelId
-	hash := md5.Sum([]byte(data))
-	return fmt.Sprintf("%x", hash)
+	return deviceId + channelId
 }

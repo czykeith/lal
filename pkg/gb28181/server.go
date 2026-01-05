@@ -27,15 +27,16 @@ import (
 
 // Gb28181Server GB28181信令服务器
 type Gb28181Server struct {
-	addr     string
-	conn     *nazanet.UdpConnection
-	udpConn  *net.UDPConn // 底层UDP连接，用于发送数据
-	config   *ServerConfig
-	devices  map[string]*Device // 设备ID -> 设备信息
-	streams  map[string]*Stream // stream_name -> 流信息
-	mutex    sync.RWMutex
-	onInvite func(deviceId, channelId, streamName string, port int, isTcp bool) error
-	onBye    func(deviceId, channelId, streamName string) error
+	addr        string
+	conn        *nazanet.UdpConnection
+	udpConn     *net.UDPConn // 底层UDP连接，用于发送数据
+	config      *ServerConfig
+	devices     map[string]*Device // 设备ID -> 设备信息
+	streams     map[string]*Stream // stream_name -> 流信息
+	mutex       sync.RWMutex
+	onInvite    func(deviceId, channelId, streamName string, port int, isTcp bool) error
+	onBye       func(deviceId, channelId, streamName string) error
+	onReconnect func(deviceId string) error
 }
 
 // ServerConfig GB28181服务器配置
@@ -118,6 +119,11 @@ func (s *Gb28181Server) SetOnInvite(fn func(deviceId, channelId, streamName stri
 // SetOnBye 设置BYE回调
 func (s *Gb28181Server) SetOnBye(fn func(deviceId, channelId, streamName string) error) {
 	s.onBye = fn
+}
+
+// SetOnReconnect 设置设备重连回调
+func (s *Gb28181Server) SetOnReconnect(fn func(deviceId string) error) {
+	s.onReconnect = fn
 }
 
 // Listen 监听UDP端口
@@ -220,6 +226,7 @@ func (s *Gb28181Server) handleRegister(msg *SipMessage, raddr *net.UDPAddr) {
 	// 更新或创建设备
 	s.mutex.Lock()
 	device, exists := s.devices[deviceId]
+	isReconnect := exists // 设备已存在，说明是重连
 	if !exists {
 		device = &Device{
 			DeviceId:     deviceId,
@@ -235,10 +242,21 @@ func (s *Gb28181Server) handleRegister(msg *SipMessage, raddr *net.UDPAddr) {
 	device.KeepaliveTime = time.Now()
 	s.mutex.Unlock()
 
-	Log.Infof("device register. device_id=%s, ip=%s, port=%d, expires=%d", deviceId, ip, port, expires)
+	Log.Infof("device register. device_id=%s, ip=%s, port=%d, expires=%d, is_reconnect=%v", deviceId, ip, port, expires, isReconnect)
 
 	// 设备注册成功后，主动查询通道列表
 	go s.queryCatalog(deviceId)
+
+	// 如果是设备重连，尝试恢复拉流任务
+	if isReconnect && s.onReconnect != nil {
+		go func() {
+			// 延迟一点时间，等待设备完全上线
+			time.Sleep(500 * time.Millisecond)
+			if err := s.onReconnect(deviceId); err != nil {
+				Log.Warnf("device reconnect callback failed. device_id=%s, err=%+v", deviceId, err)
+			}
+		}()
+	}
 
 	// 发送200 OK响应
 	callId := msg.Headers["call-id"]
@@ -362,9 +380,9 @@ func (s *Gb28181Server) handleInvite(msg *SipMessage, raddr *net.UDPAddr) {
 	} else {
 		// 解析SDP获取RTP端口等信息（简化处理）
 		// 实际应该解析SDP获取RTP信息，这里使用默认端口段分配端口
-		// 生成流名称（使用device_id+channel_id的MD5值，设备主动推流时channel_id使用device_id）
+		// 生成流名称（使用device_id+channel_id，设备主动推流时channel_id使用device_id）
 		channelId := deviceId // 简化处理，使用设备ID作为通道ID
-		streamName := GenerateStreamName(deviceId, channelId)
+		streamName := deviceId + channelId
 
 		// 从端口池分配一个端口用于接收RTP数据（端口为0表示自动分配）
 		port := 0
@@ -775,6 +793,20 @@ func (s *Gb28181Server) HasStream(streamName string) bool {
 	defer s.mutex.RUnlock()
 	_, exists := s.streams[streamName]
 	return exists
+}
+
+// GetStreamsByDeviceId 获取设备的所有流
+func (s *Gb28181Server) GetStreamsByDeviceId(deviceId string) []*Stream {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+
+	streams := make([]*Stream, 0)
+	for _, stream := range s.streams {
+		if stream.DeviceId == deviceId {
+			streams = append(streams, stream)
+		}
+	}
+	return streams
 }
 
 // queryCatalog 查询设备通道列表

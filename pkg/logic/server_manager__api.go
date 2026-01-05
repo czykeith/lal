@@ -14,7 +14,6 @@ import (
 	"strings"
 
 	"github.com/q191201771/lal/pkg/base"
-	"github.com/q191201771/lal/pkg/gb28181"
 	"github.com/q191201771/naza/pkg/bininfo"
 )
 
@@ -247,7 +246,7 @@ func (sm *ServerManager) CtrlGb28181Invite(info base.ApiCtrlGb28181InviteReq) (r
 	// 生成流名称
 	streamName := info.StreamName
 	if streamName == "" {
-		streamName = gb28181.GenerateStreamName(info.DeviceId, info.ChannelId)
+		streamName = info.DeviceId + info.ChannelId
 	}
 
 	// 检查拉流任务是否已经存在
@@ -323,7 +322,7 @@ func (sm *ServerManager) CtrlGb28181Bye(info base.ApiCtrlGb28181ByeReq) (ret bas
 	// 确定流名称
 	streamName := info.StreamName
 	if streamName == "" {
-		streamName = gb28181.GenerateStreamName(info.DeviceId, info.ChannelId)
+		streamName = info.DeviceId + info.ChannelId
 	}
 
 	// 发送BYE信令
@@ -432,6 +431,69 @@ func (sm *ServerManager) onGb28181Bye(deviceId, channelId, streamName string) er
 	group := sm.getGroup("", streamName)
 	if group != nil {
 		group.StopRtpPub(streamName)
+	}
+
+	return nil
+}
+
+// onGb28181Reconnect GB28181设备重连回调
+func (sm *ServerManager) onGb28181Reconnect(deviceId string) error {
+	if sm.gb28181Server == nil {
+		return nil
+	}
+
+	// 获取该设备的所有流
+	streams := sm.gb28181Server.GetStreamsByDeviceId(deviceId)
+	if len(streams) == 0 {
+		return nil
+	}
+
+	Log.Infof("device reconnect detected. device_id=%s, stream_count=%d", deviceId, len(streams))
+
+	sm.mutex.Lock()
+	defer sm.mutex.Unlock()
+
+	// 遍历所有流，尝试恢复拉流
+	for _, stream := range streams {
+		// 检查Group是否还有输入会话
+		group := sm.getGroup("", stream.StreamName)
+		if group != nil && group.HasInSession() {
+			Log.Debugf("stream already has input session, skip restore. device_id=%s, stream_name=%s", deviceId, stream.StreamName)
+			continue
+		}
+
+		// 获取或创建Group
+		if group == nil {
+			group = sm.getOrCreateGroup("", stream.StreamName)
+		}
+
+		// 重新启动RTP Pub
+		rtpPubReq := base.ApiCtrlStartRtpPubReq{
+			StreamName: stream.StreamName,
+			Port:       stream.Port,
+			TimeoutMs:  10000,
+			IsTcpFlag:  0,
+		}
+		if stream.IsTcp {
+			rtpPubReq.IsTcpFlag = 1
+		}
+
+		rtpPubResp := group.StartRtpPub(rtpPubReq)
+		if rtpPubResp.ErrorCode != base.ErrorCodeSucc {
+			Log.Warnf("restore stream failed. device_id=%s, stream_name=%s, err=%s", deviceId, stream.StreamName, rtpPubResp.Desp)
+			continue
+		}
+
+		// 重新发送INVITE信令
+		err := sm.gb28181Server.Invite(stream.DeviceId, stream.ChannelId, stream.StreamName, rtpPubResp.Data.Port, stream.IsTcp)
+		if err != nil {
+			Log.Warnf("restore stream INVITE failed. device_id=%s, stream_name=%s, err=%+v", deviceId, stream.StreamName, err)
+			// 如果INVITE失败，停止RTP Pub
+			group.StopRtpPub(stream.StreamName)
+			continue
+		}
+
+		Log.Infof("stream restored. device_id=%s, channel_id=%s, stream_name=%s", stream.DeviceId, stream.ChannelId, stream.StreamName)
 	}
 
 	return nil

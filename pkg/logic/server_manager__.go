@@ -160,6 +160,9 @@ Doc: %s
 		sm.gb28181Server.SetOnBye(func(deviceId, channelId, streamName string) error {
 			return sm.onGb28181Bye(deviceId, channelId, streamName)
 		})
+		sm.gb28181Server.SetOnReconnect(func(deviceId string) error {
+			return sm.onGb28181Reconnect(deviceId)
+		})
 	}
 
 	if sm.config.PprofConfig.Enable {
