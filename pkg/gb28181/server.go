@@ -9,13 +9,19 @@
 package gb28181
 
 import (
+	"bytes"
+	"encoding/xml"
 	"fmt"
+	"io"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/q191201771/naza/pkg/nazanet"
+	"golang.org/x/text/encoding/simplifiedchinese"
+	"golang.org/x/text/transform"
 )
 
 // Gb28181Server GB28181信令服务器
@@ -230,6 +236,9 @@ func (s *Gb28181Server) handleRegister(msg *SipMessage, raddr *net.UDPAddr) {
 
 	Log.Infof("device register. device_id=%s, ip=%s, port=%d, expires=%d", deviceId, ip, port, expires)
 
+	// 设备注册成功后，主动查询通道列表
+	go s.queryCatalog(deviceId)
+
 	// 发送200 OK响应
 	callId := msg.Headers["call-id"]
 	from := msg.Headers["from"]
@@ -252,7 +261,7 @@ func (s *Gb28181Server) handleRegister(msg *SipMessage, raddr *net.UDPAddr) {
 	s.sendRaw(response, raddr)
 }
 
-// handleKeepalive 处理MESSAGE请求（心跳）
+// handleKeepalive 处理MESSAGE请求（心跳或响应）
 func (s *Gb28181Server) handleKeepalive(msg *SipMessage, raddr *net.UDPAddr) {
 	deviceId := ExtractDeviceId(msg.Headers["from"])
 	if deviceId == "" {
@@ -267,6 +276,23 @@ func (s *Gb28181Server) handleKeepalive(msg *SipMessage, raddr *net.UDPAddr) {
 		device.Status = "online"
 	}
 	s.mutex.Unlock()
+
+	// 检查是否是通道列表响应（Body中包含XML）
+	body := msg.Body
+	if len(body) > 0 {
+		// 记录收到的消息内容用于调试
+		previewLen := 200
+		if len(body) < previewLen {
+			previewLen = len(body)
+		}
+		Log.Debugf("receive MESSAGE from device. device_id=%s, body_len=%d, body_preview=%s", deviceId, len(body), body[:previewLen])
+
+		if strings.Contains(body, "<?xml") || strings.Contains(body, "<Response") || strings.Contains(body, "<Response>") {
+			// 这是通道列表响应，解析XML
+			Log.Infof("detect catalog response XML. device_id=%s", deviceId)
+			s.parseCatalogResponse(deviceId, body)
+		}
+	}
 
 	// 发送200 OK响应
 	callId := msg.Headers["call-id"]
@@ -623,6 +649,180 @@ func (s *Gb28181Server) GetDevice(deviceId string) *Device {
 	s.mutex.RLock()
 	defer s.mutex.RUnlock()
 	return s.devices[deviceId]
+}
+
+// queryCatalog 查询设备通道列表
+func (s *Gb28181Server) queryCatalog(deviceId string) {
+	time.Sleep(100 * time.Millisecond) // 等待注册完成
+
+	s.mutex.RLock()
+	device, exists := s.devices[deviceId]
+	s.mutex.RUnlock()
+
+	if !exists {
+		return
+	}
+
+	// 构建CATALOG查询XML（GB28181标准格式）
+	catalogXml := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<Query>
+<CmdType>Catalog</CmdType>
+<SN>%d</SN>
+<DeviceID>%s</DeviceID>
+</Query>`, time.Now().Unix(), deviceId)
+
+	// 构建MESSAGE请求
+	requestUri := fmt.Sprintf("sip:%s@%s:%d", deviceId, device.Ip, device.Port)
+	from := fmt.Sprintf("<sip:%s@%s:%d>", s.config.LocalSipId, s.config.LocalSipIp, s.config.LocalSipPort)
+	to := fmt.Sprintf("<sip:%s@%s:%d>", deviceId, device.Ip, device.Port)
+
+	branch := GenerateBranch()
+	callId := GenerateCallId()
+	headers := map[string]string{
+		"Via":            fmt.Sprintf("SIP/2.0/UDP %s:%d;branch=%s;rport", s.config.LocalSipIp, s.config.LocalSipPort, branch),
+		"From":           from + ";tag=" + GenerateTag(),
+		"To":             to,
+		"Call-ID":        callId,
+		"CSeq":           "1 MESSAGE",
+		"Content-Type":   "Application/MANSCDP+xml",
+		"Content-Length": fmt.Sprintf("%d", len(catalogXml)),
+	}
+
+	request := BuildSipRequest(SipMethodMessage, requestUri, headers, catalogXml)
+
+	// 发送请求
+	addr := &net.UDPAddr{
+		IP:   net.ParseIP(device.Ip),
+		Port: device.Port,
+	}
+	s.sendRaw(request, addr)
+
+	Log.Infof("send CATALOG query to device. device_id=%s, ip=%s, port=%d, xml=%s", deviceId, device.Ip, device.Port, catalogXml)
+}
+
+// parseCatalogResponse 解析通道列表响应
+func (s *Gb28181Server) parseCatalogResponse(deviceId string, xmlBody string) {
+	Log.Debugf("parse catalog response. device_id=%s, xml_body=%s", deviceId, xmlBody)
+
+	// GB28181 XML格式解析
+	type Item struct {
+		DeviceID     string `xml:"DeviceID"`
+		Name         string `xml:"Name"`
+		Status       string `xml:"Status"`
+		ParentID     string `xml:"ParentID"`
+		Manufacturer string `xml:"Manufacturer"`
+		Model        string `xml:"Model"`
+		Owner        string `xml:"Owner"`
+		CivilCode    string `xml:"CivilCode"`
+		Address      string `xml:"Address"`
+		Parental     string `xml:"Parental"`
+		SafetyWay    string `xml:"SafetyWay"`
+		RegisterWay  string `xml:"RegisterWay"`
+		Secrecy      string `xml:"Secrecy"`
+		IPAddress    string `xml:"IPAddress"`
+		Port         string `xml:"Port"`
+		Password     string `xml:"Password"`
+	}
+
+	type CatalogResponse struct {
+		XMLName  xml.Name `xml:"Response"`
+		CmdType  string   `xml:"CmdType"`
+		SN       string   `xml:"SN"`
+		DeviceID string   `xml:"DeviceID"`
+		SumNum   string   `xml:"SumNum"`
+		ItemList struct {
+			Items []Item `xml:"Item"`
+		} `xml:"ItemList"`
+	}
+
+	// 检查XML编码，如果是GB2312或GBK，转换为UTF-8
+	xmlBytes := []byte(xmlBody)
+	if strings.Contains(xmlBody, "encoding=\"GB2312\"") || strings.Contains(xmlBody, "encoding='GB2312'") ||
+		strings.Contains(xmlBody, "encoding=\"GBK\"") || strings.Contains(xmlBody, "encoding='GBK'") {
+		// 转换GB2312/GBK到UTF-8
+		reader := transform.NewReader(bytes.NewReader(xmlBytes), simplifiedchinese.GBK.NewDecoder())
+		utf8Bytes, err := io.ReadAll(reader)
+		if err != nil {
+			Log.Warnf("convert GB2312/GBK to UTF-8 failed. device_id=%s, err=%+v", deviceId, err)
+			// 如果转换失败，尝试直接解析
+		} else {
+			xmlBytes = utf8Bytes
+			// 替换XML声明中的编码为UTF-8
+			xmlBody = strings.ReplaceAll(string(xmlBytes), "encoding=\"GB2312\"", "encoding=\"UTF-8\"")
+			xmlBody = strings.ReplaceAll(xmlBody, "encoding='GB2312'", "encoding='UTF-8'")
+			xmlBody = strings.ReplaceAll(xmlBody, "encoding=\"GBK\"", "encoding=\"UTF-8\"")
+			xmlBody = strings.ReplaceAll(xmlBody, "encoding='GBK'", "encoding='UTF-8'")
+			xmlBytes = []byte(xmlBody)
+		}
+	}
+
+	var resp CatalogResponse
+	decoder := xml.NewDecoder(bytes.NewReader(xmlBytes))
+	if err := decoder.Decode(&resp); err != nil {
+		xmlPreviewLen := 500
+		if len(xmlBody) < xmlPreviewLen {
+			xmlPreviewLen = len(xmlBody)
+		}
+		Log.Warnf("parse catalog response XML failed. device_id=%s, err=%+v, xml=%s", deviceId, err, xmlBody[:xmlPreviewLen])
+		return
+	}
+
+	Log.Debugf("parsed catalog response. device_id=%s, cmd_type=%s, sum_num=%s, item_count=%d", deviceId, resp.CmdType, resp.SumNum, len(resp.ItemList.Items))
+
+	if resp.CmdType != "Catalog" {
+		Log.Debugf("not catalog response, cmd_type=%s", resp.CmdType)
+		return
+	}
+
+	s.mutex.Lock()
+	device, exists := s.devices[deviceId]
+	if !exists {
+		s.mutex.Unlock()
+		Log.Warnf("device not found when parsing catalog. device_id=%s", deviceId)
+		return
+	}
+
+	device.mutex.Lock()
+	// 清空旧通道列表
+	device.Channels = make(map[string]*Channel)
+
+	// 更新通道列表
+	channelCount := 0
+	for _, item := range resp.ItemList.Items {
+		// 通道的DeviceID不等于设备ID（设备自身），且ParentID等于设备ID
+		// 或者如果ParentID为空，则检查DeviceID是否以设备ID开头（某些设备可能这样标识）
+		isChannel := false
+		if item.DeviceID != deviceId {
+			if item.ParentID == deviceId {
+				isChannel = true
+			} else if item.ParentID == "" {
+				// ParentID为空时，如果DeviceID以设备ID开头且长度大于设备ID，认为是通道
+				if strings.HasPrefix(item.DeviceID, deviceId) && len(item.DeviceID) > len(deviceId) {
+					isChannel = true
+				}
+			}
+		}
+
+		if isChannel {
+			channel := &Channel{
+				ChannelId:   item.DeviceID,
+				ChannelName: item.Name,
+				Status:      item.Status,
+			}
+			if channel.ChannelName == "" {
+				channel.ChannelName = item.DeviceID
+			}
+			device.Channels[item.DeviceID] = channel
+			channelCount++
+			Log.Debugf("add channel. device_id=%s, channel_id=%s, channel_name=%s, status=%s, parent_id=%s", deviceId, channel.ChannelId, channel.ChannelName, channel.Status, item.ParentID)
+		} else {
+			Log.Debugf("skip item. device_id=%s, item_device_id=%s, parent_id=%s, name=%s", deviceId, item.DeviceID, item.ParentID, item.Name)
+		}
+	}
+	device.mutex.Unlock()
+	s.mutex.Unlock()
+
+	Log.Infof("parse catalog response success. device_id=%s, total_items=%d, channel_count=%d", deviceId, len(resp.ItemList.Items), channelCount)
 }
 
 // Dispose 释放资源
