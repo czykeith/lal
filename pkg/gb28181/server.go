@@ -27,16 +27,17 @@ import (
 
 // Gb28181Server GB28181信令服务器
 type Gb28181Server struct {
-	addr        string
-	conn        *nazanet.UdpConnection
-	udpConn     *net.UDPConn // 底层UDP连接，用于发送数据
-	config      *ServerConfig
-	devices     map[string]*Device // 设备ID -> 设备信息
-	streams     map[string]*Stream // stream_name -> 流信息
-	mutex       sync.RWMutex
-	onInvite    func(deviceId, channelId, streamName string, port int, isTcp bool) error
-	onBye       func(deviceId, channelId, streamName string) error
-	onReconnect func(deviceId string) error
+	addr          string
+	conn          *nazanet.UdpConnection
+	udpConn       *net.UDPConn // 底层UDP连接，用于发送数据
+	config        *ServerConfig
+	devices       map[string]*Device            // 设备ID -> 设备信息
+	streams       map[string]*Stream            // stream_name -> 流信息
+	deviceStreams map[string]map[string]*Stream // 设备ID -> stream_name -> 流信息（索引优化）
+	mutex         sync.RWMutex
+	onInvite      func(deviceId, channelId, streamName string, port int, isTcp bool) error
+	onBye         func(deviceId, channelId, streamName string) error
+	onReconnect   func(deviceId string) error
 }
 
 // ServerConfig GB28181服务器配置
@@ -105,9 +106,10 @@ func NewGb28181Server(config *ServerConfig) *Gb28181Server {
 	}
 
 	return &Gb28181Server{
-		config:  config,
-		devices: make(map[string]*Device),
-		streams: make(map[string]*Stream),
+		config:        config,
+		devices:       make(map[string]*Device),
+		streams:       make(map[string]*Stream),
+		deviceStreams: make(map[string]map[string]*Stream),
 	}
 }
 
@@ -389,7 +391,7 @@ func (s *Gb28181Server) handleInvite(msg *SipMessage, raddr *net.UDPAddr) {
 
 		// 记录流信息（设备主动推流）
 		s.mutex.Lock()
-		s.streams[streamName] = &Stream{
+		stream := &Stream{
 			DeviceId:   deviceId,
 			ChannelId:  channelId,
 			StreamName: streamName,
@@ -398,7 +400,13 @@ func (s *Gb28181Server) handleInvite(msg *SipMessage, raddr *net.UDPAddr) {
 			IsTcp:      false,
 			StartTime:  time.Now(),
 		}
-		targetStream = s.streams[streamName]
+		s.streams[streamName] = stream
+		// 更新设备流索引
+		if s.deviceStreams[deviceId] == nil {
+			s.deviceStreams[deviceId] = make(map[string]*Stream)
+		}
+		s.deviceStreams[deviceId][streamName] = stream
+		targetStream = stream
 		s.mutex.Unlock()
 
 		Log.Infof("accept INVITE from device. device_id=%s, stream_name=%s", deviceId, streamName)
@@ -470,17 +478,34 @@ func (s *Gb28181Server) handleBye(msg *SipMessage, raddr *net.UDPAddr) {
 
 	Log.Infof("receive BYE from device. device_id=%s", deviceId)
 
-	// 查找并停止对应的流
+	// 查找并停止对应的流（使用索引优化）
 	s.mutex.Lock()
-	for streamName, stream := range s.streams {
-		if stream.DeviceId == deviceId {
-			if s.onBye != nil {
-				s.onBye(stream.DeviceId, stream.ChannelId, streamName)
+	if deviceStreams, ok := s.deviceStreams[deviceId]; ok {
+		streamNames := make([]string, 0, len(deviceStreams))
+		streams := make([]*Stream, 0, len(deviceStreams))
+		for streamName, stream := range deviceStreams {
+			streamNames = append(streamNames, streamName)
+			streams = append(streams, stream)
+		}
+		// 先释放锁，调用回调
+		s.mutex.Unlock()
+
+		if s.onBye != nil {
+			for i, streamName := range streamNames {
+				s.onBye(streams[i].DeviceId, streams[i].ChannelId, streamName)
 			}
+		}
+
+		// 重新加锁删除
+		s.mutex.Lock()
+		for _, streamName := range streamNames {
 			delete(s.streams, streamName)
 		}
+		delete(s.deviceStreams, deviceId)
+		s.mutex.Unlock()
+	} else {
+		s.mutex.Unlock()
 	}
-	s.mutex.Unlock()
 
 	// 发送200 OK响应
 	callId := msg.Headers["call-id"]
@@ -675,7 +700,7 @@ func (s *Gb28181Server) Invite(deviceId, channelId, streamName string, port int,
 
 	// 记录流信息
 	s.mutex.Lock()
-	s.streams[streamName] = &Stream{
+	stream := &Stream{
 		DeviceId:   deviceId,
 		ChannelId:  channelId,
 		StreamName: streamName,
@@ -684,6 +709,12 @@ func (s *Gb28181Server) Invite(deviceId, channelId, streamName string, port int,
 		IsTcp:      isTcp,
 		StartTime:  time.Now(),
 	}
+	s.streams[streamName] = stream
+	// 更新设备流索引
+	if s.deviceStreams[deviceId] == nil {
+		s.deviceStreams[deviceId] = make(map[string]*Stream)
+	}
+	s.deviceStreams[deviceId][streamName] = stream
 	s.mutex.Unlock()
 
 	Log.Infof("send INVITE to device. device_id=%s, channel_id=%s, stream_name=%s, port=%d", deviceId, channelId, streamName, port)
@@ -700,6 +731,13 @@ func (s *Gb28181Server) Bye(deviceId, channelId, streamName string) error {
 		return fmt.Errorf("stream not found: %s", streamName)
 	}
 	delete(s.streams, streamName)
+	// 从设备流索引中删除
+	if deviceStreams, ok := s.deviceStreams[deviceId]; ok {
+		delete(deviceStreams, streamName)
+		if len(deviceStreams) == 0 {
+			delete(s.deviceStreams, deviceId)
+		}
+	}
 	s.mutex.Unlock()
 
 	s.mutex.RLock()
@@ -795,16 +833,19 @@ func (s *Gb28181Server) HasStream(streamName string) bool {
 	return exists
 }
 
-// GetStreamsByDeviceId 获取设备的所有流
+// GetStreamsByDeviceId 获取设备的所有流（使用索引优化）
 func (s *Gb28181Server) GetStreamsByDeviceId(deviceId string) []*Stream {
 	s.mutex.RLock()
 	defer s.mutex.RUnlock()
 
-	streams := make([]*Stream, 0)
-	for _, stream := range s.streams {
-		if stream.DeviceId == deviceId {
-			streams = append(streams, stream)
-		}
+	deviceStreams, exists := s.deviceStreams[deviceId]
+	if !exists || len(deviceStreams) == 0 {
+		return nil
+	}
+
+	streams := make([]*Stream, 0, len(deviceStreams))
+	for _, stream := range deviceStreams {
+		streams = append(streams, stream)
 	}
 	return streams
 }
