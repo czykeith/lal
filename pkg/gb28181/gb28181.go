@@ -39,3 +39,13 @@ var defaultUdpConnPoll *nazanet.AvailUdpConnPool
 func init() {
 	defaultUdpConnPoll = nazanet.NewAvailUdpConnPool(defaultPubSessionPortMin, defaultPubSessionPortMax)
 }
+
+// SetRtpPortRange 设置RTP端口段（全局配置）
+func SetRtpPortRange(portMin, portMax uint16) {
+	if portMin > 0 && portMax > portMin {
+		defaultPubSessionPortMin = portMin
+		defaultPubSessionPortMax = portMax
+		defaultUdpConnPoll = nazanet.NewAvailUdpConnPool(portMin, portMax)
+		Log.Infof("set RTP port range. min=%d, max=%d", portMin, portMax)
+	}
+}

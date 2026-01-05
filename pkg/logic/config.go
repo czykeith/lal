@@ -177,6 +177,8 @@ type Gb28181Config struct {
 	Username       string `json:"username"`         // 认证用户名（可选）
 	Password       string `json:"password"`         // 认证密码（可选）
 	Expires        int    `json:"expires"`          // 注册过期时间（秒，默认3600）
+	RtpPortMin     int    `json:"rtp_port_min"`     // RTP接收端口段最小值（默认30000）
+	RtpPortMax     int    `json:"rtp_port_max"`     // RTP接收端口段最大值（默认60000）
 }
 
 type CommonHttpServerConfig struct {

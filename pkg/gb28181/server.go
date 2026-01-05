@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -287,10 +288,14 @@ func (s *Gb28181Server) handleKeepalive(msg *SipMessage, raddr *net.UDPAddr) {
 		}
 		Log.Debugf("receive MESSAGE from device. device_id=%s, body_len=%d, body_preview=%s", deviceId, len(body), body[:previewLen])
 
-		if strings.Contains(body, "<?xml") || strings.Contains(body, "<Response") || strings.Contains(body, "<Response>") {
+		// 检查是否是Catalog响应（包含<CmdType>Catalog</CmdType>）
+		if strings.Contains(body, "<?xml") && strings.Contains(body, "<CmdType>Catalog</CmdType>") {
 			// 这是通道列表响应，解析XML
 			Log.Infof("detect catalog response XML. device_id=%s", deviceId)
 			s.parseCatalogResponse(deviceId, body)
+		} else if strings.Contains(body, "<?xml") {
+			// 其他XML消息（如Notify心跳），不需要解析通道列表
+			Log.Debugf("receive other XML message (not Catalog). device_id=%s", deviceId)
 		}
 	}
 
@@ -322,8 +327,7 @@ func (s *Gb28181Server) handleInvite(msg *SipMessage, raddr *net.UDPAddr) {
 		return
 	}
 
-	// 从SDP中提取信息
-	sdp := msg.Body
+	// 从SDP中提取信息（目前暂时不需要解析SDP）
 	callId := msg.Headers["call-id"]
 
 	// 检查设备是否存在
@@ -339,12 +343,52 @@ func (s *Gb28181Server) handleInvite(msg *SipMessage, raddr *net.UDPAddr) {
 
 	Log.Infof("receive INVITE from device. device_id=%s, call_id=%s", deviceId, callId)
 
-	// 解析SDP获取RTP端口等信息（简化处理）
-	// 实际应该解析SDP获取RTP信息，这里使用默认端口
-	// 生成流名称
-	streamName := fmt.Sprintf("%s_%s_%s", deviceId, callId, time.Now().Format("20060102150405"))
+	// 检查是否已经存在相同的Call-ID的流
+	s.mutex.RLock()
+	var existingStream *Stream
+	for _, stream := range s.streams {
+		if stream.CallId == callId {
+			existingStream = stream
+			break
+		}
+	}
+	s.mutex.RUnlock()
 
-	// 发送200 OK响应
+	var targetStream *Stream
+	if existingStream != nil {
+		Log.Warnf("receive duplicate INVITE with same Call-ID. device_id=%s, call_id=%s, existing_stream=%s", deviceId, callId, existingStream.StreamName)
+		targetStream = existingStream
+		// 发送200 OK响应（即使流已存在）
+	} else {
+		// 解析SDP获取RTP端口等信息（简化处理）
+		// 实际应该解析SDP获取RTP信息，这里使用默认端口段分配端口
+		// 生成流名称（使用device_id+channel_id的MD5值，设备主动推流时channel_id使用device_id）
+		channelId := deviceId // 简化处理，使用设备ID作为通道ID
+		streamName := GenerateStreamName(deviceId, channelId)
+
+		// 从端口池分配一个端口用于接收RTP数据（端口为0表示自动分配）
+		port := 0
+
+		// 记录流信息（设备主动推流）
+		s.mutex.Lock()
+		s.streams[streamName] = &Stream{
+			DeviceId:   deviceId,
+			ChannelId:  channelId,
+			StreamName: streamName,
+			CallId:     callId,
+			Port:       port,
+			IsTcp:      false,
+			StartTime:  time.Now(),
+		}
+		targetStream = s.streams[streamName]
+		s.mutex.Unlock()
+
+		Log.Infof("accept INVITE from device. device_id=%s, stream_name=%s", deviceId, streamName)
+	}
+
+	// 发送200 OK响应，构建包含服务器RTP端口的SDP
+	// 注意：对于设备主动推流，服务器需要在SDP中告诉设备使用哪个端口接收RTP
+	// 这里先使用端口0（自动分配），实际端口会在创建RTP Pub Session时确定
 	from := msg.Headers["from"]
 	to := msg.Headers["to"]
 	cseq := msg.Headers["cseq"]
@@ -359,34 +403,43 @@ func (s *Gb28181Server) handleInvite(msg *SipMessage, raddr *net.UDPAddr) {
 		"CSeq":           cseq,
 		"Contact":        fmt.Sprintf("<sip:%s@%s:%d>", s.config.LocalSipId, s.config.LocalSipIp, s.config.LocalSipPort),
 		"Content-Type":   "application/sdp",
-		"Content-Length": fmt.Sprintf("%d", len(sdp)),
+		"Content-Length": "0", // 先设置为0，后面会更新
 	}
 
-	// 构建SDP响应（简化处理，实际应该根据接收到的SDP构建响应）
-	responseSdp := sdp // 这里简化处理，实际应该构建自己的SDP
+	// 构建SDP响应（使用服务器要接收RTP的端口）
+	// 注意：实际端口会在收到ACK后创建RTP Pub Session时确定，这里先使用占位符
+	// 但为了兼容，我们先构建一个基本的SDP响应
+	responseSdp := s.buildSdp(targetStream.Port, targetStream.IsTcp)
+	headers["Content-Length"] = fmt.Sprintf("%d", len(responseSdp))
 	response := BuildSipResponse(200, "OK", headers, responseSdp)
 	s.sendRaw(response, raddr)
-
-	// 记录流信息（设备主动推流）
-	s.mutex.Lock()
-	s.streams[streamName] = &Stream{
-		DeviceId:   deviceId,
-		ChannelId:  deviceId, // 简化处理，使用设备ID作为通道ID
-		StreamName: streamName,
-		CallId:     callId,
-		Port:       0, // 需要从SDP中解析
-		IsTcp:      false,
-		StartTime:  time.Now(),
-	}
-	s.mutex.Unlock()
-
-	Log.Infof("accept INVITE from device. device_id=%s, stream_name=%s", deviceId, streamName)
 }
 
 // handleAck 处理ACK请求
 func (s *Gb28181Server) handleAck(msg *SipMessage, raddr *net.UDPAddr) {
 	// ACK通常不需要响应
-	Log.Debugf("receive ACK from %s", raddr.String())
+	callId := msg.Headers["call-id"]
+	Log.Debugf("receive ACK from %s, call_id=%s", raddr.String(), callId)
+
+	// 对于设备主动推流，收到ACK后应该调用onInvite回调创建RTP Pub Session
+	// 查找对应的流
+	s.mutex.RLock()
+	var targetStream *Stream
+	for _, stream := range s.streams {
+		if stream.CallId == callId {
+			targetStream = stream
+			break
+		}
+	}
+	s.mutex.RUnlock()
+
+	if targetStream != nil && s.onInvite != nil {
+		// 设备主动推流：收到ACK后调用回调创建RTP Pub Session
+		Log.Infof("receive ACK for device push stream. call_id=%s, stream_name=%s", callId, targetStream.StreamName)
+		if err := s.onInvite(targetStream.DeviceId, targetStream.ChannelId, targetStream.StreamName, targetStream.Port, targetStream.IsTcp); err != nil {
+			Log.Warnf("onInvite callback failed after ACK. err=%+v", err)
+		}
+	}
 }
 
 // handleBye 处理BYE请求
@@ -455,6 +508,64 @@ func (s *Gb28181Server) handleResponse(msg *SipMessage, raddr *net.UDPAddr) {
 			// 解析SDP获取RTP信息
 			sdp := msg.Body
 			Log.Infof("receive INVITE 200 OK response. call_id=%s, stream_name=%s, sdp_len=%d", callId, targetStream.StreamName, len(sdp))
+
+			// 获取设备信息用于发送ACK
+			s.mutex.RLock()
+			device, deviceExists := s.devices[targetStream.DeviceId]
+			s.mutex.RUnlock()
+
+			if deviceExists {
+				// 发送ACK请求，完成INVITE三次握手
+				// ACK的Request-URI使用200 OK响应中的Contact头，如果没有则使用INVITE请求中的To头
+				contact := msg.Headers["contact"]
+				var requestUri string
+				if contact != "" {
+					// 从Contact头提取URI
+					// Contact: <sip:34020000001310000001@192.168.1.100:5060>
+					re := regexp.MustCompile(`<([^>]+)>`)
+					matches := re.FindStringSubmatch(contact)
+					if len(matches) > 1 {
+						requestUri = matches[1]
+					} else {
+						requestUri = contact
+					}
+				} else {
+					// 使用To头构建Request-URI
+					to := msg.Headers["to"]
+					// To: <sip:34020000001310000001@192.168.1.100:5060>;tag=xxx
+					re := regexp.MustCompile(`<([^>]+)>`)
+					matches := re.FindStringSubmatch(to)
+					if len(matches) > 1 {
+						requestUri = matches[1]
+					} else {
+						requestUri = fmt.Sprintf("sip:%s@%s:%d", targetStream.ChannelId, device.Ip, device.Port)
+					}
+				}
+
+				// 构建ACK请求
+				from := fmt.Sprintf("<sip:%s@%s:%d>", s.config.LocalSipId, s.config.LocalSipIp, s.config.LocalSipPort)
+				to := msg.Headers["to"] // 使用200 OK响应中的To头（包含tag）
+				cseq := msg.Headers["cseq"]
+				// CSeq可能包含方法名，ACK只需要数字
+				cseqNum := cseq
+				if strings.Contains(cseq, " ") {
+					cseqNum = strings.Split(cseq, " ")[0]
+				}
+				via := msg.Headers["via"]
+
+				ackHeaders := map[string]string{
+					"Via":            via,
+					"From":           from,
+					"To":             to, // 使用200 OK响应中的To头（包含tag）
+					"Call-ID":        callId,
+					"CSeq":           cseqNum + " ACK",
+					"Content-Length": "0",
+				}
+
+				ackRequest := BuildSipRequest(SipMethodAck, requestUri, ackHeaders, "")
+				s.sendRaw(ackRequest, raddr)
+				Log.Infof("send ACK to device. device_id=%s, channel_id=%s, stream_name=%s", targetStream.DeviceId, targetStream.ChannelId, targetStream.StreamName)
+			}
 
 			// 如果设置了回调，调用回调处理
 			if s.onInvite != nil {
@@ -651,6 +762,21 @@ func (s *Gb28181Server) GetDevice(deviceId string) *Device {
 	return s.devices[deviceId]
 }
 
+// GetStream 获取流信息
+func (s *Gb28181Server) GetStream(streamName string) *Stream {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+	return s.streams[streamName]
+}
+
+// HasStream 检查流是否存在
+func (s *Gb28181Server) HasStream(streamName string) bool {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+	_, exists := s.streams[streamName]
+	return exists
+}
+
 // queryCatalog 查询设备通道列表
 func (s *Gb28181Server) queryCatalog(deviceId string) {
 	time.Sleep(100 * time.Millisecond) // 等待注册完成
@@ -725,11 +851,14 @@ func (s *Gb28181Server) parseCatalogResponse(deviceId string, xmlBody string) {
 	}
 
 	type CatalogResponse struct {
-		XMLName  xml.Name `xml:"Response"`
-		CmdType  string   `xml:"CmdType"`
-		SN       string   `xml:"SN"`
-		DeviceID string   `xml:"DeviceID"`
-		SumNum   string   `xml:"SumNum"`
+		XMLName    xml.Name `xml:"Response"`
+		CmdType    string   `xml:"CmdType"`
+		SN         string   `xml:"SN"`
+		DeviceID   string   `xml:"DeviceID"`
+		SumNum     string   `xml:"SumNum"`
+		DeviceList struct {
+			Items []Item `xml:"Item"`
+		} `xml:"DeviceList"`
 		ItemList struct {
 			Items []Item `xml:"Item"`
 		} `xml:"ItemList"`
@@ -767,7 +896,18 @@ func (s *Gb28181Server) parseCatalogResponse(deviceId string, xmlBody string) {
 		return
 	}
 
-	Log.Debugf("parsed catalog response. device_id=%s, cmd_type=%s, sum_num=%s, item_count=%d", deviceId, resp.CmdType, resp.SumNum, len(resp.ItemList.Items))
+	// 获取Item列表（支持DeviceList和ItemList两种格式）
+	items := resp.DeviceList.Items
+	if len(items) == 0 {
+		items = resp.ItemList.Items
+	}
+
+	Log.Infof("parsed catalog response. device_id=%s, cmd_type=%s, sum_num=%s, item_count=%d", deviceId, resp.CmdType, resp.SumNum, len(items))
+
+	// 打印所有Item的详细信息用于调试
+	for i, item := range items {
+		Log.Infof("catalog item[%d]: device_id=%s, name=%s, parent_id=%s, status=%s", i, item.DeviceID, item.Name, item.ParentID, item.Status)
+	}
 
 	if resp.CmdType != "Catalog" {
 		Log.Debugf("not catalog response, cmd_type=%s", resp.CmdType)
@@ -788,17 +928,28 @@ func (s *Gb28181Server) parseCatalogResponse(deviceId string, xmlBody string) {
 
 	// 更新通道列表
 	channelCount := 0
-	for _, item := range resp.ItemList.Items {
-		// 通道的DeviceID不等于设备ID（设备自身），且ParentID等于设备ID
-		// 或者如果ParentID为空，则检查DeviceID是否以设备ID开头（某些设备可能这样标识）
+	for _, item := range items {
+		Log.Infof("processing catalog item. device_id=%s, item_device_id=%s, item_name=%s, parent_id=%s, status=%s", deviceId, item.DeviceID, item.Name, item.ParentID, item.Status)
+
+		// 通道判断逻辑（更宽松的判断）：
+		// 1. 通道的DeviceID不等于设备ID（排除设备自身）
+		// 2. ParentID等于设备ID，或者是空/"0"（某些设备不填ParentID）
+		// 3. 对于ParentID为空的情况，如果DeviceID和deviceId不同，也认为是通道
 		isChannel := false
 		if item.DeviceID != deviceId {
+			// 首先检查ParentID是否明确指向设备ID
 			if item.ParentID == deviceId {
 				isChannel = true
-			} else if item.ParentID == "" {
-				// ParentID为空时，如果DeviceID以设备ID开头且长度大于设备ID，认为是通道
-				if strings.HasPrefix(item.DeviceID, deviceId) && len(item.DeviceID) > len(deviceId) {
+				Log.Infof("item is channel (parent_id matches device_id). device_id=%s, item_device_id=%s, parent_id=%s", deviceId, item.DeviceID, item.ParentID)
+			} else if item.ParentID == "" || item.ParentID == "0" || item.ParentID == deviceId {
+				// ParentID为空、0或等于设备ID，都认为是通道（只要DeviceID不同）
+				isChannel = true
+				Log.Infof("item is channel (parent_id is empty/0/device_id and device_id different). device_id=%s, item_device_id=%s, parent_id=%s", deviceId, item.DeviceID, item.ParentID)
+			} else if len(deviceId) >= 10 && len(item.DeviceID) >= 10 {
+				// 如果ParentID不为空，检查前10位（区域编码）是否相同
+				if item.DeviceID[:10] == deviceId[:10] && item.DeviceID != deviceId {
 					isChannel = true
+					Log.Infof("item is channel (region code matches). device_id=%s, item_device_id=%s, parent_id=%s", deviceId, item.DeviceID, item.ParentID)
 				}
 			}
 		}
@@ -814,15 +965,15 @@ func (s *Gb28181Server) parseCatalogResponse(deviceId string, xmlBody string) {
 			}
 			device.Channels[item.DeviceID] = channel
 			channelCount++
-			Log.Debugf("add channel. device_id=%s, channel_id=%s, channel_name=%s, status=%s, parent_id=%s", deviceId, channel.ChannelId, channel.ChannelName, channel.Status, item.ParentID)
+			Log.Infof("add channel SUCCESS. device_id=%s, channel_id=%s, channel_name=%s, status=%s, parent_id=%s", deviceId, channel.ChannelId, channel.ChannelName, channel.Status, item.ParentID)
 		} else {
-			Log.Debugf("skip item. device_id=%s, item_device_id=%s, parent_id=%s, name=%s", deviceId, item.DeviceID, item.ParentID, item.Name)
+			Log.Infof("skip item (not a channel). device_id=%s, item_device_id=%s, parent_id=%s, name=%s", deviceId, item.DeviceID, item.ParentID, item.Name)
 		}
 	}
 	device.mutex.Unlock()
 	s.mutex.Unlock()
 
-	Log.Infof("parse catalog response success. device_id=%s, total_items=%d, channel_count=%d", deviceId, len(resp.ItemList.Items), channelCount)
+	Log.Infof("parse catalog response success. device_id=%s, total_items=%d, channel_count=%d", deviceId, len(items), channelCount)
 }
 
 // Dispose 释放资源

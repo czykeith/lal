@@ -134,6 +134,13 @@ Doc: %s
 	}
 
 	if sm.config.Gb28181Config.Enable {
+		// 设置RTP端口段
+		rtpPortMin := sm.config.Gb28181Config.RtpPortMin
+		rtpPortMax := sm.config.Gb28181Config.RtpPortMax
+		if rtpPortMin > 0 && rtpPortMax > rtpPortMin {
+			gb28181.SetRtpPortRange(uint16(rtpPortMin), uint16(rtpPortMax))
+		}
+
 		gb28181Config := &gb28181.ServerConfig{
 			LocalSipId:     sm.config.Gb28181Config.LocalSipId,
 			LocalSipIp:     sm.config.Gb28181Config.LocalSipIp,

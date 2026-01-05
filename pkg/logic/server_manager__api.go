@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/q191201771/lal/pkg/base"
+	"github.com/q191201771/lal/pkg/gb28181"
 	"github.com/q191201771/naza/pkg/bininfo"
 )
 
@@ -246,11 +247,28 @@ func (sm *ServerManager) CtrlGb28181Invite(info base.ApiCtrlGb28181InviteReq) (r
 	// 生成流名称
 	streamName := info.StreamName
 	if streamName == "" {
-		streamName = fmt.Sprintf("%s_%s", info.DeviceId, info.ChannelId)
+		streamName = gb28181.GenerateStreamName(info.DeviceId, info.ChannelId)
+	}
+
+	// 检查拉流任务是否已经存在
+	if sm.gb28181Server.HasStream(streamName) {
+		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
+		ret.Desp = fmt.Sprintf("stream already exists: %s", streamName)
+		return
+	}
+
+	// 检查Group是否已经有输入流
+	group := sm.getGroup("", streamName)
+	if group != nil && group.HasInSession() {
+		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
+		ret.Desp = fmt.Sprintf("stream group already has input session: %s", streamName)
+		return
 	}
 
 	// 获取或创建Group
-	group := sm.getOrCreateGroup("", streamName)
+	if group == nil {
+		group = sm.getOrCreateGroup("", streamName)
+	}
 
 	// 启动RTP Pub
 	var port int
@@ -305,7 +323,7 @@ func (sm *ServerManager) CtrlGb28181Bye(info base.ApiCtrlGb28181ByeReq) (ret bas
 	// 确定流名称
 	streamName := info.StreamName
 	if streamName == "" {
-		streamName = fmt.Sprintf("%s_%s", info.DeviceId, info.ChannelId)
+		streamName = gb28181.GenerateStreamName(info.DeviceId, info.ChannelId)
 	}
 
 	// 发送BYE信令
@@ -380,6 +398,14 @@ func (sm *ServerManager) onGb28181Invite(deviceId, channelId, streamName string,
 	defer sm.mutex.Unlock()
 
 	group := sm.getOrCreateGroup("", streamName)
+
+	// 检查Group是否已经有输入会话（服务器主动拉流时，RTP Pub Session已经在API调用时创建）
+	if group.HasInSession() {
+		Log.Debugf("group already has input session, skip StartRtpPub. stream_name=%s", streamName)
+		return nil
+	}
+
+	// 设备主动推流时，需要在这里创建RTP Pub Session
 	rtpPubReq := base.ApiCtrlStartRtpPubReq{
 		StreamName: streamName,
 		Port:       port,

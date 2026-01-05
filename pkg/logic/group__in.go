@@ -9,6 +9,8 @@
 package logic
 
 import (
+	"fmt"
+
 	"github.com/q191201771/lal/pkg/gb28181"
 	"github.com/q191201771/naza/pkg/nazalog"
 	"time"
@@ -99,7 +101,9 @@ func (group *Group) StartRtpPub(req base.ApiCtrlStartRtpPubReq) (ret base.ApiCtr
 	defer group.mutex.Unlock()
 
 	if group.hasInSession() {
-		// TODO(chef): [fix] 处理已经有输入session的情况 202207
+		ret.ErrorCode = base.ErrorCodeListenUdpPortFail
+		ret.Desp = fmt.Sprintf("in stream already exist at group: %s", group.inSessionUniqueKey())
+		return
 	}
 
 	if req.DebugDumpPacket != "" {
