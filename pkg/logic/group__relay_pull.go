@@ -33,6 +33,7 @@ func (group *Group) StartPull(info base.ApiCtrlStartRelayPullReq) (string, error
 	group.pullProxy.autoStopPullAfterNoOutMs = info.AutoStopPullAfterNoOutMs
 	group.pullProxy.rtspMode = info.RtspMode
 	group.pullProxy.debugDumpPacket = info.DebugDumpPacket
+	group.pullProxy.scale = info.Scale
 
 	return group.pullIfNeeded()
 }
@@ -59,6 +60,7 @@ type pullProxy struct {
 	autoStopPullAfterNoOutMs int // 没有观看者时，是否自动停止pull
 	rtspMode                 int
 	debugDumpPacket          string
+	scale                    float64 // RTSP拉流时的播放速度倍数
 
 	startCount   int
 	lastHasOutTs int64
@@ -235,6 +237,7 @@ func (group *Group) pullIfNeeded() (string, error) {
 		rtspSession = rtsp.NewPullSession(group, func(option *rtsp.PullSessionOption) {
 			option.PullTimeoutMs = group.pullProxy.pullTimeoutMs
 			option.OverTcp = group.pullProxy.rtspMode == 0
+			option.Scale = group.pullProxy.scale
 		}).WithOnDescribeResponse(func() {
 			err := group.AddRtspPullSession(rtspSession)
 			if err != nil {

@@ -48,6 +48,7 @@ const (
 	HeaderTransport       = "Transport"
 	HeaderSession         = "Session"
 	HeaderRange           = "Range"
+	HeaderScale           = "Scale"
 	HeaderWwwAuthenticate = "WWW-Authenticate"
 	HeaderAuthorization   = "Authorization"
 	HeaderPublic          = "Public"

@@ -42,6 +42,7 @@ const (
 type ClientCommandSessionOption struct {
 	DoTimeoutMs int
 	OverTcp     bool
+	Scale       float64 // RTSP拉流时的播放速度倍数，例如1.0表示正常速度，2.0表示2倍速。如果为0，则不设置Scale头
 }
 
 var defaultClientCommandSessionOption = ClientCommandSessionOption{
@@ -364,6 +365,10 @@ func (session *ClientCommandSession) writeDescribe() error {
 	headers := map[string]string{
 		HeaderAccept: HeaderAcceptApplicationSdp,
 	}
+	// 如果设置了Scale参数，在DESCRIBE请求中也添加Scale请求头（某些服务器可能支持）
+	if session.option.Scale > 0 {
+		headers[HeaderScale] = fmt.Sprintf("%.2f", session.option.Scale)
+	}
 	ctx, err := session.writeCmdReadResp(MethodDescribe, session.urlCtx.RawUrlWithoutUserInfo, headers, "")
 	if err != nil {
 		return err
@@ -547,6 +552,10 @@ func (session *ClientCommandSession) writeOneSetupTcp(setupUri string) error {
 func (session *ClientCommandSession) writePlay() error {
 	headers := map[string]string{
 		HeaderRange: HeaderRangeDefault,
+	}
+	// 如果设置了Scale参数，添加Scale请求头
+	if session.option.Scale > 0 {
+		headers[HeaderScale] = fmt.Sprintf("%.2f", session.option.Scale)
 	}
 	_, err := session.writeCmdReadResp(MethodPlay, session.urlCtx.RawUrlWithoutUserInfo, headers, "")
 	return err

@@ -24,13 +24,14 @@ const (
 )
 
 type ApiCtrlStartRelayPullReq struct {
-	Url                      string `json:"url"`
-	StreamName               string `json:"stream_name"`
-	PullTimeoutMs            int    `json:"pull_timeout_ms"`
-	PullRetryNum             int    `json:"pull_retry_num"`
-	AutoStopPullAfterNoOutMs int    `json:"auto_stop_pull_after_no_out_ms"`
-	RtspMode                 int    `json:"rtsp_mode"`
-	DebugDumpPacket          string `json:"debug_dump_packet"`
+	Url                      string  `json:"url"`
+	StreamName               string  `json:"stream_name"`
+	PullTimeoutMs            int     `json:"pull_timeout_ms"`
+	PullRetryNum             int     `json:"pull_retry_num"`
+	AutoStopPullAfterNoOutMs int     `json:"auto_stop_pull_after_no_out_ms"`
+	RtspMode                 int     `json:"rtsp_mode"`
+	DebugDumpPacket          string  `json:"debug_dump_packet"`
+	Scale                    float64 `json:"scale"` // RTSP拉流时的播放速度倍数，例如1.0表示正常速度，2.0表示2倍速
 }
 
 type ApiCtrlKickSessionReq struct {
@@ -55,14 +56,15 @@ type ApiCtrlAddIpBlacklistReq struct {
 // 从 RTSP 或 RTMP 拉流，然后转推到 RTMP 或 RTSP
 // 注意：转推模式下，auto_stop_pull_after_no_out_ms 参数会被忽略，始终设置为 -1（不自动停止）
 type ApiCtrlStartRelayReq struct {
-	PullUrl                  string `json:"pull_url"`                       // 拉流地址，支持 rtmp:// 或 rtsp://
-	PushUrl                  string `json:"push_url"`                       // 推流地址，支持 rtmp:// 或 rtsp://
-	StreamName               string `json:"stream_name"`                    // 流名称（可选，如果不提供则从 pull_url 解析）
-	TimeoutMs                int    `json:"timeout_ms"`                     // 拉流和推流的超时时间（毫秒），默认 10000
-	RetryNum                 int    `json:"retry_num"`                      // 拉流和推流的重试次数，-1表示永远重试，大于0表示重试次数，0表示不重试，默认 0
-	AutoStopPullAfterNoOutMs int    `json:"auto_stop_pull_after_no_out_ms"` // 转推模式下此参数会被忽略，始终为 -1（不自动停止）
-	RtspMode                 int    `json:"rtsp_mode"`                      // RTSP 模式，0=TCP，1=UDP，默认 0
-	DebugDumpPacket          string `json:"debug_dump_packet"`              // 转推模式下此参数会被忽略，数据不会落盘，直接转发
+	PullUrl                  string  `json:"pull_url"`                       // 拉流地址，支持 rtmp:// 或 rtsp://
+	PushUrl                  string  `json:"push_url"`                       // 推流地址，支持 rtmp:// 或 rtsp://
+	StreamName               string  `json:"stream_name"`                    // 流名称（可选，如果不提供则从 pull_url 解析）
+	TimeoutMs                int     `json:"timeout_ms"`                     // 拉流和推流的超时时间（毫秒），默认 10000
+	RetryNum                 int     `json:"retry_num"`                      // 拉流和推流的重试次数，-1表示永远重试，大于0表示重试次数，0表示不重试，默认 0
+	AutoStopPullAfterNoOutMs int     `json:"auto_stop_pull_after_no_out_ms"` // 转推模式下此参数会被忽略，始终为 -1（不自动停止）
+	RtspMode                 int     `json:"rtsp_mode"`                      // RTSP 模式，0=TCP，1=UDP，默认 0
+	DebugDumpPacket          string  `json:"debug_dump_packet"`              // 转推模式下此参数会被忽略，数据不会落盘，直接转发
+	Scale                    float64 `json:"scale"`                          // RTSP拉流时的播放速度倍数，例如1.0表示正常速度，2.0表示2倍速
 }
 
 // ApiCtrlGb28181InviteReq GB28181拉流请求

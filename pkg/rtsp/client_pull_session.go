@@ -27,6 +27,8 @@ type PullSessionOption struct {
 	PullTimeoutMs int
 
 	OverTcp bool // 是否使用interleaved模式，也即是否通过rtsp command tcp连接传输rtp/rtcp数据
+
+	Scale float64 // RTSP拉流时的播放速度倍数，例如1.0表示正常速度，2.0表示2倍速。如果为0，则不设置Scale头
 }
 
 var defaultPullSessionOption = PullSessionOption{
@@ -62,6 +64,7 @@ func NewPullSession(observer IPullSessionObserver, modOptions ...ModPullSessionO
 	cmdSession := NewClientCommandSession(CcstPullSession, baseInSession.UniqueKey(), s, func(opt *ClientCommandSessionOption) {
 		opt.DoTimeoutMs = option.PullTimeoutMs
 		opt.OverTcp = option.OverTcp
+		opt.Scale = option.Scale
 	})
 	s.baseInSession = baseInSession
 	s.cmdSession = cmdSession

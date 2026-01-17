@@ -30,7 +30,8 @@ type relayProxy struct {
 	autoStopPullAfterNoOutMs int
 	rtspMode                 int
 	debugDumpPacket          string
-	pullSessionId            string // 拉流 session ID
+	scale                    float64 // RTSP拉流时的播放速度倍数
+	pullSessionId            string  // 拉流 session ID
 
 	// 推流相关
 	pushUrl        string
@@ -64,6 +65,7 @@ func (group *Group) StartRelay(info base.ApiCtrlStartRelayReq) (string, string, 
 		autoStopPullAfterNoOutMs: info.AutoStopPullAfterNoOutMs,
 		rtspMode:                 info.RtspMode,
 		debugDumpPacket:          "", // 转推模式下不落盘，直接转发
+		scale:                    info.Scale,
 		pushUrl:                  info.PushUrl,
 		pushStartCount:           0,
 		isRelaying:               false,
@@ -92,6 +94,7 @@ func (group *Group) StartRelay(info base.ApiCtrlStartRelayReq) (string, string, 
 	group.pullProxy.rtspMode = group.relayProxy.rtspMode
 	// 转推模式下，不进行数据落盘，强制设置为空字符串
 	group.pullProxy.debugDumpPacket = ""
+	group.pullProxy.scale = group.relayProxy.scale
 
 	// 转推模式下，停止存储功能（HLS、录制等），只做数据转发
 	group.stopHlsIfNeeded()
