@@ -249,7 +249,27 @@ func (session *PullSession) OnInterleavedPacket(packet []byte, channel int) {
 // EnableClientSideScale 启用客户端侧变速播放
 // 当服务器不支持 Scale 时调用此方法
 func (session *PullSession) EnableClientSideScale(scale float64) {
-	if scale > 0 {
+	// 健壮性：检查session是否有效
+	if session == nil {
+		return
+	}
+
+	// 健壮性：防止panic
+	defer func() {
+		if r := recover(); r != nil {
+			Log.Errorf("panic in EnableClientSideScale: %v", r)
+		}
+	}()
+
+	// 健壮性：验证scale范围
+	const minScale = 0.1
+	const maxScale = 10.0
+	if scale < minScale || scale > maxScale {
+		Log.Warnf("invalid scale value: %.1f, using default 1.0", scale)
+		scale = 1.0
+	}
+
+	if scale > 0 && session.baseInSession != nil {
 		session.scale = scale
 		session.baseInSession.SetScale(scale)
 		Log.Infof("[%s] enabled client-side scale playback. scale=%.1f", session.baseInSession.UniqueKey(), scale)

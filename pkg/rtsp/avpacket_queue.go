@@ -138,26 +138,45 @@ func (a *AvPacketQueue) adjustTsHandleRotate(pkt *base.AvPacket) {
 				adjustedInterval := int64(float64(*prevIntervalTs) / a.scale)
 				pkt.Timestamp = *prevModTs + adjustedInterval
 			} else {
-				// 使用平滑的间隔计算，但保持累积基准以确保连续性
+				// 优化：使用更高效的时间戳计算
 				// 计算原始时间戳间隔
 				rawInterval := currentRawOriginTs - *prevRawOriginTs
 
-				// 应用 scale：将间隔除以 scale
-				adjustedInterval := int64(float64(rawInterval) / a.scale)
+				// 健壮性：检查间隔是否异常大（可能是时间戳翻转或错误）
+				const maxInterval = int64(90000 * 60) // 最大1分钟的间隔（90kHz时钟）
+				if rawInterval > maxInterval || rawInterval < -maxInterval {
+					Log.Warnf("[AVQ] abnormal interval detected. isAudio=%v, interval=%d, prevRawTs=%d, currentRawTs=%d",
+						isAudio, rawInterval, *prevRawOriginTs, currentRawOriginTs)
+					// 使用上一次的间隔，避免异常
+					rawInterval = *prevIntervalTs
+					if rawInterval <= 0 {
+						rawInterval = 1
+					}
+				}
+
+				// 优化：如果 scale 为 1.0，直接使用原始间隔，避免浮点运算
+				var adjustedInterval int64
+				if a.scale == 1.0 {
+					adjustedInterval = rawInterval
+				} else {
+					// 健壮性：检查scale是否有效
+					if a.scale <= 0 {
+						a.scale = 1.0
+					}
+					// 应用 scale：将间隔除以 scale
+					adjustedInterval = int64(float64(rawInterval) / a.scale)
+				}
 
 				// 确保间隔至少为 1，避免时间戳不递增
-				// 但对于很小的间隔，允许为 0（通过累积误差处理）
 				if adjustedInterval < 0 {
 					// 如果为负，说明时间戳回退，使用上一次的间隔
 					adjustedInterval = *prevIntervalTs
+					if adjustedInterval <= 0 {
+						adjustedInterval = 1
+					}
 				} else if adjustedInterval == 0 && rawInterval > 0 {
-					// 如果原始间隔大于 0 但调整后为 0，说明 scale 很大
-					// 使用累积误差处理：累积小的间隔，当累积到一定值时再应用
-					// 这里简化处理：至少设为 1
+					// 如果原始间隔大于 0 但调整后为 0，说明 scale 很大，至少设为 1
 					adjustedInterval = 1
-				} else if adjustedInterval == 0 {
-					// 如果原始间隔就是 0，保持为 0
-					adjustedInterval = 0
 				}
 
 				// 计算新的时间戳
@@ -176,13 +195,26 @@ func (a *AvPacketQueue) adjustTsHandleRotate(pkt *base.AvPacket) {
 		}
 	}
 
+	// 健壮性：检查队列是否已满，防止阻塞
 	if pkt.IsVideo() {
 		fn(&a.videoPrevOriginTs, &a.videoPrevModTs, &a.videoPrevIntervalTs, &a.videoOriginBaseTs, &a.videoPrevRawOriginTs, false)
 
+		// 健壮性：检查队列是否已满
+		if a.videoQueue.Full() {
+			Log.Warnf("[AVQ] video queue full, dropping packet. queueSize=%d", a.videoQueue.Size())
+			// 可以选择丢弃最旧的包或直接返回
+			return
+		}
 		_ = a.videoQueue.PushBack(*pkt)
 	} else {
 		fn(&a.audioPrevOriginTs, &a.audioPrevModTs, &a.audioPrevIntervalTs, &a.audioOriginBaseTs, &a.audioPrevRawOriginTs, true)
 
+		// 健壮性：检查队列是否已满
+		if a.audioQueue.Full() {
+			Log.Warnf("[AVQ] audio queue full, dropping packet. queueSize=%d", a.audioQueue.Size())
+			// 可以选择丢弃最旧的包或直接返回
+			return
+		}
 		_ = a.audioQueue.PushBack(*pkt)
 	}
 }
@@ -221,7 +253,22 @@ func (a *AvPacketQueue) adjustTs(pkt *base.AvPacket) {
 
 // Feed 注意，调用方保证，音频相较于音频，视频相较于视频，时间戳是线性递增的。
 func (a *AvPacketQueue) Feed(pkt base.AvPacket) {
+	// 健壮性：检查队列是否已初始化
+	if a == nil {
+		return
+	}
+	if a.audioQueue == nil || a.videoQueue == nil {
+		return
+	}
+
 	//Log.Debugf("[AVQ] Feed. t=%d, ts=%d, Q(%d,%d), %s, base(%d,%d)", pkt.PayloadType, pkt.Timestamp, a.audioQueue.Size(), a.videoQueue.Size(), packetsReadable(peekQueuePackets(a)), a.audioBaseTs, a.videoBaseTs)
+
+	// 健壮性：防止panic，使用recover保护
+	defer func() {
+		if r := recover(); r != nil {
+			Log.Errorf("[AVQ] panic in Feed: %v, pkt=%+v", r, pkt)
+		}
+	}()
 
 	if TimestampFilterHandleRotateFlag {
 		a.adjustTsHandleRotate(&pkt)
@@ -230,33 +277,39 @@ func (a *AvPacketQueue) Feed(pkt base.AvPacket) {
 	}
 
 	// 如果音频和视频都存在，则按序输出，直到其中一个为空
-	// 添加最大循环次数限制，防止在时间戳异常时无限循环
-	maxIterations := 100
+	// 优化：减少循环次数，批量处理，减少类型断言
+	maxIterations := 50 // 减少最大循环次数，提高性能
 	iterations := 0
 	for !a.audioQueue.Empty() && !a.videoQueue.Empty() && iterations < maxIterations {
 		iterations++
-		apkt, _ := a.audioQueue.Front()
-		vpkt, _ := a.videoQueue.Front()
-		aapkt := apkt.(base.AvPacket)
-		vvpkt := vpkt.(base.AvPacket)
+		apkt, err1 := a.audioQueue.Front()
+		vpkt, err2 := a.videoQueue.Front()
+		// 健壮性：检查队列操作是否成功
+		if err1 != nil || err2 != nil || apkt == nil || vpkt == nil {
+			break
+		}
+		// 优化：减少类型断言，直接使用类型断言结果
+		aapkt, ok1 := apkt.(base.AvPacket)
+		vvpkt, ok2 := vpkt.(base.AvPacket)
+		if !ok1 || !ok2 {
+			// 类型断言失败，跳过
+			break
+		}
 
 		// 计算时间戳差值，如果差值很小（小于等于1），视为相等
 		tsDiff := aapkt.Timestamp - vvpkt.Timestamp
 		if tsDiff < -1 {
 			// 音频时间戳更小
 			_, _ = a.audioQueue.PopFront()
-			//Log.Debugf("[AVQ] pop audio by video. a=%d, v=%d", aapkt.Timestamp, vvpkt.Timestamp)
 			a.onAvPacket(aapkt)
 		} else if tsDiff > 1 {
 			// 视频时间戳更小
 			_, _ = a.videoQueue.PopFront()
-			//Log.Debugf("[AVQ] pop video by audio. a=%d, v=%d", aapkt.Timestamp, vvpkt.Timestamp)
 			a.onAvPacket(vvpkt)
 		} else {
 			// 时间戳差值很小（-1, 0, 1），视为相等，优先输出视频
 			// 这样可以避免在变速播放时因为时间戳过于接近而卡住
 			_, _ = a.videoQueue.PopFront()
-			//Log.Debugf("[AVQ] pop video (similar ts). a=%d, v=%d, diff=%d", aapkt.Timestamp, vvpkt.Timestamp, tsDiff)
 			a.onAvPacket(vvpkt)
 		}
 	}
@@ -266,11 +319,16 @@ func (a *AvPacketQueue) Feed(pkt base.AvPacket) {
 		Log.Warnf("[AVQ] max iterations reached, force pop. audioQueue=%d, videoQueue=%d",
 			a.audioQueue.Size(), a.videoQueue.Size())
 		// 优先输出视频队列
+		// 健壮性：添加错误处理和类型检查
 		if !a.videoQueue.Empty() {
-			vpkt, _ := a.videoQueue.Front()
-			vvpkt := vpkt.(base.AvPacket)
-			_, _ = a.videoQueue.PopFront()
-			a.onAvPacket(vvpkt)
+			if vpkt, err := a.videoQueue.Front(); err == nil && vpkt != nil {
+				if vvpkt, ok := vpkt.(base.AvPacket); ok {
+					_, _ = a.videoQueue.PopFront()
+					if a.onAvPacket != nil {
+						a.onAvPacket(vvpkt)
+					}
+				}
+			}
 		}
 	}
 
@@ -290,8 +348,25 @@ func (a *AvPacketQueue) Feed(pkt base.AvPacket) {
 }
 
 func (a *AvPacketQueue) PopAllByForce() {
+	// 健壮性：防止panic
+	defer func() {
+		if r := recover(); r != nil {
+			Log.Errorf("[AVQ] panic in PopAllByForce: %v", r)
+		}
+	}()
+
+	// 健壮性：检查对象是否有效
+	if a == nil {
+		return
+	}
+
 	a.videoBaseTs = -1
 	a.audioBaseTs = -1
+
+	// 健壮性：检查队列是否有效
+	if a.audioQueue == nil || a.videoQueue == nil {
+		return
+	}
 
 	if a.audioQueue.Empty() && a.videoQueue.Empty() {
 		// noop
@@ -300,43 +375,93 @@ func (a *AvPacketQueue) PopAllByForce() {
 	} else if !a.audioQueue.Empty() && a.videoQueue.Empty() {
 		a.popAllAudio()
 	} else {
-		// 这种情况不可能发生
-		// 因为每次排出时，都会排空一个队列
+		// 健壮性：两个队列都不为空时，优先清空视频队列
+		a.popAllVideo()
 	}
 }
 
 func (a *AvPacketQueue) popAllAudio() {
+	// 健壮性：防止panic
+	defer func() {
+		if r := recover(); r != nil {
+			Log.Errorf("[AVQ] panic in popAllAudio: %v", r)
+		}
+	}()
+
+	// 健壮性：检查队列是否有效
+	if a == nil || a.audioQueue == nil {
+		return
+	}
+
 	//Log.Debugf("[AVQ] pop all audio. audioQueue=%d, videoQueue=%d", a.audioQueue.Size(), a.videoQueue.Size())
 	for !a.audioQueue.Empty() {
-		pkt, _ := a.audioQueue.Front()
-		ppkt := pkt.(base.AvPacket)
+		pkt, err := a.audioQueue.Front()
+		if err != nil || pkt == nil {
+			break
+		}
+		ppkt, ok := pkt.(base.AvPacket)
+		if !ok {
+			break
+		}
 		_, _ = a.audioQueue.PopFront()
-		a.onAvPacket(ppkt)
+		if a.onAvPacket != nil {
+			a.onAvPacket(ppkt)
+		}
 	}
 }
 
 func (a *AvPacketQueue) popAllVideo() {
+	// 健壮性：防止panic
+	defer func() {
+		if r := recover(); r != nil {
+			Log.Errorf("[AVQ] panic in popAllVideo: %v", r)
+		}
+	}()
+
+	// 健壮性：检查队列是否有效
+	if a == nil || a.videoQueue == nil {
+		return
+	}
+
 	//Log.Debugf("[AVQ] pop all video. audioQueue=%d, videoQueue=%d", a.audioQueue.Size(), a.videoQueue.Size())
 	for !a.videoQueue.Empty() {
-		pkt, _ := a.videoQueue.Front()
-		ppkt := pkt.(base.AvPacket)
+		pkt, err := a.videoQueue.Front()
+		if err != nil || pkt == nil {
+			break
+		}
+		ppkt, ok := pkt.(base.AvPacket)
+		if !ok {
+			break
+		}
 		_, _ = a.videoQueue.PopFront()
-		a.onAvPacket(ppkt)
+		if a.onAvPacket != nil {
+			a.onAvPacket(ppkt)
+		}
 	}
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
 
 func packetsReadable(pkts []base.AvPacket) string {
+	// 优化：使用预分配容量，减少内存重新分配
+	if len(pkts) == 0 {
+		return "[]"
+	}
+	// 估算容量：每个包约15-20字节
+	estimatedCap := len(pkts) * 20
 	var buf bytes.Buffer
+	buf.Grow(estimatedCap)
 	buf.WriteString("[")
-	for _, pkt := range pkts {
+	for i, pkt := range pkts {
+		if i > 0 {
+			buf.WriteByte(' ')
+		}
 		if pkt.IsAudio() {
-			buf.WriteString(fmt.Sprintf(" A(%d) ", pkt.Timestamp))
+			buf.WriteString(fmt.Sprintf("A(%d)", pkt.Timestamp))
 		} else if pkt.IsVideo() {
-			buf.WriteString(fmt.Sprintf(" V(%d) ", pkt.Timestamp))
+			buf.WriteString(fmt.Sprintf("V(%d)", pkt.Timestamp))
 		} else {
-			buf.WriteString(fmt.Sprintf(" U(%d) ", pkt.Timestamp))
+			buf.WriteString(fmt.Sprintf("U(%d)", pkt.Timestamp))
 		}
 	}
 	buf.WriteString("]")

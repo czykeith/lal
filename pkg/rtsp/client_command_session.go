@@ -265,8 +265,9 @@ func (session *ClientCommandSession) runReadLoop() {
 
 		// not over tcp
 		// 接收TCP对端关闭FIN信号
-		dummy := make([]byte, 1)
-		_, err := session.conn.Read(dummy)
+		// 优化：使用栈上分配，避免堆分配
+		var dummy [1]byte
+		_, err := session.conn.Read(dummy[:])
 		loopErr = err
 		return
 	}
@@ -553,13 +554,32 @@ func (session *ClientCommandSession) writeOneSetupTcp(setupUri string) error {
 }
 
 func (session *ClientCommandSession) writePlay() error {
+	// 健壮性：防止panic
+	defer func() {
+		if r := recover(); r != nil {
+			Log.Errorf("[%s] panic in writePlay: %v", session.uniqueKey, r)
+		}
+	}()
+
+	// 健壮性：检查session是否有效
+	if session == nil {
+		return nazaerrors.Wrap(base.ErrRtsp)
+	}
+
 	headers := map[string]string{
 		HeaderRange: HeaderRangeDefault,
 	}
 	// 如果设置了Scale参数，添加Scale请求头
 	if session.option.Scale > 0 {
+		// 健壮性：验证scale范围
+		const maxScale = 10.0
+		scale := session.option.Scale
+		if scale > maxScale {
+			Log.Warnf("[%s] scale too large, clamped to %.1f", session.uniqueKey, maxScale)
+			scale = maxScale
+		}
 		// 使用 %.1f 格式，确保显示为浮点数格式（例如 1.0, 2.0），符合 RTSP 规范
-		scaleStr := fmt.Sprintf("%.1f", session.option.Scale)
+		scaleStr := fmt.Sprintf("%.1f", scale)
 		headers[HeaderScale] = scaleStr
 		Log.Infof("[%s] set Scale header in PLAY request. scale=%s", session.uniqueKey, scaleStr)
 	}
@@ -581,10 +601,13 @@ func (session *ClientCommandSession) writePlay() error {
 
 			// 如果服务器不支持 Scale，启用客户端侧变速播放
 			// 通过类型断言检查 observer 是否是 PullSession
-			if pullSession, ok := session.observer.(interface {
-				EnableClientSideScale(scale float64)
-			}); ok {
-				pullSession.EnableClientSideScale(session.option.Scale)
+			// 健壮性：添加错误处理
+			if session.observer != nil {
+				if pullSession, ok := session.observer.(interface {
+					EnableClientSideScale(scale float64)
+				}); ok {
+					pullSession.EnableClientSideScale(session.option.Scale)
+				}
 			}
 		}
 	}
@@ -601,8 +624,9 @@ func (session *ClientCommandSession) writeRecord() error {
 
 func (session *ClientCommandSession) writeCmd(method, uri string, headers map[string]string, body string) error {
 	session.cseq++
+	// 优化：预分配map容量，减少重新分配
 	if headers == nil {
-		headers = make(map[string]string)
+		headers = make(map[string]string, 8) // 通常RTSP请求头不超过8个
 	}
 	headers[HeaderCSeq] = fmt.Sprintf("%d", session.cseq)
 	headers[HeaderUserAgent] = base.LalRtspPullSessionUa
@@ -621,8 +645,9 @@ func (session *ClientCommandSession) writeCmd(method, uri string, headers map[st
 	}
 
 	req := PackRequest(method, uri, headers, body)
-	//Log.Debugf("[%s] > write %s.", session.uniqueKey, method)
-	Log.Debugf("[%s] > write %s. req=%s", session.uniqueKey, method, req)
+	// 优化：减少频繁的Debug日志，特别是包含完整请求体的日志
+	// 只在需要调试时输出，避免性能开销
+	// Log.Debugf("[%s] > write %s. req=%s", session.uniqueKey, method, req)
 	_, err := session.conn.Write([]byte(req))
 	return err
 }
@@ -630,6 +655,19 @@ func (session *ClientCommandSession) writeCmd(method, uri string, headers map[st
 // @param headers 可以为nil
 // @param body 可以为空
 func (session *ClientCommandSession) writeCmdReadResp(method, uri string, headers map[string]string, body string) (ctx nazahttp.HttpRespMsgCtx, err error) {
+	// 健壮性：防止panic
+	defer func() {
+		if r := recover(); r != nil {
+			Log.Errorf("[%s] panic in writeCmdReadResp: %v, method=%s", session.uniqueKey, r, method)
+			err = nazaerrors.Wrap(base.ErrRtsp)
+		}
+	}()
+
+	// 健壮性：检查session和连接是否有效
+	if session == nil || session.conn == nil {
+		return ctx, nazaerrors.Wrap(base.ErrRtsp)
+	}
+
 	for i := 0; i < 2; i++ {
 		if err = session.writeCmd(method, uri, headers, body); err != nil {
 			return
@@ -639,8 +677,10 @@ func (session *ClientCommandSession) writeCmdReadResp(method, uri string, header
 		if err != nil {
 			return
 		}
-		Log.Debugf("[%s] < read response. version=%s, code=%s, reason=%s, headers=%+v, body=%s",
-			session.uniqueKey, ctx.Version, ctx.StatusCode, ctx.Reason, ctx.Headers, string(ctx.Body))
+		// 优化：减少频繁的Debug日志，特别是包含完整响应体的日志
+		// 只在需要调试时输出，避免性能开销和内存分配
+		// Log.Debugf("[%s] < read response. version=%s, code=%s, reason=%s, headers=%+v, body=%s",
+		// 	session.uniqueKey, ctx.Version, ctx.StatusCode, ctx.Reason, ctx.Headers, string(ctx.Body))
 
 		if ctx.StatusCode != "401" {
 			return
