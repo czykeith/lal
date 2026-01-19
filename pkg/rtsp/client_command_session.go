@@ -367,7 +367,10 @@ func (session *ClientCommandSession) writeDescribe() error {
 	}
 	// 如果设置了Scale参数，在DESCRIBE请求中也添加Scale请求头（某些服务器可能支持）
 	if session.option.Scale > 0 {
-		headers[HeaderScale] = fmt.Sprintf("%.2f", session.option.Scale)
+		// 使用 %.1f 格式，确保显示为浮点数格式（例如 1.0, 2.0），符合 RTSP 规范
+		scaleStr := fmt.Sprintf("%.1f", session.option.Scale)
+		headers[HeaderScale] = scaleStr
+		Log.Debugf("[%s] set Scale header in DESCRIBE. scale=%s", session.uniqueKey, scaleStr)
 	}
 	ctx, err := session.writeCmdReadResp(MethodDescribe, session.urlCtx.RawUrlWithoutUserInfo, headers, "")
 	if err != nil {
@@ -555,10 +558,37 @@ func (session *ClientCommandSession) writePlay() error {
 	}
 	// 如果设置了Scale参数，添加Scale请求头
 	if session.option.Scale > 0 {
-		headers[HeaderScale] = fmt.Sprintf("%.2f", session.option.Scale)
+		// 使用 %.1f 格式，确保显示为浮点数格式（例如 1.0, 2.0），符合 RTSP 规范
+		scaleStr := fmt.Sprintf("%.1f", session.option.Scale)
+		headers[HeaderScale] = scaleStr
+		Log.Infof("[%s] set Scale header in PLAY request. scale=%s", session.uniqueKey, scaleStr)
 	}
-	_, err := session.writeCmdReadResp(MethodPlay, session.urlCtx.RawUrlWithoutUserInfo, headers, "")
-	return err
+	ctx, err := session.writeCmdReadResp(MethodPlay, session.urlCtx.RawUrlWithoutUserInfo, headers, "")
+	if err != nil {
+		return err
+	}
+
+	// 检查服务器响应中是否包含 Scale 头，以确认服务器是否支持 Scale
+	if session.option.Scale > 0 {
+		serverScale := ctx.Headers.Get(HeaderScale)
+		if serverScale != "" {
+			Log.Infof("[%s] server supports Scale. requested=%s, server_scale=%s",
+				session.uniqueKey, fmt.Sprintf("%.1f", session.option.Scale), serverScale)
+		} else {
+			Log.Warnf("[%s] server does not support Scale (no Scale header in response). requested_scale=%.1f. "+
+				"Enabling client-side scale playback.",
+				session.uniqueKey, session.option.Scale)
+
+			// 如果服务器不支持 Scale，启用客户端侧变速播放
+			// 通过类型断言检查 observer 是否是 PullSession
+			if pullSession, ok := session.observer.(interface {
+				EnableClientSideScale(scale float64)
+			}); ok {
+				pullSession.EnableClientSideScale(session.option.Scale)
+			}
+		}
+	}
+	return nil
 }
 
 func (session *ClientCommandSession) writeRecord() error {

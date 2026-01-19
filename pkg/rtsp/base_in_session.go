@@ -73,6 +73,8 @@ type BaseInSession struct {
 	audioSsrc nazaatomic.Uint32
 	videoSsrc nazaatomic.Uint32
 
+	scale float64 // 客户端侧变速播放倍数，如果服务器不支持 Scale，使用此值调整时间戳
+
 	disposeOnce sync.Once
 	waitChan    chan error
 
@@ -101,6 +103,18 @@ func NewBaseInSessionWithObserver(sessionType base.SessionType, cmdSession IInte
 	return s
 }
 
+// SetScale 设置客户端侧变速播放倍数
+// 当服务器不支持 Scale 时，使用此方法启用客户端侧变速播放
+func (session *BaseInSession) SetScale(scale float64) {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	session.scale = scale
+	if session.avPacketQueue != nil {
+		session.avPacketQueue.SetScale(scale)
+	}
+	Log.Infof("[%s] set client-side scale. scale=%.1f", session.UniqueKey(), scale)
+}
+
 func (session *BaseInSession) InitWithSdp(sdpCtx sdp.LogicContext) {
 	session.mu.Lock()
 	session.sdpCtx = sdpCtx
@@ -124,6 +138,10 @@ func (session *BaseInSession) InitWithSdp(sdpCtx sdp.LogicContext) {
 		session.mu.Lock()
 		if BaseInSessionTimestampFilterFlag {
 			session.avPacketQueue = NewAvPacketQueue(session.onAvPacket)
+			// 如果已经设置了 scale，应用到新创建的 avPacketQueue
+			if session.scale > 0 {
+				session.avPacketQueue.SetScale(session.scale)
+			}
 		}
 		session.mu.Unlock()
 	}

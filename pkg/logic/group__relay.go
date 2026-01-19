@@ -78,19 +78,20 @@ func (group *Group) StartRelay(info base.ApiCtrlStartRelayReq) (string, string, 
 	if group.relayProxy.retryNum == 0 {
 		group.relayProxy.retryNum = base.PullRetryNumNever
 	}
-	// 转推模式下，auto_stop_pull_after_no_out_ms 强制设置为 -1（不自动停止）
-	group.relayProxy.autoStopPullAfterNoOutMs = base.AutoStopPullAfterNoOutMsNever
+	// 如果没有显式传入 auto_stop_pull_after_no_out_ms，则沿用默认值（不自动停止）
+	if group.relayProxy.autoStopPullAfterNoOutMs == 0 {
+		group.relayProxy.autoStopPullAfterNoOutMs = base.AutoStopPullAfterNoOutMsNever
+	}
 
 	// 启动拉流
-	// 转推模式下，auto_stop_pull_after_no_out_ms 强制设置为 -1（不自动停止）
-	// 因为转推的目的是推送到远程服务器，而不是为了本地观看
-
 	// 设置拉流参数（需要在释放锁前设置）
 	group.pullProxy.apiEnable = true
 	group.pullProxy.pullUrl = info.PullUrl
 	group.pullProxy.pullTimeoutMs = group.relayProxy.timeoutMs
 	group.pullProxy.pullRetryNum = group.relayProxy.retryNum
-	group.pullProxy.autoStopPullAfterNoOutMs = base.AutoStopPullAfterNoOutMsNever // 转推模式下强制不自动停止
+	// 这里沿用 HTTP API 传入的 auto_stop_pull_after_no_out_ms 语义：
+	// -1：永不自动停止；0：立即停止；>0：无观众持续指定毫秒后自动停止
+	group.pullProxy.autoStopPullAfterNoOutMs = group.relayProxy.autoStopPullAfterNoOutMs
 	group.pullProxy.rtspMode = group.relayProxy.rtspMode
 	// 转推模式下，不进行数据落盘，强制设置为空字符串
 	group.pullProxy.debugDumpPacket = ""

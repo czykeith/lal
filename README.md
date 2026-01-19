@@ -146,7 +146,8 @@ LAL 提供了丰富的 HTTP API 接口，用于控制和管理流媒体服务。
   "stream_name": "test_stream",                      // 流名称（可选，如果不提供则从 pull_url 解析）
   "timeout_ms": 10000,                               // 拉流和推流的超时时间（毫秒），默认 10000
   "retry_num": -1,                                   // 拉流和推流的重试次数，-1表示永远重试，大于0表示重试次数，0表示不重试，默认 0
-  "rtsp_mode": 0                                     // RTSP 模式，0=TCP，1=UDP，默认 0
+  "rtsp_mode": 0,                                    // RTSP 模式，0=TCP，1=UDP，默认 0
+  "scale": 1.0                                       // RTSP拉流时的播放速度倍数，例如1.0表示正常速度，2.0表示2倍速。如果为0或不设置，则不设置Scale头
 }
 ```
 
@@ -154,6 +155,7 @@ LAL 提供了丰富的 HTTP API 接口，用于控制和管理流媒体服务。
 - 转推模式下，`auto_stop_pull_after_no_out_ms` 参数会被忽略，系统会自动将其设置为 -1（不自动停止拉流），因为转推的目的是将流推送到远程服务器，而不是为了本地观看。
 - `timeout_ms` 和 `retry_num` 参数同时应用于拉流和推流操作。
 - 转推模式下，数据不会落盘，直接转发到目标服务器，以提高性能和减少磁盘I/O。
+- `scale` 参数仅对 RTSP 拉流有效，用于控制播放速度倍数。如果拉流地址是 RTMP，此参数会被忽略。
 
 **响应示例：**
 
@@ -180,7 +182,8 @@ curl -X POST http://127.0.0.1:8083/api/ctrl/start_relay \
     "push_url": "rtmp://example.com/live/stream",
     "stream_name": "test_stream",
     "timeout_ms": 10000,
-    "retry_num": -1
+    "retry_num": -1,
+    "scale": 1.0
   }'
 ```
 
@@ -431,7 +434,8 @@ curl "http://127.0.0.1:8083/api/stat/group?stream_name=test_stream"
   "stream_name": "test_stream",
   "pull_timeout_ms": 10000,
   "pull_retry_num": -1,
-  "rtsp_mode": 0
+  "rtsp_mode": 0,
+  "scale": 1.0                                       // RTSP拉流时的播放速度倍数，例如1.0表示正常速度，2.0表示2倍速。如果为0或不设置，则不设置Scale头
 }
 ```
 
