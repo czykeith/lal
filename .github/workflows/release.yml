@@ -1,0 +1,116 @@
+name: Release Build
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    name: Build for ${{ matrix.os }}/${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            goos: linux
+            goarch: amd64
+          - os: linux
+            arch: arm64
+            goos: linux
+            goarch: arm64
+          - os: windows
+            arch: amd64
+            goos: windows
+            goarch: amd64
+          - os: darwin
+            arch: amd64
+            goos: darwin
+            goarch: amd64
+          - os: darwin
+            arch: arm64
+            goos: darwin
+            goarch: arm64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 需要完整历史记录以获取 GitTag
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Configure Go environment
+        run: |
+          go env -w GO111MODULE=on
+          go env -w GOPROXY=https://goproxy.cn,https://goproxy.io,direct
+
+      - name: Get version info
+        id: version
+        run: |
+          # 使用 release tag，如果没有则使用最新的 git tag
+          GIT_TAG="${{ github.event.release.tag_name }}"
+          if [ -z "$GIT_TAG" ]; then
+            GIT_TAG=$(git tag | sort -V | tail -n 1 || echo "")
+          fi
+          GIT_COMMIT=$(git log --pretty=oneline -n 1)
+          BUILD_TIME=$(date +'%Y.%m.%d.%H%M%S')
+          BUILD_GO_VERSION=$(go version)
+          
+          echo "tag=${GIT_TAG}" >> $GITHUB_OUTPUT
+          echo "commit=${GIT_COMMIT}" >> $GITHUB_OUTPUT
+          echo "build_time=${BUILD_TIME}" >> $GITHUB_OUTPUT
+          echo "go_version=${BUILD_GO_VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          # 确保输出目录存在
+          mkdir -p bin
+          
+          LDFLAGS="-X 'github.com/q191201771/naza/pkg/bininfo.GitTag=${{ steps.version.outputs.tag }}' \
+                   -X 'github.com/q191201771/naza/pkg/bininfo.GitCommitLog=${{ steps.version.outputs.commit }}' \
+                   -X 'github.com/q191201771/naza/pkg/bininfo.BuildTime=${{ steps.version.outputs.build_time }}' \
+                   -X 'github.com/q191201771/naza/pkg/bininfo.BuildGoVersion=${{ steps.version.outputs.go_version }}'"
+          
+          cd app/lalserver
+          
+          OUTPUT_NAME="lalserver"
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            OUTPUT_NAME="lalserver.exe"
+          fi
+          
+          go build -ldflags "$LDFLAGS" -o "../../bin/${OUTPUT_NAME}"
+          
+          echo "Binary built: bin/${OUTPUT_NAME}"
+
+      - name: Install zip (for Windows)
+        if: matrix.goos == 'windows'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zip
+
+      - name: Create archive
+        run: |
+          cd bin
+          ARCHIVE_NAME="lalserver-${{ matrix.os }}-${{ matrix.arch }}"
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            zip "${ARCHIVE_NAME}.zip" lalserver.exe
+            echo "ARCHIVE_PATH=bin/${ARCHIVE_NAME}.zip" >> $GITHUB_ENV
+          else
+            tar czf "${ARCHIVE_NAME}.tar.gz" lalserver
+            echo "ARCHIVE_PATH=bin/${ARCHIVE_NAME}.tar.gz" >> $GITHUB_ENV
+          fi
+
+      - name: Upload to release assets
+        uses: softprops/action-gh-release@v1
+        with:
+          files: ${{ env.ARCHIVE_PATH }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
