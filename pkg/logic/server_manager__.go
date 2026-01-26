@@ -9,6 +9,7 @@
 package logic
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/http"
@@ -185,11 +186,21 @@ func (sm *ServerManager) RunLoop() error {
 
 	if sm.pprofServer != nil {
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					Log.Errorf("pprof server panic recovered: %+v", r)
+				}
+			}()
 			//Log.Warn("start fgprof.")
 			//http.DefaultServeMux.Handle("/debug/fgprof", fgprof.Handler())
 			Log.Infof("start web pprof listen. addr=%s", sm.config.PprofConfig.Addr)
 			if err := sm.pprofServer.ListenAndServe(); err != nil {
-				Log.Error(err)
+				// http.ErrServerClosed 是正常关闭，不需要记录错误
+				if err != http.ErrServerClosed {
+					Log.Errorf("pprof server error: %+v", err)
+				} else {
+					Log.Debug("pprof server closed")
+				}
 			}
 		}()
 	}
@@ -238,19 +249,29 @@ func (sm *ServerManager) RunLoop() error {
 
 	if sm.httpServerManager != nil {
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					Log.Errorf("http server manager panic recovered: %+v", r)
+				}
+			}()
 			if err := sm.httpServerManager.RunLoop(); err != nil {
-				Log.Error(err)
+				Log.Errorf("http server manager error: %+v", err)
 			}
 		}()
 	}
 
 	if sm.rtmpServer != nil {
 		if err := sm.rtmpServer.Listen(); err != nil {
-			return err
+			return fmt.Errorf("rtmp server listen failed: %w", err)
 		}
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					Log.Errorf("rtmp server panic recovered: %+v", r)
+				}
+			}()
 			if err := sm.rtmpServer.RunLoop(); err != nil {
-				Log.Error(err)
+				Log.Errorf("rtmp server error: %+v", err)
 			}
 		}()
 	}
@@ -260,20 +281,32 @@ func (sm *ServerManager) RunLoop() error {
 		// rtmps启动失败影响降级：当rtmps启动时我们并不返回错误，保证不因为rtmps影响其他服务
 		if err == nil {
 			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						Log.Errorf("rtmps server panic recovered: %+v", r)
+					}
+				}()
 				if errRun := sm.rtmpsServer.RunLoop(); errRun != nil {
-					Log.Error(errRun)
+					Log.Errorf("rtmps server error: %+v", errRun)
 				}
 			}()
+		} else {
+			Log.Warnf("rtmps server listen failed (non-fatal): %+v", err)
 		}
 	}
 
 	if sm.rtspServer != nil {
 		if err := sm.rtspServer.Listen(); err != nil {
-			return err
+			return fmt.Errorf("rtsp server listen failed: %w", err)
 		}
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					Log.Errorf("rtsp server panic recovered: %+v", r)
+				}
+			}()
 			if err := sm.rtspServer.RunLoop(); err != nil {
-				Log.Error(err)
+				Log.Errorf("rtsp server error: %+v", err)
 			}
 		}()
 	}
@@ -283,40 +316,62 @@ func (sm *ServerManager) RunLoop() error {
 		// rtsps启动失败影响降级：当rtsps启动时我们并不返回错误，保证不因为rtsps影响其他服务
 		if err == nil {
 			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						Log.Errorf("rtsps server panic recovered: %+v", r)
+					}
+				}()
 				if errRun := sm.rtspsServer.RunLoop(); errRun != nil {
-					Log.Error(errRun)
+					Log.Errorf("rtsps server error: %+v", errRun)
 				}
 			}()
+		} else {
+			Log.Warnf("rtsps server listen failed (non-fatal): %+v", err)
 		}
 	}
 
 	if sm.wsrtspServer != nil {
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					Log.Errorf("wsrtsp server panic recovered: %+v", r)
+				}
+			}()
 			err := sm.wsrtspServer.Listen()
 			if err != nil {
-				Log.Error(err)
+				Log.Errorf("wsrtsp server listen error: %+v", err)
 			}
 		}()
 	}
 
 	if sm.httpApiServer != nil {
 		if err := sm.httpApiServer.Listen(); err != nil {
-			return err
+			return fmt.Errorf("http api server listen failed: %w", err)
 		}
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					Log.Errorf("http api server panic recovered: %+v", r)
+				}
+			}()
 			if err := sm.httpApiServer.RunLoop(); err != nil {
-				Log.Error(err)
+				Log.Errorf("http api server error: %+v", err)
 			}
 		}()
 	}
 
 	if sm.gb28181Server != nil {
 		if err := sm.gb28181Server.Listen(); err != nil {
-			return err
+			return fmt.Errorf("gb28181 server listen failed: %w", err)
 		}
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					Log.Errorf("gb28181 server panic recovered: %+v", r)
+				}
+			}()
 			if err := sm.gb28181Server.RunLoop(); err != nil {
-				Log.Error(err)
+				Log.Errorf("gb28181 server error: %+v", err)
 			}
 		}()
 	}
@@ -383,46 +438,87 @@ func (sm *ServerManager) RunLoop() error {
 func (sm *ServerManager) Dispose() {
 	Log.Debug("dispose server manager.")
 
+	// 清理通知处理线程池
+	if sm.notifyHandlerThread != nil {
+		// taskpool.Pool 通常有 Stop 或 Close 方法，但为了兼容性，这里先检查
+		// 如果 taskpool 提供了 Stop 方法，应该在这里调用
+		// 注意：taskpool 的具体实现可能不同，需要根据实际情况调整
+		if stopFunc, ok := interface{}(sm.notifyHandlerThread).(interface{ Stop() }); ok {
+			stopFunc.Stop()
+		}
+	}
+
+	// 清理所有服务器实例
 	if sm.rtmpServer != nil {
 		sm.rtmpServer.Dispose()
+		sm.rtmpServer = nil
 	}
 
 	if sm.rtmpsServer != nil {
 		sm.rtmpsServer.Dispose()
+		sm.rtmpsServer = nil
 	}
 
 	if sm.rtspServer != nil {
 		sm.rtspServer.Dispose()
+		sm.rtspServer = nil
 	}
 
 	if sm.rtspsServer != nil {
 		sm.rtspsServer.Dispose()
+		sm.rtspsServer = nil
 	}
 
 	if sm.gb28181Server != nil {
 		sm.gb28181Server.Dispose()
+		sm.gb28181Server = nil
 	}
 
 	if sm.httpServerManager != nil {
 		sm.httpServerManager.Dispose()
+		sm.httpServerManager = nil
 	}
 
+	// 关闭 pprof 服务器
 	if sm.pprofServer != nil {
-		sm.pprofServer.Close()
+		// 使用 Shutdown 进行优雅关闭，如果失败则使用 Close 强制关闭
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := sm.pprofServer.Shutdown(ctx); err != nil {
+			Log.Warnf("pprof server shutdown failed, force close: %+v", err)
+			// Shutdown 失败时，使用 Close 强制关闭
+			if closeErr := sm.pprofServer.Close(); closeErr != nil {
+				Log.Warnf("pprof server force close failed: %+v", closeErr)
+			}
+		}
+		sm.pprofServer = nil
 	}
 
 	//if sm.hlsServer != nil {
 	//	sm.hlsServer.Dispose()
 	//}
 
+	// 清理所有 group，使用 defer 确保 mutex 解锁
 	sm.mutex.Lock()
+	defer sm.mutex.Unlock()
+
 	sm.groupManager.Iterate(func(group *Group) bool {
-		group.Dispose()
+		if group != nil {
+			group.Dispose()
+		}
 		return true
 	})
-	sm.mutex.Unlock()
 
-	sm.exitChan <- struct{}{}
+	// 发送退出信号，使用非阻塞方式避免死锁
+	select {
+	case sm.exitChan <- struct{}{}:
+		// 成功发送
+	default:
+		// channel 已满或已关闭，记录警告但不阻塞
+		Log.Warn("exit channel is full or closed, skip sending exit signal")
+	}
+
+	Log.Debug("server manager disposed successfully")
 }
 
 // ---------------------------------------------------------------------------------------------------------------------

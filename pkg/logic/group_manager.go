@@ -8,6 +8,8 @@
 
 package logic
 
+import "sync"
+
 // ---------------------------------------------------------------------------------------------------------------------
 
 type IGroupCreator interface {
@@ -51,6 +53,7 @@ type IGroupManager interface {
 type SimpleGroupManager struct {
 	groupCreator IGroupCreator
 	groups       map[string]*Group // streamName -> Group
+	mutex        sync.RWMutex      // 保护 groups 的并发访问
 }
 
 func NewSimpleGroupManager(groupCreator IGroupCreator) *SimpleGroupManager {
@@ -61,16 +64,26 @@ func NewSimpleGroupManager(groupCreator IGroupCreator) *SimpleGroupManager {
 }
 
 func (s *SimpleGroupManager) GetOrCreateGroup(appName string, streamName string) (group *Group, createFlag bool) {
-	g := s.GetGroup(appName, streamName)
-	if g == nil {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	g, ok := s.groups[streamName]
+	if !ok {
 		g = s.groupCreator.CreateGroup(appName, streamName)
-		s.groups[streamName] = g
-		return g, true
+		if g != nil {
+			s.groups[streamName] = g
+			return g, true
+		}
+		// 如果创建失败，返回 nil
+		return nil, false
 	}
 	return g, false
 }
 
 func (s *SimpleGroupManager) GetGroup(appName string, streamName string) *Group {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+
 	g, ok := s.groups[streamName]
 	if !ok {
 		return nil
@@ -79,14 +92,32 @@ func (s *SimpleGroupManager) GetGroup(appName string, streamName string) *Group 
 }
 
 func (s *SimpleGroupManager) Iterate(onIterateGroup func(group *Group) bool) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	// 收集需要删除的 key
+	var toDelete []string
 	for streamName, group := range s.groups {
-		if !onIterateGroup(group) {
-			delete(s.groups, streamName)
+		if group == nil {
+			// 如果 group 为 nil，也应该删除
+			toDelete = append(toDelete, streamName)
+			continue
 		}
+		if !onIterateGroup(group) {
+			toDelete = append(toDelete, streamName)
+		}
+	}
+
+	// 删除标记的 group
+	for _, streamName := range toDelete {
+		delete(s.groups, streamName)
 	}
 }
 
 func (s *SimpleGroupManager) Len() int {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+
 	return len(s.groups)
 }
 
@@ -127,6 +158,7 @@ type ComplexGroupManager struct {
 	// 注意，一个group只可能在一个容器中，两个容器中的group加起来才是全量
 	onlyStreamNameGroups    map[string]*Group            // streamName -> Group
 	appNameStreamNameGroups map[string]map[string]*Group // appName -> streamName -> Group
+	mutex                   sync.RWMutex                 // 保护所有 maps 的并发访问
 }
 
 func NewComplexGroupManager(groupCreator IGroupCreator) *ComplexGroupManager {
@@ -147,6 +179,9 @@ func (gm *ComplexGroupManager) GetGroup(appName string, streamName string) *Grou
 }
 
 func (gm *ComplexGroupManager) getGroup(appName string, streamName string, shouldCreate bool) (group *Group, createFlag bool) {
+	gm.mutex.Lock()
+	defer gm.mutex.Unlock()
+
 	var ok bool
 	if appName == "" {
 		group, ok = gm.onlyStreamNameGroups[streamName]
@@ -167,8 +202,12 @@ func (gm *ComplexGroupManager) getGroup(appName string, streamName string, shoul
 		// 两个容器都没找到
 		if shouldCreate {
 			group = gm.groupCreator.CreateGroup(appName, streamName)
-			gm.onlyStreamNameGroups[streamName] = group
-			return group, true
+			if group != nil {
+				gm.onlyStreamNameGroups[streamName] = group
+				return group, true
+			}
+			// 如果创建失败，返回 nil
+			return nil, false
 		} else {
 			return nil, false
 		}
@@ -191,12 +230,16 @@ func (gm *ComplexGroupManager) getGroup(appName string, streamName string, shoul
 		// 都没有找到
 		if shouldCreate {
 			group = gm.groupCreator.CreateGroup(appName, streamName)
-			if !mok {
-				m = make(map[string]*Group)
-				gm.appNameStreamNameGroups[appName] = m
+			if group != nil {
+				if !mok {
+					m = make(map[string]*Group)
+					gm.appNameStreamNameGroups[appName] = m
+				}
+				m[streamName] = group
+				return group, true
 			}
-			m[streamName] = group
-			return group, true
+			// 如果创建失败，返回 nil
+			return nil, false
 		} else {
 			return nil, false
 		}
@@ -204,25 +247,73 @@ func (gm *ComplexGroupManager) getGroup(appName string, streamName string, shoul
 }
 
 func (gm *ComplexGroupManager) Iterate(onIterateGroup func(group *Group) bool) {
+	gm.mutex.Lock()
+	defer gm.mutex.Unlock()
+
+	// 收集需要删除的 key
+	var toDeleteOnlyStreamName []string
 	for streamName, group := range gm.onlyStreamNameGroups {
+		if group == nil {
+			// 如果 group 为 nil，也应该删除
+			toDeleteOnlyStreamName = append(toDeleteOnlyStreamName, streamName)
+			continue
+		}
 		if !onIterateGroup(group) {
-			delete(gm.onlyStreamNameGroups, streamName)
+			toDeleteOnlyStreamName = append(toDeleteOnlyStreamName, streamName)
 		}
 	}
 
+	// 删除标记的 group
+	for _, streamName := range toDeleteOnlyStreamName {
+		delete(gm.onlyStreamNameGroups, streamName)
+	}
+
+	// 收集需要删除的 appName 和 streamName
+	var toDeleteAppNameStreamName []struct {
+		appName    string
+		streamName string
+	}
+	var toDeleteAppName []string
+
 	for appName, m := range gm.appNameStreamNameGroups {
 		for streamName, group := range m {
+			if group == nil {
+				// 如果 group 为 nil，也应该删除
+				toDeleteAppNameStreamName = append(toDeleteAppNameStreamName, struct {
+					appName    string
+					streamName string
+				}{appName: appName, streamName: streamName})
+				continue
+			}
 			if !onIterateGroup(group) {
-				delete(m, streamName)
-				if len(m) == 0 {
-					delete(gm.appNameStreamNameGroups, appName)
-				}
+				toDeleteAppNameStreamName = append(toDeleteAppNameStreamName, struct {
+					appName    string
+					streamName string
+				}{appName: appName, streamName: streamName})
 			}
 		}
+	}
+
+	// 删除标记的 group
+	for _, item := range toDeleteAppNameStreamName {
+		if m, ok := gm.appNameStreamNameGroups[item.appName]; ok {
+			delete(m, item.streamName)
+			if len(m) == 0 {
+				toDeleteAppName = append(toDeleteAppName, item.appName)
+			}
+		}
+	}
+
+	// 删除空的 appName
+	for _, appName := range toDeleteAppName {
+		delete(gm.appNameStreamNameGroups, appName)
 	}
 }
 
 func (gm *ComplexGroupManager) Len() int {
+	gm.mutex.RLock()
+	defer gm.mutex.RUnlock()
+
 	var c int
 	for _, m := range gm.appNameStreamNameGroups {
 		c += len(m)
