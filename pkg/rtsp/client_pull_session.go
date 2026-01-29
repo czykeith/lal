@@ -28,7 +28,7 @@ type PullSessionOption struct {
 
 	OverTcp bool // 是否使用interleaved模式，也即是否通过rtsp command tcp连接传输rtp/rtcp数据
 
-	Scale float64 // RTSP拉流时的播放速度倍数，例如1.0表示正常速度，2.0表示2倍速。如果为0，则不设置Scale头
+	Scale float64 // RTSP拉流时的播放速度倍数，例如1.0表示正常速度，2.0表示2倍速。统一使用代码实现倍速，不再发送Scale头
 }
 
 var defaultPullSessionOption = PullSessionOption{
@@ -239,6 +239,10 @@ func (session *PullSession) OnSetupWithChannel(uri string, rtpChannel, rtcpChann
 // OnSetupResult callback by ClientCommandSession
 func (session *PullSession) OnSetupResult() {
 	session.baseInSession.WriteRtpRtcpDummy()
+	// 如果设置了scale，在SETUP完成后启用客户端侧倍速（统一使用代码实现）
+	if session.scale > 0 {
+		session.EnableClientSideScale(session.scale)
+	}
 }
 
 // OnInterleavedPacket callback by ClientCommandSession
@@ -247,7 +251,7 @@ func (session *PullSession) OnInterleavedPacket(packet []byte, channel int) {
 }
 
 // EnableClientSideScale 启用客户端侧变速播放
-// 当服务器不支持 Scale 时调用此方法
+// 统一使用代码实现倍速，通过调整时间戳间隔来实现倍速效果
 func (session *PullSession) EnableClientSideScale(scale float64) {
 	// 健壮性：检查session是否有效
 	if session == nil {

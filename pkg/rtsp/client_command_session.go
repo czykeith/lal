@@ -42,7 +42,7 @@ const (
 type ClientCommandSessionOption struct {
 	DoTimeoutMs int
 	OverTcp     bool
-	Scale       float64 // RTSP拉流时的播放速度倍数，例如1.0表示正常速度，2.0表示2倍速。如果为0，则不设置Scale头
+	Scale       float64 // RTSP拉流时的播放速度倍数，例如1.0表示正常速度，2.0表示2倍速。统一使用代码实现倍速，不再发送Scale头
 }
 
 var defaultClientCommandSessionOption = ClientCommandSessionOption{
@@ -366,13 +366,7 @@ func (session *ClientCommandSession) writeDescribe() error {
 	headers := map[string]string{
 		HeaderAccept: HeaderAcceptApplicationSdp,
 	}
-	// 如果设置了Scale参数，在DESCRIBE请求中也添加Scale请求头（某些服务器可能支持）
-	if session.option.Scale > 0 {
-		// 使用 %.1f 格式，确保显示为浮点数格式（例如 1.0, 2.0），符合 RTSP 规范
-		scaleStr := fmt.Sprintf("%.1f", session.option.Scale)
-		headers[HeaderScale] = scaleStr
-		Log.Debugf("[%s] set Scale header in DESCRIBE. scale=%s", session.uniqueKey, scaleStr)
-	}
+	// 不再发送Scale头，统一使用代码实现倍速
 	ctx, err := session.writeCmdReadResp(MethodDescribe, session.urlCtx.RawUrlWithoutUserInfo, headers, "")
 	if err != nil {
 		return err
@@ -569,7 +563,13 @@ func (session *ClientCommandSession) writePlay() error {
 	headers := map[string]string{
 		HeaderRange: HeaderRangeDefault,
 	}
-	// 如果设置了Scale参数，添加Scale请求头
+	// 不再发送Scale头，统一使用代码实现倍速
+	_, err := session.writeCmdReadResp(MethodPlay, session.urlCtx.RawUrlWithoutUserInfo, headers, "")
+	if err != nil {
+		return err
+	}
+
+	// 如果设置了Scale参数，启用客户端侧变速播放（统一使用代码实现）
 	if session.option.Scale > 0 {
 		// 健壮性：验证scale范围
 		const maxScale = 10.0
@@ -578,36 +578,14 @@ func (session *ClientCommandSession) writePlay() error {
 			Log.Warnf("[%s] scale too large, clamped to %.1f", session.uniqueKey, maxScale)
 			scale = maxScale
 		}
-		// 使用 %.1f 格式，确保显示为浮点数格式（例如 1.0, 2.0），符合 RTSP 规范
-		scaleStr := fmt.Sprintf("%.1f", scale)
-		headers[HeaderScale] = scaleStr
-		Log.Infof("[%s] set Scale header in PLAY request. scale=%s", session.uniqueKey, scaleStr)
-	}
-	ctx, err := session.writeCmdReadResp(MethodPlay, session.urlCtx.RawUrlWithoutUserInfo, headers, "")
-	if err != nil {
-		return err
-	}
-
-	// 检查服务器响应中是否包含 Scale 头，以确认服务器是否支持 Scale
-	if session.option.Scale > 0 {
-		serverScale := ctx.Headers.Get(HeaderScale)
-		if serverScale != "" {
-			Log.Infof("[%s] server supports Scale. requested=%s, server_scale=%s",
-				session.uniqueKey, fmt.Sprintf("%.1f", session.option.Scale), serverScale)
-		} else {
-			Log.Warnf("[%s] server does not support Scale (no Scale header in response). requested_scale=%.1f. "+
-				"Enabling client-side scale playback.",
-				session.uniqueKey, session.option.Scale)
-
-			// 如果服务器不支持 Scale，启用客户端侧变速播放
-			// 通过类型断言检查 observer 是否是 PullSession
-			// 健壮性：添加错误处理
-			if session.observer != nil {
-				if pullSession, ok := session.observer.(interface {
-					EnableClientSideScale(scale float64)
-				}); ok {
-					pullSession.EnableClientSideScale(session.option.Scale)
-				}
+		// 通过类型断言检查 observer 是否是 PullSession
+		// 健壮性：添加错误处理
+		if session.observer != nil {
+			if pullSession, ok := session.observer.(interface {
+				EnableClientSideScale(scale float64)
+			}); ok {
+				pullSession.EnableClientSideScale(scale)
+				Log.Infof("[%s] enabled client-side scale playback. scale=%.1f", session.uniqueKey, scale)
 			}
 		}
 	}

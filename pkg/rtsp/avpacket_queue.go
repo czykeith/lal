@@ -45,7 +45,7 @@ type AvPacketQueue struct {
 	audioPrevIntervalTs int64
 	videoPrevIntervalTs int64
 
-	scale float64 // 客户端侧变速播放倍数，用于调整时间戳间隔
+	scale float64 // 客户端侧变速播放倍数，统一使用代码实现倍速，通过调整时间戳间隔来实现倍速效果
 
 	// 用于平滑变速的累积时间戳
 	audioOriginBaseTs int64 // 音频原始时间戳基准（累积）
@@ -83,6 +83,7 @@ func NewAvPacketQueue(onAvPacket OnAvPacket) *AvPacketQueue {
 }
 
 // SetScale 设置客户端侧变速播放倍数
+// 统一使用代码实现倍速，通过调整时间戳间隔来实现倍速效果
 func (a *AvPacketQueue) SetScale(scale float64) {
 	if scale > 0 {
 		// 如果 scale 改变，需要调整基准以保持连续性

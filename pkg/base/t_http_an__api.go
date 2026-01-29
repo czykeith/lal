@@ -31,7 +31,7 @@ type ApiCtrlStartRelayPullReq struct {
 	AutoStopPullAfterNoOutMs int     `json:"auto_stop_pull_after_no_out_ms"`
 	RtspMode                 int     `json:"rtsp_mode"`
 	DebugDumpPacket          string  `json:"debug_dump_packet"`
-	Scale                    float64 `json:"scale"` // RTSP拉流时的播放速度倍数，例如1.0表示正常速度，2.0表示2倍速
+	Scale                    float64 `json:"scale"` // RTSP拉流时的播放速度倍数，例如1.0表示正常速度，2.0表示2倍速。统一使用代码实现倍速，不依赖RTSP协议支持
 }
 
 type ApiCtrlKickSessionReq struct {

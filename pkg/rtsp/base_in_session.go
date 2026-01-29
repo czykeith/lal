@@ -70,7 +70,7 @@ type BaseInSession struct {
 	audioSsrc nazaatomic.Uint32
 	videoSsrc nazaatomic.Uint32
 
-	scale float64 // 客户端侧变速播放倍数，如果服务器不支持 Scale，使用此值调整时间戳
+	scale float64 // 客户端侧变速播放倍数，统一使用代码实现倍速，通过调整时间戳间隔来实现倍速效果
 
 	disposeOnce sync.Once
 	waitChan    chan error
@@ -101,7 +101,7 @@ func NewBaseInSessionWithObserver(sessionType base.SessionType, cmdSession IInte
 }
 
 // SetScale 设置客户端侧变速播放倍数
-// 当服务器不支持 Scale 时，使用此方法启用客户端侧变速播放
+// 统一使用代码实现倍速，通过调整时间戳间隔来实现倍速效果
 func (session *BaseInSession) SetScale(scale float64) {
 	// 健壮性：检查session是否有效
 	if session == nil {
