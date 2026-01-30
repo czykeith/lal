@@ -21,6 +21,8 @@ import (
 	"github.com/q191201771/lal/pkg/avc"
 	"github.com/q191201771/lal/pkg/base"
 	"github.com/q191201771/lal/pkg/hevc"
+	"github.com/q191201771/lal/pkg/httpflv"
+	"github.com/q191201771/lal/pkg/httpts"
 	"github.com/q191201771/lal/pkg/remux"
 	"github.com/q191201771/lal/pkg/rtprtcp"
 	"github.com/q191201771/lal/pkg/sdp"
@@ -38,6 +40,13 @@ import (
 // 输入rtmp数据.
 // 来自 rtmp.ServerSession(Pub), rtmp.PullSession, CustomizePubSessionContext(remux.AvPacket2RtmpRemuxer), (remux.DummyAudioFilter) 的回调.
 func (group *Group) OnReadRtmpAvMsg(msg base.RtmpMsg) {
+	// 添加 panic 恢复保护
+	defer func() {
+		if r := recover(); r != nil {
+			Log.Errorf("[%s] panic in OnReadRtmpAvMsg: %v", group.UniqueKey, r)
+		}
+	}()
+
 	group.mutex.Lock()
 	defer group.mutex.Unlock()
 	if group.dummyAudioFilter != nil {
@@ -68,6 +77,13 @@ func (group *Group) OnSdp(sdpCtx sdp.LogicContext) {
 
 // OnRtpPacket ...
 func (group *Group) OnRtpPacket(pkt rtprtcp.RtpPacket) {
+	// 添加 panic 恢复保护
+	defer func() {
+		if r := recover(); r != nil {
+			Log.Errorf("[%s] panic in OnRtpPacket: %v", group.UniqueKey, r)
+		}
+	}()
+
 	group.mutex.Lock()
 	defer group.mutex.Unlock()
 	group.feedRtpPacket(pkt)
@@ -78,6 +94,13 @@ func (group *Group) OnRtpPacket(pkt rtprtcp.RtpPacket) {
 
 // OnAvPacket ...
 func (group *Group) OnAvPacket(pkt base.AvPacket) {
+	// 添加 panic 恢复保护
+	defer func() {
+		if r := recover(); r != nil {
+			Log.Errorf("[%s] panic in OnAvPacket: %v", group.UniqueKey, r)
+		}
+	}()
+
 	group.mutex.Lock()
 	defer group.mutex.Unlock()
 
@@ -97,12 +120,19 @@ func (group *Group) OnAvPacket(pkt base.AvPacket) {
 func (group *Group) OnAvPacketFromPsPubSession(pkt *base.AvPacket) {
 	// TODO(chef): [refactor] 统一所有回调，AvPacket和*AvPacket 202208
 
+	// 添加 panic 恢复保护
+	defer func() {
+		if r := recover(); r != nil {
+			Log.Errorf("[%s] panic in OnAvPacketFromPsPubSession: %v", group.UniqueKey, r)
+		}
+	}()
+
 	group.mutex.Lock()
 	defer group.mutex.Unlock()
 
 	//Log.Debugf("Group::OnAvPacketFromPsPubSession. pkt=%s", pkt.DebugString())
 
-	if group.rtsp2RtmpRemuxer != nil {
+	if group.rtsp2RtmpRemuxer != nil && pkt != nil {
 		group.rtsp2RtmpRemuxer.OnAvPacket(*pkt)
 	}
 }
@@ -179,6 +209,13 @@ func (group *Group) OnFragmentOpen() {
 //
 // @param msg 调用结束后，内部不持有msg.Payload内存块
 func (group *Group) broadcastByRtmpMsg(msg base.RtmpMsg) {
+	// 添加 panic 恢复保护，防止高负载时崩溃
+	defer func() {
+		if r := recover(); r != nil {
+			Log.Errorf("[%s] panic in broadcastByRtmpMsg: %v, msgType=%d", group.UniqueKey, r, msg.Header.MsgTypeId)
+		}
+	}()
+
 	//Log.Debugf("> broadcastByRtmpMsg. %s", msg.DebugString())
 
 	if msg.Header.MsgLen != uint32(len(msg.Payload)) {
@@ -246,20 +283,37 @@ func (group *Group) broadcastByRtmpMsg(msg base.RtmpMsg) {
 
 	// # 广播。遍历所有 rtmp sub session，转发数据
 	// ## 如果是新的 sub session，发送已缓存的信息
+	// 使用函数包装，为每个 session 的 Write 操作添加 panic 保护
+	writeRtmpSession := func(session *rtmp.ServerSession, data []byte) {
+		defer func() {
+			if r := recover(); r != nil {
+				Log.Errorf("[%s] panic in rtmp session write: %v, session=%s", group.UniqueKey, r, session.UniqueKey())
+			}
+		}()
+		if session != nil {
+			_ = session.Write(data)
+		}
+	}
+
 	for session := range group.rtmpSubSessionSet {
+		// 检查 session 是否有效
+		if session == nil {
+			continue
+		}
+
 		if session.IsFresh {
 			// TODO chef: 头信息和full gop也可以在SubSession刚加入时发送
 			if group.rtmpGopCache.MetadataEnsureWithoutSetDataFrame != nil {
 				Log.Debugf("[%s] [%s] write metadata", group.UniqueKey, session.UniqueKey())
-				_ = session.Write(group.rtmpGopCache.MetadataEnsureWithoutSetDataFrame)
+				writeRtmpSession(session, group.rtmpGopCache.MetadataEnsureWithoutSetDataFrame)
 			}
 			if group.rtmpGopCache.VideoSeqHeader != nil {
 				Log.Debugf("[%s] [%s] write vsh", group.UniqueKey, session.UniqueKey())
-				_ = session.Write(group.rtmpGopCache.VideoSeqHeader)
+				writeRtmpSession(session, group.rtmpGopCache.VideoSeqHeader)
 			}
 			if group.rtmpGopCache.AacSeqHeader != nil {
 				Log.Debugf("[%s] [%s] write ash", group.UniqueKey, session.UniqueKey())
-				_ = session.Write(group.rtmpGopCache.AacSeqHeader)
+				writeRtmpSession(session, group.rtmpGopCache.AacSeqHeader)
 			}
 			gopCount := group.rtmpGopCache.GetGopCount()
 			if gopCount > 0 {
@@ -270,7 +324,7 @@ func (group *Group) broadcastByRtmpMsg(msg base.RtmpMsg) {
 			}
 			for i := 0; i < gopCount; i++ {
 				for _, item := range group.rtmpGopCache.GetGopDataAt(i) {
-					_ = session.Write(item)
+					writeRtmpSession(session, item)
 				}
 			}
 
@@ -338,16 +392,33 @@ func (group *Group) broadcastByRtmpMsg(msg base.RtmpMsg) {
 	}
 
 	// # 广播。遍历所有 httpflv sub session，转发数据
+	// 使用函数包装，为每个 session 的 Write 操作添加 panic 保护
+	writeHttpflvSession := func(session *httpflv.SubSession, data []byte) {
+		defer func() {
+			if r := recover(); r != nil {
+				Log.Errorf("[%s] panic in httpflv session write: %v, session=%s", group.UniqueKey, r, session.UniqueKey())
+			}
+		}()
+		if session != nil {
+			session.Write(data)
+		}
+	}
+
 	for session := range group.httpflvSubSessionSet {
+		// 检查 session 是否有效
+		if session == nil {
+			continue
+		}
+
 		if session.IsFresh {
 			if group.httpflvGopCache.MetadataEnsureWithoutSetDataFrame != nil {
-				session.Write(group.httpflvGopCache.MetadataEnsureWithoutSetDataFrame)
+				writeHttpflvSession(session, group.httpflvGopCache.MetadataEnsureWithoutSetDataFrame)
 			}
 			if group.httpflvGopCache.VideoSeqHeader != nil {
-				session.Write(group.httpflvGopCache.VideoSeqHeader)
+				writeHttpflvSession(session, group.httpflvGopCache.VideoSeqHeader)
 			}
 			if group.httpflvGopCache.AacSeqHeader != nil {
-				session.Write(group.httpflvGopCache.AacSeqHeader)
+				writeHttpflvSession(session, group.httpflvGopCache.AacSeqHeader)
 			}
 			gopCount := group.httpflvGopCache.GetGopCount()
 			if gopCount > 0 {
@@ -356,7 +427,7 @@ func (group *Group) broadcastByRtmpMsg(msg base.RtmpMsg) {
 			}
 			for i := 0; i < gopCount; i++ {
 				for _, item := range group.httpflvGopCache.GetGopDataAt(i) {
-					session.Write(item)
+					writeHttpflvSession(session, item)
 				}
 			}
 
@@ -366,11 +437,11 @@ func (group *Group) broadcastByRtmpMsg(msg base.RtmpMsg) {
 		// 是否在等待关键帧
 		if session.ShouldWaitVideoKeyFrame {
 			if msg.IsVideoKeyNalu() {
-				session.Write(lazyRtmpMsg2FlvTag.GetEnsureWithoutSdf())
+				writeHttpflvSession(session, lazyRtmpMsg2FlvTag.GetEnsureWithoutSdf())
 				session.ShouldWaitVideoKeyFrame = false
 			}
 		} else {
-			session.Write(lazyRtmpMsg2FlvTag.GetEnsureWithoutSdf())
+			writeHttpflvSession(session, lazyRtmpMsg2FlvTag.GetEnsureWithoutSdf())
 		}
 	}
 
@@ -464,10 +535,31 @@ func (group *Group) broadcastByRtmpMsg(msg base.RtmpMsg) {
 // ---------------------------------------------------------------------------------------------------------------------
 
 func (group *Group) feedRtpPacket(pkt rtprtcp.RtpPacket) {
+	// 添加 panic 恢复保护
+	defer func() {
+		if r := recover(); r != nil {
+			Log.Errorf("[%s] panic in feedRtpPacket: %v", group.UniqueKey, r)
+		}
+	}()
+
+	// 使用函数包装，为每个 session 的 WriteRtpPacket 操作添加 panic 保护
+	writeRtpSession := func(session *rtsp.SubSession, pkt rtprtcp.RtpPacket) {
+		defer func() {
+			if r := recover(); r != nil {
+				Log.Errorf("[%s] panic in rtsp session write rtp: %v, session=%s", group.UniqueKey, r, session.UniqueKey())
+			}
+		}()
+		if session != nil {
+			session.WriteRtpPacket(pkt)
+		}
+	}
+
 	// 如果配置项 OutWaitKeyFrameFlag 为false，则音频和视频都直接发送。（音频和视频都不等待视频关键帧，都不等待任何数据）
 	if !group.config.RtspConfig.OutWaitKeyFrameFlag {
 		for s := range group.rtspSubSessionSet {
-			s.WriteRtpPacket(pkt)
+			if s != nil {
+				writeRtpSession(s, pkt)
+			}
 		}
 		return
 	}
@@ -478,13 +570,18 @@ func (group *Group) feedRtpPacket(pkt rtprtcp.RtpPacket) {
 	)
 
 	for s := range group.rtspSubSessionSet {
+		// 检查 session 是否有效
+		if s == nil {
+			continue
+		}
+
 		// session的 ShouldWaitVideoKeyFrame 为false，那么可能有两种情况：
 		// 1. 对输入流做智能检测时，判定为流内没有视频
 		// 2. 该输出流已经发送过了GOP起始数据
 		//
 		// 这两种情况下，音频或视频数据都直接发送，不需要等了
 		if !s.ShouldWaitVideoKeyFrame {
-			s.WriteRtpPacket(pkt)
+			writeRtpSession(s, pkt)
 			continue
 		}
 
@@ -502,7 +599,7 @@ func (group *Group) feedRtpPacket(pkt rtprtcp.RtpPacket) {
 		}
 
 		if boundary {
-			s.WriteRtpPacket(pkt)
+			writeRtpSession(s, pkt)
 			s.ShouldWaitVideoKeyFrame = false
 		}
 	}
@@ -511,6 +608,25 @@ func (group *Group) feedRtpPacket(pkt rtprtcp.RtpPacket) {
 // ---------------------------------------------------------------------------------------------------------------------
 
 func (group *Group) feedTsPackets(tsPackets []byte, frame *mpegts.Frame, boundary bool) {
+	// 添加 panic 恢复保护
+	defer func() {
+		if r := recover(); r != nil {
+			Log.Errorf("[%s] panic in feedTsPackets: %v", group.UniqueKey, r)
+		}
+	}()
+
+	// 使用函数包装，为每个 session 的 Write 操作添加 panic 保护
+	writeTsSession := func(session *httpts.SubSession, data []byte) {
+		defer func() {
+			if r := recover(); r != nil {
+				Log.Errorf("[%s] panic in httpts session write: %v, session=%s", group.UniqueKey, r, session.UniqueKey())
+			}
+		}()
+		if session != nil {
+			session.Write(data)
+		}
+	}
+
 	// 注意，hls的处理放在前面，让hls先判断是否打开新的fragment并flush audio
 	if group.hlsMuxer != nil {
 		group.hlsMuxer.FeedMpegts(tsPackets, frame, boundary)
@@ -518,18 +634,22 @@ func (group *Group) feedTsPackets(tsPackets []byte, frame *mpegts.Frame, boundar
 
 	// # 遍历 httpts sub session
 	for session := range group.httptsSubSessionSet {
+		// 检查 session 是否有效
+		if session == nil {
+			continue
+		}
 		if session.IsFresh {
 			// ## 如果是新加入者
 
 			// 发送头
-			session.Write(group.patpmt)
+			writeTsSession(session, group.patpmt)
 
 			// 如果有缓存，发送缓存
 			// 并且设置标志，后续都实时转发就行了
 			gopCount := group.httptsGopCache.GetGopCount()
 			for i := 0; i < gopCount; i++ {
 				for _, item := range group.httptsGopCache.GetGopDataAt(i) {
-					session.Write(item)
+					writeTsSession(session, item)
 				}
 			}
 			if gopCount > 0 {
@@ -543,14 +663,14 @@ func (group *Group) feedTsPackets(tsPackets []byte, frame *mpegts.Frame, boundar
 		// ## 转发本次数据
 		if session.ShouldWaitBoundary {
 			if boundary {
-				session.Write(tsPackets)
+				writeTsSession(session, tsPackets)
 
 				session.ShouldWaitBoundary = false
 			} else {
 				// 需要继续等
 			}
 		} else {
-			session.Write(tsPackets)
+			writeTsSession(session, tsPackets)
 		}
 	} // for loop iterate httptsSubSessionSet
 

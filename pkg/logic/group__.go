@@ -475,30 +475,57 @@ func (group *Group) disposeInactiveSessions(tickCount uint32) {
 
 	group.disposeInactivePullSession()
 
+	// 收集需要 dispose 的 session，避免在遍历时修改 map
+	var toDisposeRtmp []*rtmp.ServerSession
 	for session := range group.rtmpSubSessionSet {
-		if _, writeAlive := session.IsAlive(); !writeAlive {
-			Log.Warnf("[%s] session timeout. session=%s", group.UniqueKey, session.UniqueKey())
-			session.Dispose()
+		if session != nil {
+			if _, writeAlive := session.IsAlive(); !writeAlive {
+				Log.Warnf("[%s] session timeout. session=%s", group.UniqueKey, session.UniqueKey())
+				toDisposeRtmp = append(toDisposeRtmp, session)
+			}
 		}
 	}
-	for session := range group.rtspSubSessionSet {
-		if _, writeAlive := session.IsAlive(); !writeAlive {
-			Log.Warnf("[%s] session timeout. session=%s", group.UniqueKey, session.UniqueKey())
-			session.Dispose()
-		}
+	for _, session := range toDisposeRtmp {
+		session.Dispose()
 	}
 
-	for session := range group.httpflvSubSessionSet {
-		if _, writeAlive := session.IsAlive(); !writeAlive {
-			Log.Warnf("[%s] session timeout. session=%s", group.UniqueKey, session.UniqueKey())
-			session.Dispose()
+	var toDisposeRtsp []*rtsp.SubSession
+	for session := range group.rtspSubSessionSet {
+		if session != nil {
+			if _, writeAlive := session.IsAlive(); !writeAlive {
+				Log.Warnf("[%s] session timeout. session=%s", group.UniqueKey, session.UniqueKey())
+				toDisposeRtsp = append(toDisposeRtsp, session)
+			}
 		}
 	}
-	for session := range group.httptsSubSessionSet {
-		if _, writeAlive := session.IsAlive(); !writeAlive {
-			Log.Warnf("[%s] session timeout. session=%s", group.UniqueKey, session.UniqueKey())
-			session.Dispose()
+	for _, session := range toDisposeRtsp {
+		session.Dispose()
+	}
+
+	var toDisposeHttpflv []*httpflv.SubSession
+	for session := range group.httpflvSubSessionSet {
+		if session != nil {
+			if _, writeAlive := session.IsAlive(); !writeAlive {
+				Log.Warnf("[%s] session timeout. session=%s", group.UniqueKey, session.UniqueKey())
+				toDisposeHttpflv = append(toDisposeHttpflv, session)
+			}
 		}
+	}
+	for _, session := range toDisposeHttpflv {
+		session.Dispose()
+	}
+
+	var toDisposeHttpts []*httpts.SubSession
+	for session := range group.httptsSubSessionSet {
+		if session != nil {
+			if _, writeAlive := session.IsAlive(); !writeAlive {
+				Log.Warnf("[%s] session timeout. session=%s", group.UniqueKey, session.UniqueKey())
+				toDisposeHttpts = append(toDisposeHttpts, session)
+			}
+		}
+	}
+	for _, session := range toDisposeHttpts {
+		session.Dispose()
 	}
 	for _, item := range group.url2PushProxy {
 		session := item.pushSession

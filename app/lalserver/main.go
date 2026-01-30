@@ -16,6 +16,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"syscall"
 	"time"
 
@@ -82,6 +83,15 @@ func main() {
 		sig := <-sigChan
 		nazalog.Infof("received signal: %v, starting graceful shutdown...", sig)
 		cancel()
+		// 继续监听信号，防止信号丢失
+		for {
+			select {
+			case <-sigChan:
+				nazalog.Warnf("received additional signal, forcing shutdown...")
+			case <-ctx.Done():
+				return
+			}
+		}
 	}()
 
 	// 创建 LAL 服务器实例
@@ -94,6 +104,21 @@ func main() {
 		os.Exit(1)
 	}
 
+	// 使用 sync.Once 确保 Dispose 只被调用一次
+	var disposeOnce sync.Once
+	disposeFunc := func() {
+		disposeOnce.Do(func() {
+			defer func() {
+				if r := recover(); r != nil {
+					buf := make([]byte, 4096)
+					n := runtime.Stack(buf, false)
+					nazalog.Errorf("dispose panic recovered: %v\n%s", r, buf[:n])
+				}
+			}()
+			lals.Dispose()
+		})
+	}
+
 	// 在单独的 goroutine 中运行服务器
 	serverErrChan := make(chan error, 1)
 	go func() {
@@ -102,7 +127,12 @@ func main() {
 				buf := make([]byte, 4096)
 				n := runtime.Stack(buf, false)
 				nazalog.Errorf("server panic recovered: %v\n%s", r, buf[:n])
-				serverErrChan <- fmt.Errorf("server panic: %v", r)
+				select {
+				case serverErrChan <- fmt.Errorf("server panic: %v", r):
+				default:
+					// channel 已满或已关闭，记录错误但不阻塞
+					nazalog.Errorf("failed to send panic error to channel")
+				}
 			}
 		}()
 
@@ -110,14 +140,17 @@ func main() {
 		if err != nil {
 			nazalog.Errorf("lal server run loop error: %+v", err)
 		}
-		serverErrChan <- err
+		select {
+		case serverErrChan <- err:
+		default:
+			// channel 已满或已关闭，记录错误但不阻塞
+			nazalog.Errorf("failed to send error to channel")
+		}
 	}()
 
-	// 等待上下文取消或服务器错误
-	select {
-	case <-ctx.Done():
-		// 收到关闭信号，执行优雅关闭
-		nazalog.Infof("shutdown signal received, disposing server...")
+	// 执行优雅关闭的辅助函数
+	gracefulShutdown := func(reason string) {
+		nazalog.Infof("%s, disposing server...", reason)
 
 		// 使用超时上下文确保不会无限期等待
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
@@ -126,8 +159,7 @@ func main() {
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
-			// 调用 Dispose 方法进行优雅关闭
-			lals.Dispose()
+			disposeFunc()
 		}()
 
 		select {
@@ -137,13 +169,43 @@ func main() {
 			nazalog.Warnf("server dispose timeout after %v", shutdownTimeout)
 		}
 		nazalog.Infof("lal server shutdown complete")
+	}
 
-	case err := <-serverErrChan:
-		// 服务器运行出错
-		if err != nil {
-			nazalog.Errorf("lal server exited with error: %+v", err)
-			os.Exit(1)
+	// 等待上下文取消或服务器错误
+	// 使用 for-select 循环处理可能的竞态条件
+	var shutdownReason string
+	var serverErr error
+	shutdownInitiated := false
+
+	for !shutdownInitiated {
+		select {
+		case <-ctx.Done():
+			// 收到关闭信号
+			if !shutdownInitiated {
+				shutdownReason = "shutdown signal received"
+				shutdownInitiated = true
+			}
+
+		case err := <-serverErrChan:
+			// 服务器运行出错
+			if !shutdownInitiated {
+				serverErr = err
+				shutdownReason = "server error occurred"
+				shutdownInitiated = true
+				// 取消上下文，确保其他 goroutine 也能感知到关闭
+				cancel()
+			}
 		}
+	}
+
+	// 执行优雅关闭
+	gracefulShutdown(shutdownReason)
+
+	// 处理服务器错误
+	if serverErr != nil {
+		nazalog.Errorf("lal server exited with error: %+v", serverErr)
+		os.Exit(1)
+	} else if shutdownReason == "server error occurred" {
 		nazalog.Infof("lal server exited normally")
 	}
 }
