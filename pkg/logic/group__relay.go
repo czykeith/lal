@@ -37,11 +37,23 @@ type relayProxy struct {
 	pushUrl        string
 	pushStartCount int    // 推流启动次数，用于重试计数
 	pushSessionId  string // 推流 session ID
+	pushBackoffMs  int    // 推流失败退避（毫秒）
 
 	// 状态
 	isRelaying      bool
 	rtmpPushSession *rtmp.PushSession
 	rtspPushSession *rtsp.PushSession
+}
+
+const (
+	minRelayPushBackoffMs    = 1000
+	maxRelayPushBackoffMs    = 30 * 1000
+	relayPushBackoffJitterMs = 250
+)
+
+func calcRelayPushBackoffJitterMs() int64 {
+	nowMs := time.Now().UnixNano() / 1e6
+	return nowMs % relayPushBackoffJitterMs
 }
 
 // StartRelay 启动转推
@@ -68,6 +80,7 @@ func (group *Group) StartRelay(info base.ApiCtrlStartRelayReq) (string, string, 
 		scale:                    info.Scale,
 		pushUrl:                  info.PushUrl,
 		pushStartCount:           0,
+		pushBackoffMs:            0,
 		isRelaying:               false,
 	}
 
@@ -162,6 +175,7 @@ func (group *Group) stopRelayLocked() (string, string) {
 	group.relayProxy.pullSessionId = ""
 	group.relayProxy.pushSessionId = ""
 	group.relayProxy.pushStartCount = 0 // 重置推流重试计数
+	group.relayProxy.pushBackoffMs = 0  // 重置推流退避
 
 	Log.Infof("[%s] stop relay. pull_session_id=%s, push_session_id=%s",
 		group.UniqueKey, pullSessionId, pushSessionId)
@@ -272,13 +286,32 @@ func (group *Group) startRtmpPushLocked(pushUrl string, timeoutMs int) (string, 
 					group.UniqueKey, group.relayProxy.pushStartCount, group.relayProxy.retryNum)
 			}
 		}
+
+		// 计算本次重试的退避时间（在锁内更新状态，在锁外sleep）
+		var firstSleepMs int
+		if group.relayProxy != nil && group.relayProxy.isRelaying && shouldRetry {
+			if group.relayProxy.pushBackoffMs <= 0 {
+				group.relayProxy.pushBackoffMs = minRelayPushBackoffMs
+			} else {
+				group.relayProxy.pushBackoffMs *= 2
+				if group.relayProxy.pushBackoffMs > maxRelayPushBackoffMs {
+					group.relayProxy.pushBackoffMs = maxRelayPushBackoffMs
+				}
+			}
+			firstSleepMs = group.relayProxy.pushBackoffMs + int(calcRelayPushBackoffJitterMs())
+		} else if group.relayProxy != nil {
+			// 不需要重试（或relay已停止），清空退避
+			group.relayProxy.pushBackoffMs = 0
+		}
 		group.mutex.Unlock()
 
 		// 在锁外执行重试，避免阻塞
 		if shouldRetry {
-			// 等待一段时间后重试（避免立即重试导致资源浪费和频繁连接）
-			// 给目标服务器一些时间恢复
-			time.Sleep(2 * time.Second)
+			// 等待退避一段时间后重试（避免立即重试导致资源浪费和频繁连接）
+			if firstSleepMs <= 0 {
+				firstSleepMs = minRelayPushBackoffMs
+			}
+			time.Sleep(time.Duration(firstSleepMs) * time.Millisecond)
 
 			// 循环重试，直到成功或达到重试限制
 			for {
@@ -316,13 +349,27 @@ func (group *Group) startRtmpPushLocked(pushUrl string, timeoutMs int) (string, 
 					// 启动失败，继续重试
 					Log.Warnf("[%s] retry push failed, will retry again. err=%v, retry_count=%d",
 						group.UniqueKey, retryErr, group.relayProxy.pushStartCount)
+					// 更新退避窗口
+					sleepMs := minRelayPushBackoffMs
+					if group.relayProxy != nil {
+						if group.relayProxy.pushBackoffMs <= 0 {
+							group.relayProxy.pushBackoffMs = minRelayPushBackoffMs
+						} else {
+							group.relayProxy.pushBackoffMs *= 2
+							if group.relayProxy.pushBackoffMs > maxRelayPushBackoffMs {
+								group.relayProxy.pushBackoffMs = maxRelayPushBackoffMs
+							}
+						}
+						sleepMs = group.relayProxy.pushBackoffMs + int(calcRelayPushBackoffJitterMs())
+					}
 					group.mutex.Unlock()
-					// 等待一段时间后继续重试
-					time.Sleep(2 * time.Second)
+					// 等待退避一段时间后继续重试
+					time.Sleep(time.Duration(sleepMs) * time.Millisecond)
 					continue
 				} else {
 					// 启动成功
 					group.relayProxy.pushSessionId = newSessionId
+					group.relayProxy.pushBackoffMs = 0
 					Log.Infof("[%s] retry push success. new_session_id=%s", group.UniqueKey, newSessionId)
 					group.mutex.Unlock()
 					break

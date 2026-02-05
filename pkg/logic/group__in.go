@@ -184,10 +184,22 @@ func (group *Group) AddRtmpPullSession(session *rtmp.PullSession) error {
 
 	if group.hasInSession() {
 		Log.Errorf("[%s] in stream already exist. wanna add=%s", group.UniqueKey, session.UniqueKey())
+		// 可能是pull过程中的竞态（例如同时有pub进来），避免isSessionPulling卡死
+		if group.pullProxy != nil && group.pullProxy.isSessionPulling && group.pullProxy.pullingSessionId == session.UniqueKey() {
+			group.pullProxy.isSessionPulling = false
+			group.pullProxy.pullingSessionId = ""
+		}
 		return base.ErrDupInStream
 	}
 
 	Log.Debugf("[%s] [%s] add PullSession into group.", group.UniqueKey, session.UniqueKey())
+
+	// Pull成功进入in session后，清理“正在pull”的attempt状态，并重置退避
+	if group.pullProxy != nil && group.pullProxy.isSessionPulling && group.pullProxy.pullingSessionId == session.UniqueKey() {
+		group.pullProxy.isSessionPulling = false
+		group.pullProxy.pullingSessionId = ""
+		group.resetPullBackoffLocked()
+	}
 
 	group.setRtmpPullSession(session)
 	group.addIn()
@@ -220,10 +232,22 @@ func (group *Group) AddRtspPullSession(session *rtsp.PullSession) error {
 
 	if group.hasInSession() {
 		Log.Errorf("[%s] in stream already exist. wanna add=%s", group.UniqueKey, session.UniqueKey())
+		// 可能是pull过程中的竞态（例如同时有pub进来），避免isSessionPulling卡死
+		if group.pullProxy != nil && group.pullProxy.isSessionPulling && group.pullProxy.pullingSessionId == session.UniqueKey() {
+			group.pullProxy.isSessionPulling = false
+			group.pullProxy.pullingSessionId = ""
+		}
 		return base.ErrDupInStream
 	}
 
 	Log.Debugf("[%s] [%s] add PullSession into group.", group.UniqueKey, session.UniqueKey())
+
+	// Pull成功进入in session后，清理“正在pull”的attempt状态，并重置退避
+	if group.pullProxy != nil && group.pullProxy.isSessionPulling && group.pullProxy.pullingSessionId == session.UniqueKey() {
+		group.pullProxy.isSessionPulling = false
+		group.pullProxy.pullingSessionId = ""
+		group.resetPullBackoffLocked()
+	}
 
 	group.setRtspPullSession(session)
 	group.addIn()
@@ -274,7 +298,10 @@ func (group *Group) DelRtspPubSession(session *rtsp.PubSession) {
 func (group *Group) DelRtmpPullSession(session *rtmp.PullSession) {
 	group.mutex.Lock()
 	defer group.mutex.Unlock()
-	group.delPullSession(session)
+	removed := group.delPullSession(session)
+	if !removed {
+		return
+	}
 
 	var info base.PullStopInfo
 	info.SessionId = session.UniqueKey()
@@ -292,7 +319,10 @@ func (group *Group) DelRtmpPullSession(session *rtmp.PullSession) {
 func (group *Group) DelRtspPullSession(session *rtsp.PullSession) {
 	group.mutex.Lock()
 	defer group.mutex.Unlock()
-	group.delPullSession(session)
+	removed := group.delPullSession(session)
+	if !removed {
+		return
+	}
 
 	var info base.PullStopInfo
 	info.SessionId = session.UniqueKey()
@@ -358,11 +388,32 @@ func (group *Group) delRtspPubSession(session *rtsp.PubSession) {
 	group.delIn()
 }
 
-func (group *Group) delPullSession(session base.IObject) {
+func (group *Group) delPullSession(session base.IObject) bool {
 	Log.Debugf("[%s] [%s] del PullSession from group.", group.UniqueKey, session.UniqueKey())
 
-	group.resetRelayPullSession()
-	group.delIn()
+	delUk := session.UniqueKey()
+	if group.pullProxy != nil {
+		if group.pullProxy.rtmpSession != nil && group.pullProxy.rtmpSession.UniqueKey() == delUk {
+			group.resetRelayPullSession()
+			group.delIn()
+			return true
+		}
+		if group.pullProxy.rtspSession != nil && group.pullProxy.rtspSession.UniqueKey() == delUk {
+			group.resetRelayPullSession()
+			group.delIn()
+			return true
+		}
+
+		// 若该session从未成功Add进group（仅attempt阶段），不要触发delIn；只需清理attempt状态。
+		if group.pullProxy.isSessionPulling && group.pullProxy.pullingSessionId == delUk {
+			group.pullProxy.isSessionPulling = false
+			group.pullProxy.pullingSessionId = ""
+		}
+	}
+
+	Log.Warnf("[%s] del pull session ignored (not match current). del=%s, current=%s",
+		group.UniqueKey, delUk, group.pullSessionUniqueKey())
+	return false
 }
 
 // ---------------------------------------------------------------------------------------------------------------------

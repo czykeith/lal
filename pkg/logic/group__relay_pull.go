@@ -16,7 +16,6 @@ import (
 
 	"github.com/q191201771/lal/pkg/base"
 	"github.com/q191201771/lal/pkg/rtsp"
-	"github.com/q191201771/naza/pkg/nazalog"
 
 	"github.com/q191201771/lal/pkg/rtmp"
 )
@@ -25,6 +24,9 @@ import (
 func (group *Group) StartPull(info base.ApiCtrlStartRelayPullReq) (string, error) {
 	group.mutex.Lock()
 	defer group.mutex.Unlock()
+
+	// 手动触发时，避免被上一次失败的退避窗口影响
+	group.resetPullBackoffLocked()
 
 	group.pullProxy.apiEnable = true
 	group.pullProxy.pullUrl = info.Url
@@ -66,8 +68,56 @@ type pullProxy struct {
 	lastHasOutTs int64
 
 	isSessionPulling bool // 是否正在pull，注意，这是一个内部状态，表示的是session的状态，而不是整体任务应该处于的状态
+	pullingSessionId string
+	nextPullTsMs     int64 // 允许下一次触发pull的最早时间（毫秒）
+	backoffMs        int   // 失败退避（毫秒）
 	rtmpSession      *rtmp.PullSession
 	rtspSession      *rtsp.PullSession
+}
+
+const (
+	// 避免断线/失败后每秒疯狂重连，造成CPU和网络抖动
+	minPullBackoffMs    = 1000
+	maxPullBackoffMs    = 30 * 1000
+	pullBackoffJitterMs = 250
+)
+
+const (
+	// 控制“握手阶段”同时在做 Start() 的拉流数量（rtmp/rtsp pull 都算）。
+	//
+	// 当拉流规模很大（比如400+）时，如果所有拉流同时tcp connect/handshake，
+	// Windows 上很容易出现临时端口耗尽、TIME_WAIT堆积、上游accept/backlog扛不住等问题，
+	// 表现为：大量拉流失败或拉到一半频繁中断。
+	//
+	// 通过限并发让拉流分批建立，整体成功率和稳定性会明显提升。
+	defaultMaxConcurrentPullStart = 128
+	// 获取并发slot的最长等待时间，避免大量goroutine永久阻塞在排队上（会影响停止/切流的及时性）。
+	maxWaitPullStartSlot = 15 * time.Second
+)
+
+var pullStartSem = make(chan struct{}, defaultMaxConcurrentPullStart)
+
+func acquirePullStartSlot(timeout time.Duration) bool {
+	if timeout <= 0 {
+		pullStartSem <- struct{}{}
+		return true
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case pullStartSem <- struct{}{}:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+func releasePullStartSlot() {
+	select {
+	case <-pullStartSem:
+	default:
+		// 理论上不应发生，防御性处理，避免因误用导致panic
+	}
 }
 
 // initRelayPullByConfig 根据配置文件中的静态回源配置来初始化回源设置
@@ -94,6 +144,49 @@ func (group *Group) initRelayPullByConfig() {
 	group.pullProxy.autoStopPullAfterNoOutMs = staticRelayPullAutoStopPullAfterNoOutMs
 }
 
+func (group *Group) resetPullBackoffLocked() {
+	group.pullProxy.backoffMs = 0
+	group.pullProxy.nextPullTsMs = 0
+}
+
+func (group *Group) schedulePullBackoffLocked() {
+	nowMs := time.Now().UnixNano() / 1e6
+	if group.pullProxy.backoffMs <= 0 {
+		group.pullProxy.backoffMs = minPullBackoffMs
+	} else {
+		group.pullProxy.backoffMs *= 2
+		if group.pullProxy.backoffMs > maxPullBackoffMs {
+			group.pullProxy.backoffMs = maxPullBackoffMs
+		}
+	}
+	// 简单jitter，避免多个group同一秒同时重连
+	jitter := int64(nowMs % pullBackoffJitterMs)
+	group.pullProxy.nextPullTsMs = nowMs + int64(group.pullProxy.backoffMs) + jitter
+	Log.Infof("[%s] relay pull backoff. backoff_ms=%d, jitter_ms=%d", group.UniqueKey, group.pullProxy.backoffMs, jitter)
+}
+
+func (group *Group) onPullStartFailedLocked(sessionId string, pullErr error) {
+	if !group.pullProxy.isSessionPulling || group.pullProxy.pullingSessionId != sessionId {
+		return
+	}
+	group.pullProxy.isSessionPulling = false
+	group.pullProxy.pullingSessionId = ""
+	group.schedulePullBackoffLocked()
+	_ = pullErr // 预留：未来可按错误类型分类退避策略
+}
+
+func (group *Group) onPullSessionExitedLocked(sessionId string, pullErr error) {
+	// 只有当前活跃的pull session退出，才影响退避窗口
+	if sessionId != group.pullSessionUniqueKey() {
+		return
+	}
+	if pullErr == nil {
+		group.resetPullBackoffLocked()
+	} else {
+		group.schedulePullBackoffLocked()
+	}
+}
+
 func (group *Group) setRtmpPullSession(session *rtmp.PullSession) {
 	group.pullProxy.rtmpSession = session
 }
@@ -110,6 +203,7 @@ func (group *Group) setRtspPullSession(session *rtsp.PullSession) {
 
 func (group *Group) resetRelayPullSession() {
 	group.pullProxy.isSessionPulling = false
+	group.pullProxy.pullingSessionId = ""
 	group.pullProxy.rtmpSession = nil
 	group.pullProxy.rtspSession = nil
 	if group.rtspPullDumpFile != nil {
@@ -156,6 +250,20 @@ func (group *Group) isPullModuleAlive() bool {
 	if group.hasPullSession() || group.pullProxy.isSessionPulling {
 		return true
 	}
+
+	// 关键：即便当前处于backoff窗口，只要pull配置是开启的，并且未来仍会继续尝试拉流（例如永久重试），
+	// 就应视为“存活”，否则Group会被ServerManager当作Inactive直接回收，导致控制台流消失。
+	if group.pullProxy != nil {
+		if (group.pullProxy.staticRelayPullEnable || group.pullProxy.apiEnable) &&
+			group.pullProxy.pullUrl != "" &&
+			!group.shouldAutoStopPull() {
+			// 检查重试次数是否已达上限。-1表示永远重试。
+			if group.pullProxy.pullRetryNum < 0 || group.pullProxy.startCount <= group.pullProxy.pullRetryNum {
+				return true
+			}
+		}
+	}
+
 	flag, _ := group.shouldStartPull()
 	return flag
 }
@@ -213,7 +321,6 @@ func (group *Group) pullIfNeeded() (string, error) {
 	Log.Infof("[%s] start relay pull. url=%s", group.UniqueKey, group.pullProxy.pullUrl)
 
 	group.pullProxy.isSessionPulling = true
-	group.pullProxy.startCount++
 
 	isPullByRtmp := strings.HasPrefix(group.pullProxy.pullUrl, "rtmp")
 
@@ -249,31 +356,76 @@ func (group *Group) pullIfNeeded() (string, error) {
 		uk = rtspSession.UniqueKey()
 	}
 
+	// 记录attempt id，保证错误路径能正确清理状态，避免“卡死不再拉流”
+	group.pullProxy.pullingSessionId = uk
+
 	go func(rtPullUrl string, rtIsPullByRtmp bool, rtRtmpSession *rtmp.PullSession, rtRtspSession *rtsp.PullSession) {
+		// 全局限并发：只控制 Start 握手阶段的并发数量，不限制拉流总路数
+		if ok := acquirePullStartSlot(maxWaitPullStartSlot); !ok {
+			// 排队超时：说明系统处于高压（或上游长期不可用），不要一直堵在这里
+			err := errors.New("wait pull start slot timeout")
+			Log.Warnf("[%s] relay pull start blocked too long, abort attempt. err=%v", uk, err)
+			group.mutex.Lock()
+			group.onPullStartFailedLocked(uk, err)
+			group.mutex.Unlock()
+			if rtRtmpSession != nil {
+				rtRtmpSession.Dispose()
+			}
+			if rtRtspSession != nil {
+				rtRtspSession.Dispose()
+			}
+			return
+		}
+
+		// 可能在排队期间被StopPull/autoStop取消，这里二次确认
+		group.mutex.Lock()
+		if !group.pullProxy.isSessionPulling || group.pullProxy.pullingSessionId != uk {
+			group.mutex.Unlock()
+			// 已被取消或被新attempt覆盖，直接返回
+			return
+		}
+		// 真正开始Start，才计入尝试次数（用于重试上限判断）
+		group.pullProxy.startCount++
+		group.mutex.Unlock()
+
 		if rtIsPullByRtmp {
 			// TODO(chef): 处理数据回调，是否应该等待Add成功之后。避免竞态条件中途加入了其他in session
 			err := rtRtmpSession.Start(rtPullUrl)
+			// Start 阶段结束，释放并发slot（无论成功失败）
+			releasePullStartSlot()
 			if err != nil {
 				Log.Errorf("[%s] relay pull fail. err=%v", rtRtmpSession.UniqueKey(), err)
-				group.DelRtmpPullSession(rtRtmpSession)
+				group.mutex.Lock()
+				group.onPullStartFailedLocked(rtRtmpSession.UniqueKey(), err)
+				group.mutex.Unlock()
 				return
 			}
 
 			err = <-rtRtmpSession.WaitChan()
 			Log.Infof("[%s] relay pull done. err=%v", rtRtmpSession.UniqueKey(), err)
+			group.mutex.Lock()
+			group.onPullSessionExitedLocked(rtRtmpSession.UniqueKey(), err)
+			group.mutex.Unlock()
 			group.DelRtmpPullSession(rtRtmpSession)
 			return
 		}
 
 		err := rtRtspSession.Start(rtPullUrl)
+		// Start 阶段结束，释放并发slot（无论成功失败）
+		releasePullStartSlot()
 		if err != nil {
 			Log.Errorf("[%s] relay pull fail. err=%v", rtRtspSession.UniqueKey(), err)
-			group.DelRtspPullSession(rtRtspSession)
+			group.mutex.Lock()
+			group.onPullStartFailedLocked(rtRtspSession.UniqueKey(), err)
+			group.mutex.Unlock()
 			return
 		}
 
 		err = <-rtRtspSession.WaitChan()
 		Log.Infof("[%s] relay pull done. err=%v", rtRtspSession.UniqueKey(), err)
+		group.mutex.Lock()
+		group.onPullSessionExitedLocked(rtRtspSession.UniqueKey(), err)
+		group.mutex.Unlock()
 		group.DelRtspPullSession(rtRtspSession)
 		return
 	}(group.pullProxy.pullUrl, isPullByRtmp, rtmpSession, rtspSession)
@@ -284,6 +436,11 @@ func (group *Group) pullIfNeeded() (string, error) {
 func (group *Group) stopPull() string {
 	// 关闭时，清空用于重试的计数
 	group.pullProxy.startCount = 0
+	// 若当前仅处于attempt阶段（还没Add进group），也要清理状态，避免在高并发排队时卡死不再拉流
+	group.pullProxy.isSessionPulling = false
+	group.pullProxy.pullingSessionId = ""
+	// stop属于“正常行为”，清理退避窗口，避免影响下一次手动/自动拉流
+	group.resetPullBackoffLocked()
 
 	if group.pullProxy.rtmpSession != nil {
 		Log.Infof("[%s] stop pull session.", group.UniqueKey)
@@ -299,6 +456,12 @@ func (group *Group) stopPull() string {
 }
 
 func (group *Group) shouldStartPull() (bool, error) {
+	// 退避窗口内不触发pull，避免频繁重连导致抖动
+	nowMs := time.Now().UnixNano() / 1e6
+	if group.pullProxy.nextPullTsMs != 0 && nowMs < group.pullProxy.nextPullTsMs {
+		return false, errors.New("relay pull in backoff")
+	}
+
 	// 如果本地已经有输入型的流，就不需要pull了
 	if group.hasInSession() {
 		return false, base.ErrDupInStream
@@ -348,6 +511,5 @@ func (group *Group) shouldAutoStopPull() bool {
 	}
 
 	// 是否达到时间阈值
-	nazalog.Debugf("%d %d %d", group.pullProxy.lastHasOutTs, time.Now().UnixNano(), group.pullProxy.autoStopPullAfterNoOutMs)
 	return group.pullProxy.lastHasOutTs != -1 && time.Now().UnixNano()/1e6-group.pullProxy.lastHasOutTs >= int64(group.pullProxy.autoStopPullAfterNoOutMs)
 }
