@@ -107,7 +107,6 @@ func (session *BaseInSession) SetScale(scale float64) {
 	if session == nil {
 		return
 	}
-
 	// 健壮性：防止panic
 	defer func() {
 		if r := recover(); r != nil {
@@ -117,11 +116,33 @@ func (session *BaseInSession) SetScale(scale float64) {
 
 	session.mu.Lock()
 	defer session.mu.Unlock()
+
 	session.scale = scale
-	if session.avPacketQueue != nil {
-		session.avPacketQueue.SetScale(scale)
+
+	// 只有当倍速>1 时才启用回放算法（时间戳过滤 / 变速播放）
+	// 其他情况下直接走原始 OnAvPacket 流程，以降低额外开销
+	if !BaseInSessionTimestampFilterFlag {
+		// 全局关闭过滤器时，直接返回
+		return
 	}
-	Log.Infof("[%s] set client-side scale. scale=%.1f", session.UniqueKey(), scale)
+
+	if scale > 1.0 {
+		// 按需懒加载 AvPacketQueue，避免在未开启倍速时占用资源
+		if session.avPacketQueue == nil && session.sdpCtx.IsAudioUnpackable() && session.sdpCtx.IsVideoUnpackable() {
+			session.avPacketQueue = NewAvPacketQueue(session.onAvPacket)
+		}
+		if session.avPacketQueue != nil {
+			session.avPacketQueue.SetScale(scale)
+			Log.Infof("[%s] enable client-side scale filter. scale=%.1f", session.UniqueKey(), scale)
+		}
+	} else {
+		// 倍速<=1 时关闭回放算法，恢复直通逻辑
+		if session.avPacketQueue != nil {
+			// 直接丢弃内部队列，后续解包数据将不再经过过滤器
+			session.avPacketQueue = nil
+		}
+		Log.Infof("[%s] disable client-side scale filter. scale=%.1f", session.UniqueKey(), scale)
+	}
 }
 
 func (session *BaseInSession) InitWithSdp(sdpCtx sdp.LogicContext) {
@@ -143,23 +164,9 @@ func (session *BaseInSession) InitWithSdp(sdpCtx sdp.LogicContext) {
 	session.audioRrProducer = rtprtcp.NewRrProducer(session.sdpCtx.AudioClockRate)
 	session.videoRrProducer = rtprtcp.NewRrProducer(session.sdpCtx.VideoClockRate)
 
-	if session.sdpCtx.IsAudioUnpackable() && session.sdpCtx.IsVideoUnpackable() {
-		// 优化：在锁外创建对象，减少锁持有时间
-		var avPacketQueue *AvPacketQueue
-		if BaseInSessionTimestampFilterFlag {
-			avPacketQueue = NewAvPacketQueue(session.onAvPacket)
-		}
-
-		session.mu.Lock()
-		if BaseInSessionTimestampFilterFlag {
-			session.avPacketQueue = avPacketQueue
-			// 如果已经设置了 scale，应用到新创建的 avPacketQueue
-			if session.scale > 0 {
-				session.avPacketQueue.SetScale(session.scale)
-			}
-		}
-		session.mu.Unlock()
-	}
+	// 回放算法（时间戳过滤 / 变速播放）按需由 SetScale 懒加载：
+	// 1. 默认不创建 AvPacketQueue，保持直通逻辑，降低正常回放（倍速<=1）的性能开销
+	// 2. 当倍速被设置为 >1 时，由 SetScale 创建并启用 AvPacketQueue
 
 	if session.observer != nil {
 		session.observer.OnSdp(session.sdpCtx)
