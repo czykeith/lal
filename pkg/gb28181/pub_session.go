@@ -147,39 +147,61 @@ func (session *PubSession) listenUdp(port int) (int, error) {
 	var addr string
 
 	if port == 0 {
+		// 自动分配端口：从端口池获取可用端口
+		// 端口池内部会检测端口占用，如果端口被占用会尝试下一个端口
 		uconn, _, err = defaultUdpConnPoll.Acquire()
 		if err != nil {
-			return -1, err
+			return -1, fmt.Errorf("acquire UDP port from pool failed: %w", err)
 		}
 
 		port = uconn.LocalAddr().(*net.UDPAddr).Port
+		Log.Debugf("[%s] auto allocated UDP port: %d", session.UniqueKey(), port)
 	} else {
+		// 指定端口：检测端口是否被占用并绑定
 		addr = fmt.Sprintf(":%d", port)
+		uconn, err = net.ListenUDP("udp", &net.UDPAddr{Port: port})
+		if err != nil {
+			return -1, fmt.Errorf("UDP port %d is already in use: %w", port, err)
+		}
+		Log.Debugf("[%s] using specified UDP port: %d", session.UniqueKey(), port)
 	}
 
 	session.udpConn, err = nazanet.NewUdpConnection(func(option *nazanet.UdpConnectionOption) {
 		option.LAddr = addr
 		option.Conn = uconn
 	})
+	if err != nil {
+		if uconn != nil {
+			uconn.Close()
+		}
+		return -1, fmt.Errorf("create UDP connection failed on port %d: %w", port, err)
+	}
 	return port, err
 }
 
 func (session *PubSession) listenTcp(port int) (int, error) {
 	var err error
 
-	// TODO(chef): [refactor] 考虑挪到naza中，udp在naza中有类似的实现 202209
 	if port == 0 {
+		// 自动分配端口：遍历端口范围，检测端口是否被占用
 		for i := defaultPubSessionPortMin; i < defaultPubSessionPortMax; i++ {
 			addr := fmt.Sprintf(":%d", i)
 			if session.listener, err = net.Listen("tcp", addr); err == nil {
+				Log.Debugf("[%s] auto allocated TCP port: %d", session.UniqueKey(), i)
 				return int(i), nil
 			}
+			// 端口被占用，继续尝试下一个端口
 		}
-		return 0, err
+		return 0, fmt.Errorf("no available TCP port in range [%d, %d): %w", defaultPubSessionPortMin, defaultPubSessionPortMax, err)
 	}
 
+	// 指定端口：检测端口是否被占用
 	addr := fmt.Sprintf(":%d", port)
 	session.listener, err = net.Listen("tcp", addr)
+	if err != nil {
+		return -1, fmt.Errorf("TCP port %d is already in use: %w", port, err)
+	}
+	Log.Debugf("[%s] using specified TCP port: %d", session.UniqueKey(), port)
 	return port, err
 }
 

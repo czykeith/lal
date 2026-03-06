@@ -186,6 +186,19 @@ func ExtractContactAddr(contactHeader string) (string, int) {
 	return "", 0
 }
 
+// ExtractServerFromRequestUri 从Request-URI中提取 serverId 和 serverDomain。
+//
+// e.g. sip:34020000002000001234@3402000000 -> ("34020000002000001234", "3402000000")
+func ExtractServerFromRequestUri(requestUri string) (serverId, serverDomain string) {
+	// 只做最小实现：匹配 sip:<digits>@<digits>
+	re := regexp.MustCompile(`^sip:(\d+)@(\d+)$`)
+	matches := re.FindStringSubmatch(strings.TrimSpace(requestUri))
+	if len(matches) >= 3 {
+		return matches[1], matches[2]
+	}
+	return "", ""
+}
+
 // 生成Call-ID
 func GenerateCallId() string {
 	return fmt.Sprintf("%d@%d", time.Now().UnixNano(), time.Now().Unix())

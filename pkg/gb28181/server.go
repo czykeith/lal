@@ -62,16 +62,21 @@ type ServerConfig struct {
 
 // Device 设备信息
 type Device struct {
-	DeviceId          string
-	DeviceName        string
-	Ip                string
-	Port              int
-	Status            string // online/offline
-	RegisterTime      time.Time
-	KeepaliveTime     time.Time     // 最后心跳时间
-	KeepaliveInterval time.Duration // 心跳间隔（根据客户端实际心跳计算）
-	Channels          map[string]*Channel
-	mutex             sync.RWMutex
+	DeviceId     string
+	DeviceName   string
+	Ip           string
+	Port         int
+	Status       string // online/offline
+	RegisterTime time.Time
+	// 设备注册时REGISTER Request-URI中携带的平台信息，例如：
+	// REGISTER sip:<serverId>@<serverDomain> SIP/2.0
+	// 部分设备（如海康）会校验后续平台发起请求的 From/Contact 中的 serverId 是否一致。
+	RegisteredServerId     string
+	RegisteredServerDomain string
+	KeepaliveTime          time.Time     // 最后心跳时间
+	KeepaliveInterval      time.Duration // 心跳间隔（根据客户端实际心跳计算）
+	Channels               map[string]*Channel
+	mutex                  sync.RWMutex
 }
 
 // GetChannels 获取通道列表的副本（线程安全）
@@ -143,6 +148,16 @@ func getDeviceDomain(deviceId string) string {
 		return deviceId[:10] // 使用前10位作为域（区域编码）
 	}
 	return deviceId // 如果设备ID长度不足10位，使用完整ID
+}
+
+func (s *Gb28181Server) getServerIdForDevice(deviceId string) string {
+	s.mutex.RLock()
+	d := s.devices[deviceId]
+	s.mutex.RUnlock()
+	if d != nil && d.RegisteredServerId != "" {
+		return d.RegisteredServerId
+	}
+	return s.config.LocalSipId
 }
 
 // SetOnInvite 设置INVITE回调
@@ -355,6 +370,9 @@ func (s *Gb28181Server) handleRegister(msg *SipMessage, raddr *net.UDPAddr) {
 		port = raddr.Port
 	}
 
+	// 提取设备注册时的平台注册信息（REGISTER Request-URI）
+	registeredServerId, registeredServerDomain := ExtractServerFromRequestUri(msg.RequestUri)
+
 	// 获取过期时间
 	expires := s.config.Expires
 	if expHeader := msg.Headers["expires"]; expHeader != "" {
@@ -417,11 +435,16 @@ func (s *Gb28181Server) handleRegister(msg *SipMessage, raddr *net.UDPAddr) {
 	}
 	device.Ip = ip
 	device.Port = port
+	if registeredServerId != "" {
+		device.RegisteredServerId = registeredServerId
+		device.RegisteredServerDomain = registeredServerDomain
+	}
 	device.Status = "online"
 	device.KeepaliveTime = time.Now()
 	s.mutex.Unlock()
 
-	Log.Infof("device register. device_id=%s, ip=%s, port=%d, expires=%d, is_reconnect=%v", deviceId, ip, port, expires, isReconnect)
+	Log.Infof("device register. device_id=%s, ip=%s, port=%d, expires=%d, is_reconnect=%v, reg_server_id=%s, reg_server_domain=%s",
+		deviceId, ip, port, expires, isReconnect, registeredServerId, registeredServerDomain)
 
 	// 设备注册成功后，主动查询通道列表
 	go s.queryCatalog(deviceId)
@@ -966,7 +989,8 @@ func (s *Gb28181Server) Invite(deviceId, channelId, streamName string, port int,
 	// 构建INVITE请求（使用域格式，符合GB28181标准）
 	deviceDomain := getDeviceDomain(deviceId)
 	requestUri := fmt.Sprintf("sip:%s@%s", channelId, deviceDomain)
-	from := fmt.Sprintf("<sip:%s@%s>", s.config.LocalSipId, s.config.LocalSipDomain)
+	serverId := s.getServerIdForDevice(deviceId)
+	from := fmt.Sprintf("<sip:%s@%s>", serverId, s.config.LocalSipDomain)
 	to := fmt.Sprintf("<sip:%s@%s>", channelId, deviceDomain)
 
 	// 构建SDP
@@ -978,10 +1002,10 @@ func (s *Gb28181Server) Invite(deviceId, channelId, streamName string, port int,
 		"To":             to,
 		"Call-ID":        callId,
 		"CSeq":           "1 INVITE",
-		"Contact":        fmt.Sprintf("<sip:%s@%s>", s.config.LocalSipId, s.config.LocalSipDomain),
+		"Contact":        fmt.Sprintf("<sip:%s@%s>", serverId, s.config.LocalSipDomain),
 		"Content-Type":   "application/sdp",
 		"Content-Length": fmt.Sprintf("%d", len(sdp)),
-		"Subject":        fmt.Sprintf("%s:0,%s:0:%d", channelId, s.config.LocalSipId, streamType),
+		"Subject":        fmt.Sprintf("%s:0,%s:0:%d", channelId, serverId, streamType),
 		"Max-Forwards":   "70",
 	}
 
@@ -1325,7 +1349,8 @@ func (s *Gb28181Server) Playback(deviceId, channelId, streamName string, port in
 	// 构建INVITE请求（使用域格式，符合GB28181标准）
 	deviceDomain := getDeviceDomain(deviceId)
 	requestUri := fmt.Sprintf("sip:%s@%s", channelId, deviceDomain)
-	from := fmt.Sprintf("<sip:%s@%s>", s.config.LocalSipId, s.config.LocalSipDomain)
+	serverId := s.getServerIdForDevice(deviceId)
+	from := fmt.Sprintf("<sip:%s@%s>", serverId, s.config.LocalSipDomain)
 	to := fmt.Sprintf("<sip:%s@%s>", channelId, deviceDomain)
 
 	// 构建回放SDP（符合GB28181标准）
@@ -1334,7 +1359,7 @@ func (s *Gb28181Server) Playback(deviceId, channelId, streamName string, port in
 	// Subject头格式：GB28181标准格式
 	// 格式：<channelId>:<streamType>,<serverId>:<streamType>
 	// 注意：回放模式通过SDP中的s=Playback标识，Subject头使用标准格式即可
-	subject := fmt.Sprintf("%s:0,%s:0", channelId, s.config.LocalSipId)
+	subject := fmt.Sprintf("%s:0,%s:0", channelId, serverId)
 
 	headers := map[string]string{
 		"Via":            fmt.Sprintf("SIP/2.0/UDP %s:%d;branch=%s;rport", s.config.LocalSipIp, s.config.LocalSipPort, branch),
@@ -1342,7 +1367,7 @@ func (s *Gb28181Server) Playback(deviceId, channelId, streamName string, port in
 		"To":             to,
 		"Call-ID":        callId,
 		"CSeq":           "1 INVITE",
-		"Contact":        fmt.Sprintf("<sip:%s@%s>", s.config.LocalSipId, s.config.LocalSipDomain),
+		"Contact":        fmt.Sprintf("<sip:%s@%s>", serverId, s.config.LocalSipDomain),
 		"Content-Type":   "application/sdp",
 		"Content-Length": fmt.Sprintf("%d", len(sdp)),
 		"Subject":        subject,
@@ -1577,8 +1602,9 @@ func (s *Gb28181Server) queryCatalog(deviceId string) {
 	// Request-URI 和 To 使用域格式，From 和 Contact 使用 IP:Port 格式
 	deviceDomain := getDeviceDomain(deviceId)
 	requestUri := fmt.Sprintf("sip:%s@%s", deviceId, deviceDomain)
+	serverId := s.getServerIdForDevice(deviceId)
 	// From 使用 IP:Port 格式（物理地址）
-	from := fmt.Sprintf("<sip:%s@%s:%d>", s.config.LocalSipId, s.config.LocalSipIp, s.config.LocalSipPort)
+	from := fmt.Sprintf("<sip:%s@%s:%d>", serverId, s.config.LocalSipIp, s.config.LocalSipPort)
 	// To 使用域格式（逻辑地址）
 	to := fmt.Sprintf("<sip:%s@%s>", deviceId, deviceDomain)
 
@@ -1593,7 +1619,7 @@ func (s *Gb28181Server) queryCatalog(deviceId string) {
 		"User-Agent":     "LALServer",
 		"CSeq":           "1 MESSAGE",
 		"Max-Forwards":   "70",
-		"Contact":        fmt.Sprintf("<sip:%s@%s:%d>;tag=%s", s.config.LocalSipId, s.config.LocalSipIp, s.config.LocalSipPort, tag),
+		"Contact":        fmt.Sprintf("<sip:%s@%s:%d>;tag=%s", serverId, s.config.LocalSipIp, s.config.LocalSipPort, tag),
 		"Expires":        fmt.Sprintf("%d", s.config.Expires),
 		"Content-Type":   "Application/MANSCDP+xml",
 		"Content-Length": fmt.Sprintf("%d", len(catalogXml)),
@@ -1612,7 +1638,7 @@ func (s *Gb28181Server) queryCatalog(deviceId string) {
 	Log.Infof("设备ID: %s", deviceId)
 	Log.Infof("目标地址: %s:%d", device.Ip, device.Port)
 	Log.Infof("请求URI: %s", requestUri)
-	Log.Infof("From: %s", from)
+	Log.Infof("From: %s (server_id=%s)", from, serverId)
 	Log.Infof("To: %s", to)
 	Log.Infof("Call-ID: %s", callId)
 	Log.Infof("CSeq: 1 MESSAGE")
