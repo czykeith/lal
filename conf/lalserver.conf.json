@@ -144,7 +144,7 @@
     "video_codec": "H264",
     "video_width": 1920,
     "video_height": 1080,
-    "video_bitrate": 2048,
+    "video_bitrate": 1024,
     "video_framerate": 25,
     "video_profile": "main",
     "video_level": "4.0"
