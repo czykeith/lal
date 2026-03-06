@@ -156,10 +156,22 @@ func (session *PubSession) listenUdp(port int) (int, error) {
 
 		port = uconn.LocalAddr().(*net.UDPAddr).Port
 		Log.Debugf("[%s] auto allocated UDP port: %d", session.UniqueKey(), port)
+
+		// Windows/部分环境下可能拿到 [::]:port（IPv6-only），导致收不到设备发来的IPv4 RTP。
+		// 这里强制重新绑定到 0.0.0.0:port（IPv4），提升兼容性。
+		if la, ok := uconn.LocalAddr().(*net.UDPAddr); ok && la.IP != nil && la.IP.To4() == nil {
+			_ = uconn.Close()
+			uconn, err = net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: port})
+			if err != nil {
+				return -1, fmt.Errorf("rebind UDP4 on port %d failed: %w", port, err)
+			}
+			Log.Debugf("[%s] rebind UDP4 on port: %d", session.UniqueKey(), port)
+		}
 	} else {
 		// 指定端口：检测端口是否被占用并绑定
 		addr = fmt.Sprintf(":%d", port)
-		uconn, err = net.ListenUDP("udp", &net.UDPAddr{Port: port})
+		// 强制使用IPv4监听，避免 [::]:port 收不到 IPv4 RTP
+		uconn, err = net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: port})
 		if err != nil {
 			return -1, fmt.Errorf("UDP port %d is already in use: %w", port, err)
 		}
