@@ -188,10 +188,14 @@ func ExtractContactAddr(contactHeader string) (string, int) {
 
 // ExtractServerFromRequestUri 从Request-URI中提取 serverId 和 serverDomain。
 //
-// e.g. sip:34020000002000001234@3402000000 -> ("34020000002000001234", "3402000000")
+// 支持两种格式：
+//   - sip:34020000002000001234@3402000000 -> ("34020000002000001234", "3402000000")
+//   - sip:34020000002000001234@3402000000.spvmn.cn -> ("34020000002000001234", "3402000000.spvmn.cn")
 func ExtractServerFromRequestUri(requestUri string) (serverId, serverDomain string) {
-	// 只做最小实现：匹配 sip:<digits>@<digits>
-	re := regexp.MustCompile(`^sip:(\d+)@(\d+)$`)
+	// 匹配 sip:<digits>@<domain>
+	// domain 可以是纯数字（如 3402000000）或包含点号的域名（如 3402000000.spvmn.cn）
+	// 使用 [\w.-]+ 匹配域名，支持字母、数字、点号、连字符、下划线
+	re := regexp.MustCompile(`^sip:(\d+)@([\w.-]+)$`)
 	matches := re.FindStringSubmatch(strings.TrimSpace(requestUri))
 	if len(matches) >= 3 {
 		return matches[1], matches[2]

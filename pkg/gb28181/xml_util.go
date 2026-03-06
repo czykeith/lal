@@ -26,8 +26,12 @@ func BuildCatalogQueryXML(deviceId string, sn int) string {
 	// GB28181 标准格式：Catalog 查询时 DeviceID 填写要查询的设备ID
 	// 如果查询设备自身的通道列表，DeviceID 填写设备ID
 	// 如果查询子设备的通道列表，DeviceID 填写子设备ID
-	// 注意：某些设备要求 XML 格式紧凑（无换行），且不需要 encoding 属性
-	return fmt.Sprintf(`<?xml version="1.0"?><Query><CmdType>Catalog</CmdType><SN>%d</SN><DeviceID>%s</DeviceID></Query>`, sn, deviceId)
+	// 注意：海康设备要求 XML 格式带换行（与 lalmax 一致）
+	return fmt.Sprintf(`<?xml version="1.0"?><Query>
+<CmdType>Catalog</CmdType>
+<SN>%d</SN>
+<DeviceID>%s</DeviceID>
+</Query>`, sn, deviceId)
 }
 
 // BuildDeviceInfoQueryXML 构建设备信息查询XML

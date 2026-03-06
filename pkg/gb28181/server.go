@@ -483,6 +483,11 @@ func (s *Gb28181Server) handleRegister(msg *SipMessage, raddr *net.UDPAddr) {
 }
 
 // handleKeepalive 处理MESSAGE请求（心跳或响应）
+//
+// 与 lalmax 保持一致：即使服务重启、未收到 REGISTER，也可以从 keepalive 中解析并更新设备注册信息。
+// - 从 From/Request-URI/Via/Contact 中提取设备ID、平台ID、设备IP和端口等信息
+// - 如果设备不存在，则创建 Device 记录，相当于“从心跳中恢复注册信息”
+// - 如果设备已存在，则更新 IP/Port 和心跳时间
 func (s *Gb28181Server) handleKeepalive(msg *SipMessage, raddr *net.UDPAddr) {
 	deviceId := ExtractDeviceId(msg.Headers["from"])
 	if deviceId == "" {
@@ -490,48 +495,45 @@ func (s *Gb28181Server) handleKeepalive(msg *SipMessage, raddr *net.UDPAddr) {
 		return
 	}
 
-	s.mutex.Lock()
-	device, exists := s.devices[deviceId]
-	if !exists {
-		// 设备未注册，返回401要求重新注册（服务重启后常见情况）
-		s.mutex.Unlock()
-		Log.Warnf("keepalive from unregistered device, require re-register. device_id=%s, from=%s:%d",
-			deviceId, raddr.IP.String(), raddr.Port)
-
-		// 发送401 Unauthorized，要求设备重新注册
-		callId := msg.Headers["call-id"]
-		from := msg.Headers["from"]
-		to := msg.Headers["to"]
-		cseq := msg.Headers["cseq"]
-		via := msg.Headers["via"]
-
-		realm := s.config.LocalSipDomain
-		if realm == "" {
-			realm = s.config.LocalSipId
-		}
-
-		nonce := GenerateNonce()
-		s.mutex.Lock()
-		s.nonces[deviceId] = nonce
-		s.mutex.Unlock()
-
-		headers := map[string]string{
-			"Via":              via,
-			"From":             from,
-			"To":               to + ";tag=" + GenerateTag(),
-			"Call-ID":          callId,
-			"CSeq":             cseq,
-			"WWW-Authenticate": BuildWWWAuthenticate(realm, nonce),
-			"Content-Length":   "0",
-		}
-
-		response := BuildSipResponse(401, "Unauthorized", headers, "")
-		s.sendRaw(response, raddr)
-		return
+	// 从 Contact 提取设备的真实 IP 和端口，兼容 NAT
+	contact := msg.Headers["contact"]
+	ip, port := ExtractContactAddr(contact)
+	if ip == "" {
+		ip = raddr.IP.String()
+	}
+	if port == 0 {
+		port = raddr.Port
 	}
 
-	// 设备已注册，更新心跳时间
+	// 从 Request-URI 提取平台注册信息（serverId / serverDomain）
+	registeredServerId, registeredServerDomain := ExtractServerFromRequestUri(msg.RequestUri)
+
 	now := time.Now()
+
+	s.mutex.Lock()
+	device, exists := s.devices[deviceId]
+	isNewDevice := !exists
+	if !exists {
+		// 设备不存在时，仿照 lalmax，从 keepalive 中"注册"设备
+		device = &Device{
+			DeviceId:     deviceId,
+			DeviceName:   deviceId,
+			Channels:     make(map[string]*Channel),
+			RegisterTime: now,
+		}
+		s.devices[deviceId] = device
+		Log.Infof("create device from keepalive. device_id=%s, ip=%s, port=%d, reg_server_id=%s, reg_server_domain=%s",
+			deviceId, ip, port, registeredServerId, registeredServerDomain)
+	}
+
+	// 更新设备的网络和平台注册信息
+	device.Ip = ip
+	device.Port = port
+	if registeredServerId != "" {
+		device.RegisteredServerId = registeredServerId
+		device.RegisteredServerDomain = registeredServerDomain
+	}
+
 	// 计算心跳间隔（基于客户端实际心跳时间）
 	if !device.KeepaliveTime.IsZero() {
 		interval := now.Sub(device.KeepaliveTime)
@@ -549,6 +551,11 @@ func (s *Gb28181Server) handleKeepalive(msg *SipMessage, raddr *net.UDPAddr) {
 	device.KeepaliveTime = now
 	device.Status = "online"
 	s.mutex.Unlock()
+
+	// 如果是从 keepalive 新创建的设备，主动查询通道列表（与 REGISTER 处理保持一致）
+	if isNewDevice {
+		go s.queryCatalog(deviceId)
+	}
 
 	// 检查是否是通道列表响应（Body中包含XML）
 	body := msg.Body
@@ -1599,22 +1606,22 @@ func (s *Gb28181Server) queryCatalog(deviceId string) {
 	catalogXml := BuildCatalogQueryXML(deviceId, GenerateSN())
 
 	// 构建MESSAGE请求（参考 lalmax 实现）
-	// Request-URI 和 To 使用域格式，From 和 Contact 使用 IP:Port 格式
-	deviceDomain := getDeviceDomain(deviceId)
-	requestUri := fmt.Sprintf("sip:%s@%s", deviceId, deviceDomain)
+	// Request-URI 和 To 使用域格式（使用 LocalSipDomain，如 3402000000.spvmn.cn）
+	// From 和 Contact 使用 IP:Port 格式
+	requestUri := fmt.Sprintf("sip:%s@%s", deviceId, s.config.LocalSipDomain)
 	serverId := s.getServerIdForDevice(deviceId)
 	// From 使用 IP:Port 格式（物理地址）
 	from := fmt.Sprintf("<sip:%s@%s:%d>", serverId, s.config.LocalSipIp, s.config.LocalSipPort)
-	// To 使用域格式（逻辑地址）
-	to := fmt.Sprintf("<sip:%s@%s>", deviceId, deviceDomain)
+	// To 使用域格式（逻辑地址，使用 LocalSipDomain）
+	to := fmt.Sprintf("<sip:%s@%s>", deviceId, s.config.LocalSipDomain)
 
 	branch := GenerateBranch()
 	callId := GenerateCallId()
 	tag := GenerateTag()
 
 	// 按照 lalmax 的顺序构建消息头（海康设备对顺序敏感）
-	// Via 格式：SIP/2.0/UDP <ip>:<port>;rport;branch=<branch>
-	via := fmt.Sprintf("SIP/2.0/UDP %s:%d;rport;branch=%s", s.config.LocalSipIp, s.config.LocalSipPort, branch)
+	// Via 格式：SIP/2.0/UDP <ip>:<port>;branch=<branch>（lalmax 没有 rport 参数）
+	via := fmt.Sprintf("SIP/2.0/UDP %s:%d;branch=%s", s.config.LocalSipIp, s.config.LocalSipPort, branch)
 	fromHeader := from + ";tag=" + tag
 	toHeader := to
 	callIdHeader := callId
