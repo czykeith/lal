@@ -114,16 +114,25 @@ func BuildSipRequest(method, requestUri string, headers map[string]string, body 
 	sb.WriteString(fmt.Sprintf("%s %s SIP/2.0\r\n", method, requestUri))
 
 	// 消息头
+	hasContentLength := false
 	for k, v := range headers {
+		if strings.ToLower(k) == "content-length" {
+			hasContentLength = true
+		}
 		sb.WriteString(fmt.Sprintf("%s: %s\r\n", k, v))
 	}
 
 	// 消息体
 	if body != "" {
-		sb.WriteString(fmt.Sprintf("Content-Length: %d\r\n", len(body)))
+		if !hasContentLength {
+			sb.WriteString(fmt.Sprintf("Content-Length: %d\r\n", len(body)))
+		}
 		sb.WriteString("\r\n")
 		sb.WriteString(body)
 	} else {
+		if !hasContentLength {
+			sb.WriteString("Content-Length: 0\r\n")
+		}
 		sb.WriteString("\r\n")
 	}
 

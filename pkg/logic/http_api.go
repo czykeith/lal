@@ -68,7 +68,12 @@ func (h *HttpApiServer) RunLoop() error {
 
 	mux.HandleFunc("/api/ctrl/gb28181_invite", h.ctrlGb28181InviteHandler)
 	mux.HandleFunc("/api/ctrl/gb28181_bye", h.ctrlGb28181ByeHandler)
-	mux.HandleFunc("/api/stat/gb28181_devices", h.statGb28181DevicesHandler)
+	mux.HandleFunc("/api/ctrl/gb28181_ptz", h.ctrlGb28181PtzHandler)
+	mux.HandleFunc("/api/ctrl/gb28181_devices", h.statGb28181DevicesHandler)
+	mux.HandleFunc("/api/ctrl/gb28181_streams", h.statGb28181StreamsHandler)
+	mux.HandleFunc("/api/ctrl/gb28181_device_info", h.queryGb28181DeviceInfoHandler)
+	mux.HandleFunc("/api/ctrl/gb28181_device_status", h.queryGb28181DeviceStatusHandler)
+	mux.HandleFunc("/api/ctrl/gb28181_channels", h.queryGb28181ChannelsHandler)
 
 	// 所有没有注册路由的走下面这个处理函数
 	mux.HandleFunc("/", h.notFoundHandler)
@@ -313,6 +318,9 @@ func (h *HttpApiServer) ctrlGb28181InviteHandler(w http.ResponseWriter, req *htt
 	if !j.Exist("is_tcp_flag") {
 		info.IsTcpFlag = 0
 	}
+	if !j.Exist("stream_type") {
+		info.StreamType = 1 // 默认辅码流
+	}
 
 	Log.Infof("http api gb28181 invite. req info=%+v", info)
 
@@ -343,6 +351,96 @@ func (h *HttpApiServer) statGb28181DevicesHandler(w http.ResponseWriter, req *ht
 	Log.Infof("http api stat gb28181 devices")
 
 	resp := h.sm.StatGb28181Devices()
+	feedback(resp, w)
+}
+
+func (h *HttpApiServer) ctrlGb28181PtzHandler(w http.ResponseWriter, req *http.Request) {
+	var v base.ApiCtrlGb28181PtzResp
+	var info base.ApiCtrlGb28181PtzReq
+
+	j, err := unmarshalRequestJsonBody(req, &info, "device_id", "channel_id", "command")
+	if err != nil {
+		Log.Warnf("http api gb28181 ptz error. err=%+v", err)
+		v.ErrorCode = base.ErrorCodeParamMissing
+		v.Desp = base.DespParamMissing
+		feedback(v, w)
+		return
+	}
+
+	if !j.Exist("speed") {
+		info.Speed = 5 // 默认速度
+	}
+	if !j.Exist("preset") {
+		info.Preset = 0
+	}
+
+	Log.Infof("http api gb28181 ptz. req info=%+v", info)
+
+	resp := h.sm.CtrlGb28181Ptz(info)
+	feedback(resp, w)
+}
+
+func (h *HttpApiServer) statGb28181StreamsHandler(w http.ResponseWriter, req *http.Request) {
+	Log.Infof("http api stat gb28181 streams")
+
+	resp := h.sm.StatGb28181Streams()
+	feedback(resp, w)
+}
+
+func (h *HttpApiServer) queryGb28181DeviceInfoHandler(w http.ResponseWriter, req *http.Request) {
+	var v base.ApiQueryGb28181DeviceInfoResp
+	var info base.ApiQueryGb28181DeviceInfoReq
+
+	_, err := unmarshalRequestJsonBody(req, &info, "device_id")
+	if err != nil {
+		Log.Warnf("http api query gb28181 device info error. err=%+v", err)
+		v.ErrorCode = base.ErrorCodeParamMissing
+		v.Desp = base.DespParamMissing
+		feedback(v, w)
+		return
+	}
+
+	Log.Infof("http api query gb28181 device info. req info=%+v", info)
+
+	resp := h.sm.QueryGb28181DeviceInfo(info)
+	feedback(resp, w)
+}
+
+func (h *HttpApiServer) queryGb28181DeviceStatusHandler(w http.ResponseWriter, req *http.Request) {
+	var v base.ApiQueryGb28181DeviceStatusResp
+	var info base.ApiQueryGb28181DeviceStatusReq
+
+	_, err := unmarshalRequestJsonBody(req, &info, "device_id")
+	if err != nil {
+		Log.Warnf("http api query gb28181 device status error. err=%+v", err)
+		v.ErrorCode = base.ErrorCodeParamMissing
+		v.Desp = base.DespParamMissing
+		feedback(v, w)
+		return
+	}
+
+	Log.Infof("http api query gb28181 device status. req info=%+v", info)
+
+	resp := h.sm.QueryGb28181DeviceStatus(info)
+	feedback(resp, w)
+}
+
+func (h *HttpApiServer) queryGb28181ChannelsHandler(w http.ResponseWriter, req *http.Request) {
+	var v base.ApiQueryGb28181ChannelsResp
+	var info base.ApiQueryGb28181ChannelsReq
+
+	_, err := unmarshalRequestJsonBody(req, &info, "device_id")
+	if err != nil {
+		Log.Warnf("http api query gb28181 channels error. err=%+v", err)
+		v.ErrorCode = base.ErrorCodeParamMissing
+		v.Desp = base.DespParamMissing
+		feedback(v, w)
+		return
+	}
+
+	Log.Infof("http api query gb28181 channels. req info=%+v", info)
+
+	resp := h.sm.QueryGb28181Channels(info)
 	feedback(resp, w)
 }
 

@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/q191201771/lal/pkg/base"
+	"github.com/q191201771/lal/pkg/gb28181"
 	"github.com/q191201771/naza/pkg/bininfo"
 )
 
@@ -291,7 +292,13 @@ func (sm *ServerManager) CtrlGb28181Invite(info base.ApiCtrlGb28181InviteReq) (r
 	}
 
 	// 发送INVITE信令
-	err := sm.gb28181Server.Invite(info.DeviceId, info.ChannelId, streamName, rtpPubResp.Data.Port, isTcp)
+	// 获取码流类型（0=主码流，1=辅码流，默认1）
+	streamType := info.StreamType
+	if streamType != 0 && streamType != 1 {
+		streamType = 1 // 默认辅码流
+	}
+
+	err := sm.gb28181Server.Invite(info.DeviceId, info.ChannelId, streamName, rtpPubResp.Data.Port, isTcp, streamType)
 	if err != nil {
 		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
 		ret.Desp = err.Error()
@@ -360,6 +367,7 @@ func (sm *ServerManager) StatGb28181Devices() (ret base.ApiStatGb28181DeviceResp
 	devices := sm.gb28181Server.GetDevices()
 	deviceInfos := make([]base.Gb28181DeviceInfo, 0, len(devices))
 
+	// 遍历设备，返回设备信息（不再主动查询Catalog，由后台策略决定）
 	for _, device := range devices {
 		deviceInfo := base.Gb28181DeviceInfo{
 			DeviceId:      device.DeviceId,
@@ -388,6 +396,194 @@ func (sm *ServerManager) StatGb28181Devices() (ret base.ApiStatGb28181DeviceResp
 	ret.ErrorCode = base.ErrorCodeSucc
 	ret.Desp = base.DespSucc
 	ret.Data.Devices = deviceInfos
+	return
+}
+
+// CtrlGb28181Ptz GB28181 PTZ控制
+func (sm *ServerManager) CtrlGb28181Ptz(info base.ApiCtrlGb28181PtzReq) (ret base.ApiCtrlGb28181PtzResp) {
+	sm.mutex.Lock()
+	defer sm.mutex.Unlock()
+
+	if sm.gb28181Server == nil {
+		ret.ErrorCode = base.ErrorCodeGb28181PtzFail
+		ret.Desp = "gb28181 server not enabled"
+		return
+	}
+
+	// 转换命令字符串为PTZCommand类型
+	// 注意：这里需要直接使用 gb28181 包的类型，但由于包访问限制，我们通过字符串传递
+	// 实际调用时在 gb28181 包内部进行转换
+	ptzControl := gb28181.PTZControl{
+		DeviceId:  info.DeviceId,
+		ChannelId: info.ChannelId,
+		Command:   gb28181.PTZCommand(info.Command),
+		Speed:     info.Speed,
+		Preset:    info.Preset,
+	}
+
+	// 发送PTZ控制命令
+	err := sm.gb28181Server.ControlPTZ(ptzControl)
+	if err != nil {
+		ret.ErrorCode = base.ErrorCodeGb28181PtzFail
+		ret.Desp = err.Error()
+		return
+	}
+
+	ret.ErrorCode = base.ErrorCodeSucc
+	ret.Desp = base.DespSucc
+	ret.Data.DeviceId = info.DeviceId
+	ret.Data.ChannelId = info.ChannelId
+	ret.Data.Command = info.Command
+	return
+}
+
+// QueryGb28181DeviceInfo 查询GB28181设备信息
+func (sm *ServerManager) QueryGb28181DeviceInfo(info base.ApiQueryGb28181DeviceInfoReq) (ret base.ApiQueryGb28181DeviceInfoResp) {
+	sm.mutex.Lock()
+	defer sm.mutex.Unlock()
+
+	if sm.gb28181Server == nil {
+		ret.ErrorCode = base.ErrorCodeGb28181QueryFail
+		ret.Desp = "gb28181 server not enabled"
+		return
+	}
+
+	// 获取设备信息
+	device := sm.gb28181Server.GetDevice(info.DeviceId)
+	if device == nil {
+		ret.ErrorCode = base.ErrorCodeGb28181DeviceNotFound
+		ret.Desp = base.DespGb28181DeviceNotFound
+		return
+	}
+
+	// 发送查询请求（设备信息需要从设备响应中获取，这里先返回基本信息）
+	err := sm.gb28181Server.QueryDeviceInfo(info.DeviceId)
+	if err != nil {
+		ret.ErrorCode = base.ErrorCodeGb28181QueryFail
+		ret.Desp = err.Error()
+		return
+	}
+
+	ret.ErrorCode = base.ErrorCodeSucc
+	ret.Desp = base.DespSucc
+	ret.Data.DeviceId = device.DeviceId
+	ret.Data.DeviceName = device.DeviceName
+	// 注意：Manufacturer、Model、Firmware 需要从设备响应中获取，这里暂时返回空
+	// 实际应用中应该等待设备响应并解析XML
+	return
+}
+
+// QueryGb28181DeviceStatus 查询GB28181设备状态
+func (sm *ServerManager) QueryGb28181DeviceStatus(info base.ApiQueryGb28181DeviceStatusReq) (ret base.ApiQueryGb28181DeviceStatusResp) {
+	sm.mutex.Lock()
+	defer sm.mutex.Unlock()
+
+	if sm.gb28181Server == nil {
+		ret.ErrorCode = base.ErrorCodeGb28181QueryFail
+		ret.Desp = "gb28181 server not enabled"
+		return
+	}
+
+	// 获取设备信息
+	device := sm.gb28181Server.GetDevice(info.DeviceId)
+	if device == nil {
+		ret.ErrorCode = base.ErrorCodeGb28181DeviceNotFound
+		ret.Desp = base.DespGb28181DeviceNotFound
+		return
+	}
+
+	// 发送查询请求
+	err := sm.gb28181Server.QueryDeviceStatus(info.DeviceId)
+	if err != nil {
+		ret.ErrorCode = base.ErrorCodeGb28181QueryFail
+		ret.Desp = err.Error()
+		return
+	}
+
+	ret.ErrorCode = base.ErrorCodeSucc
+	ret.Desp = base.DespSucc
+	ret.Data.DeviceId = device.DeviceId
+	ret.Data.Status = device.Status
+	return
+}
+
+// QueryGb28181Channels 查询GB28181通道列表
+func (sm *ServerManager) QueryGb28181Channels(info base.ApiQueryGb28181ChannelsReq) (ret base.ApiQueryGb28181ChannelsResp) {
+	sm.mutex.Lock()
+	defer sm.mutex.Unlock()
+
+	if sm.gb28181Server == nil {
+		ret.ErrorCode = base.ErrorCodeGb28181QueryFail
+		ret.Desp = "gb28181 server not enabled"
+		return
+	}
+
+	// 获取设备信息
+	device := sm.gb28181Server.GetDevice(info.DeviceId)
+	if device == nil {
+		ret.ErrorCode = base.ErrorCodeGb28181DeviceNotFound
+		ret.Desp = base.DespGb28181DeviceNotFound
+		return
+	}
+
+	// 发送查询请求
+	err := sm.gb28181Server.QueryCatalog(info.DeviceId)
+	if err != nil {
+		ret.ErrorCode = base.ErrorCodeGb28181QueryFail
+		ret.Desp = err.Error()
+		return
+	}
+
+	// 获取通道列表
+	channels := device.GetChannels()
+	channelInfos := make([]base.Gb28181ChannelInfo, 0, len(channels))
+	for _, channel := range channels {
+		channelInfo := base.Gb28181ChannelInfo{
+			ChannelId:   channel.ChannelId,
+			ChannelName: channel.ChannelName,
+			Status:      channel.Status,
+			StreamName:  channel.StreamName,
+		}
+		channelInfos = append(channelInfos, channelInfo)
+	}
+
+	ret.ErrorCode = base.ErrorCodeSucc
+	ret.Desp = base.DespSucc
+	ret.Data.DeviceId = info.DeviceId
+	ret.Data.Channels = channelInfos
+	return
+}
+
+// StatGb28181Streams 获取GB28181流列表
+func (sm *ServerManager) StatGb28181Streams() (ret base.ApiStatGb28181StreamsResp) {
+	sm.mutex.Lock()
+	defer sm.mutex.Unlock()
+
+	if sm.gb28181Server == nil {
+		ret.ErrorCode = base.ErrorCodeGb28181QueryFail
+		ret.Desp = "gb28181 server not enabled"
+		return
+	}
+
+	streams := sm.gb28181Server.GetAllStreams()
+	streamInfos := make([]base.Gb28181StreamInfo, 0, len(streams))
+
+	for _, stream := range streams {
+		streamInfo := base.Gb28181StreamInfo{
+			DeviceId:   stream.DeviceId,
+			ChannelId:  stream.ChannelId,
+			StreamName: stream.StreamName,
+			CallId:     stream.CallId,
+			Port:       stream.Port,
+			IsTcp:      stream.IsTcp,
+			StartTime:  stream.StartTime.Format("2006-01-02 15:04:05"),
+		}
+		streamInfos = append(streamInfos, streamInfo)
+	}
+
+	ret.ErrorCode = base.ErrorCodeSucc
+	ret.Desp = base.DespSucc
+	ret.Data.Streams = streamInfos
 	return
 }
 
@@ -485,7 +681,8 @@ func (sm *ServerManager) onGb28181Reconnect(deviceId string) error {
 		}
 
 		// 重新发送INVITE信令
-		err := sm.gb28181Server.Invite(stream.DeviceId, stream.ChannelId, stream.StreamName, rtpPubResp.Data.Port, stream.IsTcp)
+		// 恢复流时使用主码流（streamType=0）
+		err := sm.gb28181Server.Invite(stream.DeviceId, stream.ChannelId, stream.StreamName, rtpPubResp.Data.Port, stream.IsTcp, 0)
 		if err != nil {
 			Log.Warnf("restore stream INVITE failed. device_id=%s, stream_name=%s, err=%+v", deviceId, stream.StreamName, err)
 			// 如果INVITE失败，停止RTP Pub

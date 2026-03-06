@@ -135,21 +135,42 @@ Doc: %s
 	}
 
 	if sm.config.Gb28181Config.Enable {
-		// 设置RTP端口段
-		rtpPortMin := sm.config.Gb28181Config.RtpPortMin
-		rtpPortMax := sm.config.Gb28181Config.RtpPortMax
+		// 设置SIP收流端口范围（优先使用新配置，兼容旧配置）
+		rtpPortMin := sm.config.Gb28181Config.SipRtpPortMin
+		rtpPortMax := sm.config.Gb28181Config.SipRtpPortMax
+		// 如果新配置未设置，使用旧配置（向后兼容）
+		if rtpPortMin == 0 || rtpPortMax == 0 {
+			rtpPortMin = sm.config.Gb28181Config.RtpPortMin
+			rtpPortMax = sm.config.Gb28181Config.RtpPortMax
+		}
+		// 如果仍未设置，使用默认值
+		if rtpPortMin == 0 {
+			rtpPortMin = 30000
+		}
+		if rtpPortMax == 0 {
+			rtpPortMax = 60000
+		}
 		if rtpPortMin > 0 && rtpPortMax > rtpPortMin {
 			gb28181.SetRtpPortRange(uint16(rtpPortMin), uint16(rtpPortMax))
+			Log.Infof("set SIP RTP port range. min=%d, max=%d", rtpPortMin, rtpPortMax)
 		}
 
 		gb28181Config := &gb28181.ServerConfig{
-			LocalSipId:     sm.config.Gb28181Config.LocalSipId,
-			LocalSipIp:     sm.config.Gb28181Config.LocalSipIp,
-			LocalSipPort:   sm.config.Gb28181Config.LocalSipPort,
-			LocalSipDomain: sm.config.Gb28181Config.LocalSipDomain,
-			Username:       sm.config.Gb28181Config.Username,
-			Password:       sm.config.Gb28181Config.Password,
-			Expires:        sm.config.Gb28181Config.Expires,
+			LocalSipId:           sm.config.Gb28181Config.LocalSipId,
+			LocalSipIp:           sm.config.Gb28181Config.LocalSipIp,
+			LocalSipPort:         sm.config.Gb28181Config.LocalSipPort,
+			LocalSipDomain:       sm.config.Gb28181Config.LocalSipDomain,
+			Username:             sm.config.Gb28181Config.Username,
+			Password:             sm.config.Gb28181Config.Password,
+			Expires:              sm.config.Gb28181Config.Expires,
+			CatalogQueryInterval: sm.config.Gb28181Config.CatalogQueryInterval,
+			VideoCodec:           sm.config.Gb28181Config.VideoCodec,
+			VideoWidth:           sm.config.Gb28181Config.VideoWidth,
+			VideoHeight:          sm.config.Gb28181Config.VideoHeight,
+			VideoBitrate:         sm.config.Gb28181Config.VideoBitrate,
+			VideoFramerate:       sm.config.Gb28181Config.VideoFramerate,
+			VideoProfile:         sm.config.Gb28181Config.VideoProfile,
+			VideoLevel:           sm.config.Gb28181Config.VideoLevel,
 		}
 		if gb28181Config.LocalSipPort == 0 {
 			gb28181Config.LocalSipPort = 5060

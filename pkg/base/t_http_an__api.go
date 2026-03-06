@@ -74,6 +74,7 @@ type ApiCtrlGb28181InviteReq struct {
 	StreamName string `json:"stream_name"` // 流名称（可选，默认使用 device_id_channel_id）
 	Port       int    `json:"port"`        // RTP接收端口（可选，0表示自动分配）
 	IsTcpFlag  int    `json:"is_tcp_flag"` // 是否使用TCP传输（0=UDP，1=TCP，默认0）
+	StreamType int    `json:"stream_type"` // 码流类型（0=主码流，1=辅码流，默认0）
 }
 
 // ApiCtrlGb28181ByeReq GB28181停止拉流请求
@@ -81,6 +82,30 @@ type ApiCtrlGb28181ByeReq struct {
 	DeviceId   string `json:"device_id"`   // 设备ID（国标编码）
 	ChannelId  string `json:"channel_id"`  // 通道ID（国标编码）
 	StreamName string `json:"stream_name"` // 流名称（可选）
+}
+
+// ApiCtrlGb28181PtzReq GB28181 PTZ控制请求
+type ApiCtrlGb28181PtzReq struct {
+	DeviceId  string `json:"device_id"`  // 设备ID（国标编码）
+	ChannelId string `json:"channel_id"` // 通道ID（国标编码）
+	Command   string `json:"command"`    // PTZ命令：Up/Down/Left/Right/UpLeft/UpRight/DownLeft/DownRight/ZoomIn/ZoomOut/FocusNear/FocusFar/IrisOpen/IrisClose/Stop/SetPreset/CallPreset/DelPreset/StartCruise/StopCruise
+	Speed     int    `json:"speed"`      // 速度 1-8（默认5，仅用于方向控制）
+	Preset    int    `json:"preset"`     // 预置位编号（用于预置位相关命令）
+}
+
+// ApiQueryGb28181DeviceInfoReq GB28181查询设备信息请求
+type ApiQueryGb28181DeviceInfoReq struct {
+	DeviceId string `json:"device_id"` // 设备ID（国标编码）
+}
+
+// ApiQueryGb28181DeviceStatusReq GB28181查询设备状态请求
+type ApiQueryGb28181DeviceStatusReq struct {
+	DeviceId string `json:"device_id"` // 设备ID（国标编码）
+}
+
+// ApiQueryGb28181ChannelsReq GB28181查询通道列表请求
+type ApiQueryGb28181ChannelsReq struct {
+	DeviceId string `json:"device_id"` // 设备ID（国标编码）
 }
 
 // ----- response ------------------------------------------------------------------------------------------------------
@@ -111,6 +136,10 @@ const (
 	DespGb28181InviteFail          = "gb28181 invite fail"
 	ErrorCodeGb28181ByeFail        = 3003
 	DespGb28181ByeFail             = "gb28181 bye fail"
+	ErrorCodeGb28181PtzFail        = 3004
+	DespGb28181PtzFail             = "gb28181 ptz control fail"
+	ErrorCodeGb28181QueryFail      = 3005
+	DespGb28181QueryFail           = "gb28181 query fail"
 )
 
 type ApiRespBasic struct {
@@ -223,6 +252,59 @@ type Gb28181DeviceInfo struct {
 	RegisterTime  string               `json:"register_time"`  // 注册时间
 	KeepaliveTime string               `json:"keepalive_time"` // 最后心跳时间
 	Channels      []Gb28181ChannelInfo `json:"channels"`       // 通道列表
+}
+
+type ApiCtrlGb28181PtzResp struct {
+	ApiRespBasic
+	Data struct {
+		DeviceId  string `json:"device_id"`
+		ChannelId string `json:"channel_id"`
+		Command   string `json:"command"`
+	} `json:"data"`
+}
+
+type ApiQueryGb28181DeviceInfoResp struct {
+	ApiRespBasic
+	Data struct {
+		DeviceId     string `json:"device_id"`
+		DeviceName   string `json:"device_name"`
+		Manufacturer string `json:"manufacturer"`
+		Model        string `json:"model"`
+		Firmware     string `json:"firmware"`
+	} `json:"data"`
+}
+
+type ApiQueryGb28181DeviceStatusResp struct {
+	ApiRespBasic
+	Data struct {
+		DeviceId string `json:"device_id"`
+		Status   string `json:"status"` // online/offline
+	} `json:"data"`
+}
+
+type ApiQueryGb28181ChannelsResp struct {
+	ApiRespBasic
+	Data struct {
+		DeviceId string               `json:"device_id"`
+		Channels []Gb28181ChannelInfo `json:"channels"`
+	} `json:"data"`
+}
+
+type ApiStatGb28181StreamsResp struct {
+	ApiRespBasic
+	Data struct {
+		Streams []Gb28181StreamInfo `json:"streams"`
+	} `json:"data"`
+}
+
+type Gb28181StreamInfo struct {
+	DeviceId   string `json:"device_id"`   // 设备ID
+	ChannelId  string `json:"channel_id"`  // 通道ID
+	StreamName string `json:"stream_name"` // 流名称
+	CallId     string `json:"call_id"`     // SIP Call-ID
+	Port       int    `json:"port"`        // RTP端口
+	IsTcp      bool   `json:"is_tcp"`      // 是否TCP传输
+	StartTime  string `json:"start_time"`  // 开始时间
 }
 
 type Gb28181ChannelInfo struct {
