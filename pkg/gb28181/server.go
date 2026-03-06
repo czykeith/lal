@@ -9,10 +9,8 @@
 package gb28181
 
 import (
-	"bytes"
 	"encoding/xml"
 	"fmt"
-	"io"
 	"net"
 	"regexp"
 	"strconv"
@@ -1718,20 +1716,8 @@ func (s *Gb28181Server) parseCatalogResponse(deviceId string, xmlBody string) {
 		} `xml:"ItemList"`
 	}
 
-	// 使用工具函数处理XML编码转换
-	xmlBytes, err := DecodeGbkToUtf8([]byte(xmlBody))
-	if err != nil {
-		Log.Warnf("convert GBK to UTF-8 failed. device_id=%s, err=%+v", deviceId, err)
-		xmlBytes = []byte(xmlBody) // 转换失败，使用原始数据
-	}
-
 	var resp CatalogResponse
-	decoder := xml.NewDecoder(bytes.NewReader(xmlBytes))
-	// 设置 CharsetReader 以处理编码问题
-	decoder.CharsetReader = func(charset string, input io.Reader) (io.Reader, error) {
-		return input, nil
-	}
-	if err := decoder.Decode(&resp); err != nil {
+	if err := ParseXMLResponse([]byte(xmlBody), &resp); err != nil {
 		xmlPreviewLen := 500
 		if len(xmlBody) < xmlPreviewLen {
 			xmlPreviewLen = len(xmlBody)

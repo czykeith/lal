@@ -80,12 +80,15 @@ func BuildDeviceInfoResponseXML(deviceId, deviceName, manufacturer, model, firmw
 
 // DecodeGbkToUtf8 将GBK编码的XML转换为UTF-8
 func DecodeGbkToUtf8(data []byte) ([]byte, error) {
-	// 检查是否是GBK/GB2312编码
-	xmlStr := string(data)
-	if !strings.Contains(xmlStr, "encoding=\"GB2312\"") &&
-		!strings.Contains(xmlStr, "encoding='GB2312'") &&
-		!strings.Contains(xmlStr, "encoding=\"GBK\"") &&
-		!strings.Contains(xmlStr, "encoding='GBK'") {
+	// 检查是否是GBK/GB2312编码（大小写不敏感）
+	// 注意：大量设备会发 `encoding="gb2312"`（小写），之前大小写敏感会导致误判为“无需转码”。
+	xmlStrLower := strings.ToLower(string(data))
+	if !strings.Contains(xmlStrLower, "encoding=\"gb2312\"") &&
+		!strings.Contains(xmlStrLower, "encoding='gb2312'") &&
+		!strings.Contains(xmlStrLower, "encoding=\"gbk\"") &&
+		!strings.Contains(xmlStrLower, "encoding='gbk'") &&
+		!strings.Contains(xmlStrLower, "encoding=\"gb18030\"") &&
+		!strings.Contains(xmlStrLower, "encoding='gb18030'") {
 		// 不是GBK编码，直接返回
 		return data, nil
 	}
@@ -103,6 +106,14 @@ func DecodeGbkToUtf8(data []byte) ([]byte, error) {
 	utf8Str = strings.ReplaceAll(utf8Str, "encoding='GB2312'", "encoding='UTF-8'")
 	utf8Str = strings.ReplaceAll(utf8Str, "encoding=\"GBK\"", "encoding=\"UTF-8\"")
 	utf8Str = strings.ReplaceAll(utf8Str, "encoding='GBK'", "encoding='UTF-8'")
+	utf8Str = strings.ReplaceAll(utf8Str, "encoding=\"GB18030\"", "encoding=\"UTF-8\"")
+	utf8Str = strings.ReplaceAll(utf8Str, "encoding='GB18030'", "encoding='UTF-8'")
+	utf8Str = strings.ReplaceAll(utf8Str, "encoding=\"gb2312\"", "encoding=\"UTF-8\"")
+	utf8Str = strings.ReplaceAll(utf8Str, "encoding='gb2312'", "encoding='UTF-8'")
+	utf8Str = strings.ReplaceAll(utf8Str, "encoding=\"gbk\"", "encoding=\"UTF-8\"")
+	utf8Str = strings.ReplaceAll(utf8Str, "encoding='gbk'", "encoding='UTF-8'")
+	utf8Str = strings.ReplaceAll(utf8Str, "encoding=\"gb18030\"", "encoding=\"UTF-8\"")
+	utf8Str = strings.ReplaceAll(utf8Str, "encoding='gb18030'", "encoding='UTF-8'")
 
 	return []byte(utf8Str), nil
 }
@@ -124,6 +135,17 @@ func EncodeUtf8ToGbk(data []byte) ([]byte, error) {
 	return []byte(gbkStr), nil
 }
 
+func xmlCharsetReader(charset string, input io.Reader) (io.Reader, error) {
+	switch strings.ToLower(strings.TrimSpace(charset)) {
+	case "gbk", "gb2312", "gb18030":
+		return transform.NewReader(input, simplifiedchinese.GBK.NewDecoder()), nil
+	case "utf-8", "utf8", "":
+		return input, nil
+	default:
+		return input, nil
+	}
+}
+
 // ParseXMLResponse 解析XML响应（自动处理编码转换）
 func ParseXMLResponse(data []byte, v interface{}) error {
 	// 先转换为UTF-8
@@ -134,6 +156,7 @@ func ParseXMLResponse(data []byte, v interface{}) error {
 
 	// 解析XML
 	decoder := xml.NewDecoder(bytes.NewReader(utf8Data))
+	decoder.CharsetReader = xmlCharsetReader
 	return decoder.Decode(v)
 }
 
