@@ -1611,21 +1611,39 @@ func (s *Gb28181Server) queryCatalog(deviceId string) {
 	branch := GenerateBranch()
 	callId := GenerateCallId()
 	tag := GenerateTag()
-	headers := map[string]string{
-		"Via":            fmt.Sprintf("SIP/2.0/UDP %s:%d;branch=%s;rport", s.config.LocalSipIp, s.config.LocalSipPort, branch),
-		"From":           from + ";tag=" + tag,
-		"To":             to,
-		"Call-ID":        callId,
-		"User-Agent":     "LALServer",
-		"CSeq":           "1 MESSAGE",
-		"Max-Forwards":   "70",
-		"Contact":        fmt.Sprintf("<sip:%s@%s:%d>;tag=%s", serverId, s.config.LocalSipIp, s.config.LocalSipPort, tag),
-		"Expires":        fmt.Sprintf("%d", s.config.Expires),
-		"Content-Type":   "Application/MANSCDP+xml",
-		"Content-Length": fmt.Sprintf("%d", len(catalogXml)),
-	}
 
-	request := BuildSipRequest(SipMethodMessage, requestUri, headers, catalogXml)
+	// 按照 lalmax 的顺序构建消息头（海康设备对顺序敏感）
+	// Via 格式：SIP/2.0/UDP <ip>:<port>;rport;branch=<branch>
+	via := fmt.Sprintf("SIP/2.0/UDP %s:%d;rport;branch=%s", s.config.LocalSipIp, s.config.LocalSipPort, branch)
+	fromHeader := from + ";tag=" + tag
+	toHeader := to
+	callIdHeader := callId
+	userAgent := "LALServer"
+	cseq := "1 MESSAGE"
+	maxForwards := "70"
+	contact := fmt.Sprintf("<sip:%s@%s:%d>;tag=%s", serverId, s.config.LocalSipIp, s.config.LocalSipPort, tag)
+	contentType := "Application/MANSCDP+xml"
+	expires := fmt.Sprintf("%d", s.config.Expires)
+	contentLength := fmt.Sprintf("%d", len(catalogXml))
+
+	// 按照 lalmax 的顺序构建完整的 SIP MESSAGE（海康设备要求固定顺序）
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("MESSAGE %s SIP/2.0\r\n", requestUri))
+	sb.WriteString(fmt.Sprintf("Via: %s\r\n", via))
+	sb.WriteString(fmt.Sprintf("From: %s\r\n", fromHeader))
+	sb.WriteString(fmt.Sprintf("To: %s\r\n", toHeader))
+	sb.WriteString(fmt.Sprintf("Call-ID: %s\r\n", callIdHeader))
+	sb.WriteString(fmt.Sprintf("User-Agent: %s\r\n", userAgent))
+	sb.WriteString(fmt.Sprintf("CSeq: %s\r\n", cseq))
+	sb.WriteString(fmt.Sprintf("Max-Forwards: %s\r\n", maxForwards))
+	sb.WriteString(fmt.Sprintf("Contact: %s\r\n", contact))
+	sb.WriteString(fmt.Sprintf("Content-Type: %s\r\n", contentType))
+	sb.WriteString(fmt.Sprintf("Expires: %s\r\n", expires))
+	sb.WriteString(fmt.Sprintf("Content-Length: %s\r\n", contentLength))
+	sb.WriteString("\r\n")
+	sb.WriteString(catalogXml)
+
+	request := sb.String()
 
 	// 发送请求
 	addr := &net.UDPAddr{
@@ -1637,13 +1655,13 @@ func (s *Gb28181Server) queryCatalog(deviceId string) {
 	Log.Infof("设备ID: %s", deviceId)
 	Log.Infof("目标地址: %s:%d", device.Ip, device.Port)
 	Log.Infof("请求URI: %s", requestUri)
-	Log.Infof("From: %s (server_id=%s)", from, serverId)
-	Log.Infof("To: %s", to)
-	Log.Infof("Contact: %s", headers["Contact"])
-	Log.Infof("Call-ID: %s", callId)
-	Log.Infof("CSeq: 1 MESSAGE")
-	Log.Infof("Expires: %s", headers["Expires"])
-	Log.Infof("Via: %s", headers["Via"])
+	Log.Infof("From: %s (server_id=%s)", fromHeader, serverId)
+	Log.Infof("To: %s", toHeader)
+	Log.Infof("Contact: %s", contact)
+	Log.Infof("Call-ID: %s", callIdHeader)
+	Log.Infof("CSeq: %s", cseq)
+	Log.Infof("Expires: %s", expires)
+	Log.Infof("Via: %s", via)
 	Log.Infof("完整SIP消息:\n%s", request)
 	Log.Infof("==========================================")
 
