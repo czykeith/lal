@@ -1632,7 +1632,6 @@ func (s *Gb28181Server) queryCatalog(deviceId string) {
 		IP:   net.ParseIP(device.Ip),
 		Port: device.Port,
 	}
-	s.sendRaw(request, addr)
 
 	Log.Infof("========== 发送 Catalog 查询请求 ==========")
 	Log.Infof("设备ID: %s", deviceId)
@@ -1640,10 +1639,15 @@ func (s *Gb28181Server) queryCatalog(deviceId string) {
 	Log.Infof("请求URI: %s", requestUri)
 	Log.Infof("From: %s (server_id=%s)", from, serverId)
 	Log.Infof("To: %s", to)
+	Log.Infof("Contact: %s", headers["Contact"])
 	Log.Infof("Call-ID: %s", callId)
 	Log.Infof("CSeq: 1 MESSAGE")
-	Log.Infof("XML内容:\n%s", catalogXml)
+	Log.Infof("Expires: %s", headers["Expires"])
+	Log.Infof("Via: %s", headers["Via"])
+	Log.Infof("完整SIP消息:\n%s", request)
 	Log.Infof("==========================================")
+
+	s.sendRaw(request, addr)
 }
 
 // parseCatalogResponse 解析通道列表响应
