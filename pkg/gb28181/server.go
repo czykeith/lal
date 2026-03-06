@@ -74,7 +74,12 @@ type Device struct {
 	KeepaliveTime          time.Time     // 最后心跳时间
 	KeepaliveInterval      time.Duration // 心跳间隔（根据客户端实际心跳计算）
 	Channels               map[string]*Channel
-	mutex                  sync.RWMutex
+	// Catalog 聚合状态（用于兼容分页/分片 Catalog 响应：同一个 SN 可能会多次返回）
+	LastCatalogSN     string
+	CatalogExpected   int
+	CatalogReceived   int
+	CatalogUpdateTime time.Time
+	mutex             sync.RWMutex
 }
 
 // GetChannels 获取通道列表的副本（线程安全）
@@ -1709,6 +1714,7 @@ func (s *Gb28181Server) parseCatalogResponse(deviceId string, xmlBody string) {
 		SumNum     string   `xml:"SumNum"` // 总数量（可能用于分页）
 		Result     string   `xml:"Result"` // 结果：OK 表示成功
 		DeviceList struct {
+			Num   string `xml:"Num,attr"`
 			Items []Item `xml:"Item"`
 		} `xml:"DeviceList"`
 		ItemList struct {
@@ -1774,11 +1780,16 @@ func (s *Gb28181Server) parseCatalogResponse(deviceId string, xmlBody string) {
 		return
 	}
 
-	// 检查 SumNum 和实际数量是否一致（用于调试）
+	// 解析 SumNum（期望总数，常用于分页/分片）
+	expectedSum := 0
 	if resp.SumNum != "" {
-		sumNum, err := strconv.Atoi(resp.SumNum)
-		if err == nil && sumNum > 0 && sumNum != len(items) {
-			Log.Warnf("catalog item count mismatch. device_id=%s, sum_num=%d, actual_count=%d", deviceId, sumNum, len(items))
+		if sumNum, err := strconv.Atoi(strings.TrimSpace(resp.SumNum)); err == nil && sumNum > 0 {
+			expectedSum = sumNum
+			// 注意：分页/分片时，单条响应的 item 数量可能远小于 SumNum，此时不应当按“本次不等于SumNum”判失败
+			if len(items) > 0 && sumNum != len(items) {
+				Log.Warnf("catalog item count mismatch (likely paged). device_id=%s, sn=%s, sum_num=%d, this_item_count=%d, device_list_num_attr=%s",
+					deviceId, resp.SN, sumNum, len(items), resp.DeviceList.Num)
+			}
 		}
 	}
 
@@ -1791,8 +1802,24 @@ func (s *Gb28181Server) parseCatalogResponse(deviceId string, xmlBody string) {
 	}
 
 	device.mutex.Lock()
-	// 清空旧通道列表
-	device.Channels = make(map[string]*Channel)
+	// Catalog 分片聚合：同一个 SN 可能会多次回包（分页），需要追加；SN 变化才开始新一轮并清空。
+	if resp.SN != "" && device.LastCatalogSN != resp.SN {
+		device.Channels = make(map[string]*Channel)
+		device.LastCatalogSN = resp.SN
+		device.CatalogExpected = expectedSum
+		device.CatalogReceived = 0
+		Log.Infof("start new catalog round. device_id=%s, sn=%s, expected_sum=%d", deviceId, resp.SN, expectedSum)
+	} else if resp.SN != "" && device.LastCatalogSN == "" {
+		// 首次收到带 SN 的 catalog
+		device.LastCatalogSN = resp.SN
+		device.CatalogExpected = expectedSum
+		device.CatalogReceived = len(device.Channels)
+		Log.Infof("init catalog round. device_id=%s, sn=%s, expected_sum=%d", deviceId, resp.SN, expectedSum)
+	} else if resp.SN != "" && expectedSum > 0 {
+		// 同一 SN 的后续分页，更新期望值（部分设备可能每页都带 SumNum，也可能只在首包带）
+		device.CatalogExpected = expectedSum
+	}
+	device.CatalogUpdateTime = time.Now()
 
 	// 更新通道列表
 	channelCount := 0
@@ -1805,17 +1832,22 @@ func (s *Gb28181Server) parseCatalogResponse(deviceId string, xmlBody string) {
 			continue
 		}
 
-		// 通道判断逻辑（GB28181 标准）：
+		// 通道判断逻辑（兼容多设备实现差异）：
 		// 1. 通道的DeviceID不等于设备ID（已排除）
 		// 2. ParentID等于设备ID（标准情况）
-		// 3. ParentID为空或"0"时，如果DeviceID前10位（区域编码）与设备ID相同，也认为是通道
-		// 4. 某些设备可能不填ParentID，需要根据DeviceID的前缀判断
+		// 3. 只要DeviceID前10位（区域编码）与设备ID相同，通常也可视为该设备的通道（即使ParentID填了其它值）
+		//    说明：部分设备/级联场景会返回“非本机ID”的 ParentID，但 Item.DeviceID 仍属于本设备区域码，实际业务期望当通道处理。
+		// 4. ParentID为空或"0"时，根据DeviceID前缀判断（兼容处理）
 		isChannel := false
 
 		// 标准情况：ParentID 明确指向设备ID
 		if item.ParentID == deviceId {
 			isChannel = true
 			Log.Debugf("item is channel (parent_id matches device_id). device_id=%s, item_device_id=%s", deviceId, item.DeviceID)
+		} else if len(deviceId) >= 10 && len(item.DeviceID) >= 10 && item.DeviceID[:10] == deviceId[:10] {
+			// 兼容：只要区域码一致，也认为是通道（即便 ParentID 不匹配）
+			isChannel = true
+			Log.Debugf("item is channel (region code matches). device_id=%s, item_device_id=%s, parent_id=%s", deviceId, item.DeviceID, item.ParentID)
 		} else if item.ParentID == "" || item.ParentID == "0" {
 			// ParentID为空或"0"时，根据DeviceID前缀判断
 			if len(deviceId) >= 10 && len(item.DeviceID) >= 10 {
@@ -1840,12 +1872,27 @@ func (s *Gb28181Server) parseCatalogResponse(deviceId string, xmlBody string) {
 			if channel.ChannelName == "" {
 				channel.ChannelName = item.DeviceID
 			}
-			device.Channels[item.DeviceID] = channel
-			channelCount++
+			// upsert：分页/分片时追加，不覆盖已有字段（除非这次有值）
+			if old, ok := device.Channels[item.DeviceID]; ok {
+				if channel.ChannelName != "" {
+					old.ChannelName = channel.ChannelName
+				}
+				if channel.Status != "" {
+					old.Status = channel.Status
+				}
+			} else {
+				device.Channels[item.DeviceID] = channel
+				channelCount++
+			}
 			Log.Infof("add channel SUCCESS. device_id=%s, channel_id=%s, channel_name=%s, status=%s, parent_id=%s", deviceId, channel.ChannelId, channel.ChannelName, channel.Status, item.ParentID)
 		} else {
 			Log.Debugf("skip item (not a channel). device_id=%s, item_device_id=%s, parent_id=%s, name=%s", deviceId, item.DeviceID, item.ParentID, item.Name)
 		}
+	}
+	device.CatalogReceived = len(device.Channels)
+	if device.CatalogExpected > 0 && device.CatalogReceived >= device.CatalogExpected {
+		Log.Infof("catalog round complete. device_id=%s, sn=%s, received=%d, expected=%d",
+			deviceId, device.LastCatalogSN, device.CatalogReceived, device.CatalogExpected)
 	}
 	device.mutex.Unlock()
 	s.mutex.Unlock()
