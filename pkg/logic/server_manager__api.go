@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"time"
 
 	"github.com/q191201771/lal/pkg/base"
 	"github.com/q191201771/lal/pkg/gb28181"
@@ -303,6 +304,131 @@ func (sm *ServerManager) CtrlGb28181Invite(info base.ApiCtrlGb28181InviteReq) (r
 		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
 		ret.Desp = err.Error()
 		// 如果INVITE失败，需要停止RTP Pub
+		group.StopRtpPub(streamName)
+		return
+	}
+
+	ret.ErrorCode = base.ErrorCodeSucc
+	ret.Desp = base.DespSucc
+	ret.Data.StreamName = streamName
+	ret.Data.SessionId = rtpPubResp.Data.SessionId
+	ret.Data.Port = rtpPubResp.Data.Port
+	return
+}
+
+// CtrlGb28181Playback GB28181回放
+func (sm *ServerManager) CtrlGb28181Playback(info base.ApiCtrlGb28181PlaybackReq) (ret base.ApiCtrlGb28181PlaybackResp) {
+	sm.mutex.Lock()
+	defer sm.mutex.Unlock()
+
+	if sm.gb28181Server == nil {
+		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
+		ret.Desp = "gb28181 server not enabled"
+		return
+	}
+
+	// 解析时间
+	// 支持格式：2006-01-02T15:04:05 或 2006-01-02 15:04:05
+	timeLayouts := []string{
+		"2006-01-02T15:04:05",
+		"2006-01-02 15:04:05",
+		time.RFC3339,
+		time.RFC3339Nano,
+	}
+
+	var startTime, endTime time.Time
+	var err error
+
+	for _, layout := range timeLayouts {
+		startTime, err = time.Parse(layout, info.StartTime)
+		if err == nil {
+			break
+		}
+	}
+	if err != nil {
+		ret.ErrorCode = base.ErrorCodeParamMissing
+		ret.Desp = fmt.Sprintf("invalid start_time format: %s, supported formats: 2006-01-02T15:04:05, 2006-01-02 15:04:05", info.StartTime)
+		return
+	}
+
+	for _, layout := range timeLayouts {
+		endTime, err = time.Parse(layout, info.EndTime)
+		if err == nil {
+			break
+		}
+	}
+	if err != nil {
+		ret.ErrorCode = base.ErrorCodeParamMissing
+		ret.Desp = fmt.Sprintf("invalid end_time format: %s, supported formats: 2006-01-02T15:04:05, 2006-01-02 15:04:05", info.EndTime)
+		return
+	}
+
+	// 验证时间范围
+	if endTime.Before(startTime) || endTime.Equal(startTime) {
+		ret.ErrorCode = base.ErrorCodeParamMissing
+		ret.Desp = "end_time must be after start_time"
+		return
+	}
+
+	// 生成流名称
+	streamName := info.StreamName
+	if streamName == "" {
+		streamName = info.DeviceId + info.ChannelId + "_playback"
+	}
+
+	// 检查回放任务是否已经存在
+	if sm.gb28181Server.HasStream(streamName) {
+		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
+		ret.Desp = fmt.Sprintf("playback stream already exists: %s", streamName)
+		return
+	}
+
+	// 检查Group是否已经有输入流
+	group := sm.getGroup("", streamName)
+	if group != nil && group.HasInSession() {
+		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
+		ret.Desp = fmt.Sprintf("stream group already has input session: %s", streamName)
+		return
+	}
+
+	// 获取或创建Group
+	if group == nil {
+		group = sm.getOrCreateGroup("", streamName)
+	}
+
+	// 启动RTP Pub
+	var port int
+	if info.Port > 0 {
+		port = info.Port
+	}
+	isTcp := info.IsTcpFlag == 1
+
+	rtpPubReq := base.ApiCtrlStartRtpPubReq{
+		StreamName: streamName,
+		Port:       port,
+		TimeoutMs:  10000,
+		IsTcpFlag:  info.IsTcpFlag,
+	}
+
+	rtpPubResp := group.StartRtpPub(rtpPubReq)
+	if rtpPubResp.ErrorCode != base.ErrorCodeSucc {
+		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
+		ret.Desp = rtpPubResp.Desp
+		return
+	}
+
+	// 验证倍速参数
+	scale := info.Scale
+	if scale <= 0 {
+		scale = 1.0 // 默认正常速度
+	}
+
+	// 发送回放INVITE信令
+	err = sm.gb28181Server.Playback(info.DeviceId, info.ChannelId, streamName, rtpPubResp.Data.Port, isTcp, startTime, endTime, scale)
+	if err != nil {
+		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
+		ret.Desp = err.Error()
+		// 如果回放失败，需要停止RTP Pub
 		group.StopRtpPub(streamName)
 		return
 	}

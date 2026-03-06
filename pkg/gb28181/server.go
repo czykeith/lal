@@ -104,6 +104,8 @@ type Stream struct {
 	Port       int
 	IsTcp      bool
 	StartTime  time.Time
+	IsPlayback bool    // 是否为回放流
+	Scale      float64 // 倍速（回放时使用）
 }
 
 // NewGb28181Server 创建GB28181信令服务器
@@ -1193,6 +1195,195 @@ a=recvonly
 	}
 
 	return sdp
+}
+
+// buildPlaybackSdp 构建回放SDP消息（符合GB28181标准，包含时间范围和倍速）
+func (s *Gb28181Server) buildPlaybackSdp(port int, isTcp bool, channelId string, startTime, endTime time.Time, scale float64) string {
+	protocol := "RTP/AVP"
+	if isTcp {
+		protocol = "TCP/RTP/AVP"
+	}
+
+	// 确定视频编码格式和RTP payload type（复用buildSdp的逻辑）
+	videoCodec := s.config.VideoCodec
+	if videoCodec == "" {
+		videoCodec = "H264"
+	}
+
+	var payloadTypes []string
+	var rtpmapLines []string
+
+	switch strings.ToUpper(videoCodec) {
+	case "H265", "HEVC":
+		payloadTypes = []string{"96", "99"}
+		rtpmapLines = []string{
+			"a=rtpmap:96 PS/90000",
+			"a=rtpmap:99 H265/90000",
+		}
+	case "H264":
+		fallthrough
+	default:
+		payloadTypes = []string{"96", "98"}
+		rtpmapLines = []string{
+			"a=rtpmap:96 PS/90000",
+			"a=rtpmap:98 H264/90000",
+		}
+		// H264的fmtp参数
+		fmtpParams := "a=fmtp:98 "
+		params := []string{}
+		profileLevelId := "42E028"
+		if s.config.VideoProfile != "" {
+			profileMap := map[string]string{
+				"baseline": "42E0",
+				"main":     "4D00",
+				"high":     "6400",
+			}
+			if profilePrefix, ok := profileMap[strings.ToLower(s.config.VideoProfile)]; ok {
+				levelMap := map[string]string{
+					"3.0": "1F", "3.1": "28", "3.2": "2A",
+					"4.0": "33", "4.1": "29", "4.2": "2A",
+				}
+				if levelId, ok := levelMap[s.config.VideoLevel]; ok {
+					profileLevelId = profilePrefix + levelId
+				} else {
+					profileLevelId = profilePrefix + "28"
+				}
+			}
+		}
+		params = append(params, "profile-level-id="+profileLevelId)
+		params = append(params, "packetization-mode=1")
+		fmtpParams += strings.Join(params, ";")
+		rtpmapLines = append(rtpmapLines, fmtpParams)
+	}
+
+	// 将时间转换为NTP时间戳（秒，符合GB28181标准）
+	// NTP时间戳 = Unix时间戳 + 2208988800（1900-01-01到1970-01-01的秒数）
+	ntpStart := uint64(startTime.Unix()) + 2208988800
+	ntpEnd := uint64(endTime.Unix()) + 2208988800
+
+	// 构建SDP主体（回放模式，符合GB28181标准）
+	// s=Playback 标识回放操作（GB28181标准要求）
+	// u=<channelId>:<playbackType> 指定回放通道和类型（GB28181标准）
+	// t=<start> <end> 指定回放时间段（NTP时间戳格式，GB28181标准要求）
+	sdp := fmt.Sprintf(`v=0
+o=%s 0 0 IN IP4 %s
+s=Playback
+u=%s:0
+c=IN IP4 %s
+t=%d %d
+m=video %d %s %s
+a=recvonly
+`, s.config.LocalSipId, s.config.LocalSipIp, channelId, s.config.LocalSipIp, ntpStart, ntpEnd, port, protocol, strings.Join(payloadTypes, " "))
+
+	// 添加rtpmap行
+	for _, line := range rtpmapLines {
+		sdp += line + "\n"
+	}
+
+	// 添加倍速参数（GB28181标准：通过SDP的a字段携带倍速参数）
+	// 格式：a=scale:<value>，value为倍速值（1.0=正常速度，2.0=2倍速等）
+	if scale > 0 && scale != 1.0 {
+		sdp += fmt.Sprintf("a=scale:%.2f\n", scale)
+	} else {
+		// 默认1倍速（GB28181标准：不携带倍速参数时默认为1倍速）
+		sdp += "a=scale:1.0\n"
+	}
+
+	// 添加视频参数（如果指定了）
+	if s.config.VideoWidth > 0 && s.config.VideoHeight > 0 {
+		sdp += fmt.Sprintf("a=resolution:%dx%d\n", s.config.VideoWidth, s.config.VideoHeight)
+	}
+	if s.config.VideoFramerate > 0 {
+		sdp += fmt.Sprintf("a=framerate:%.2f\n", float64(s.config.VideoFramerate))
+	}
+	if s.config.VideoBitrate > 0 {
+		sdp += fmt.Sprintf("a=bitrate:%d\n", s.config.VideoBitrate)
+	}
+
+	return sdp
+}
+
+// Playback 回放请求
+func (s *Gb28181Server) Playback(deviceId, channelId, streamName string, port int, isTcp bool, startTime, endTime time.Time, scale float64) error {
+	s.mutex.RLock()
+	device, exists := s.devices[deviceId]
+	s.mutex.RUnlock()
+
+	if !exists {
+		return fmt.Errorf("device not found: %s", deviceId)
+	}
+
+	// 验证时间范围
+	if endTime.Before(startTime) || endTime.Equal(startTime) {
+		return fmt.Errorf("invalid time range: end_time must be after start_time")
+	}
+
+	// 生成Call-ID和Tag
+	callId := GenerateCallId()
+	branch := GenerateBranch()
+
+	// 构建INVITE请求（使用域格式，符合GB28181标准）
+	deviceDomain := getDeviceDomain(deviceId)
+	requestUri := fmt.Sprintf("sip:%s@%s", channelId, deviceDomain)
+	from := fmt.Sprintf("<sip:%s@%s>", s.config.LocalSipId, s.config.LocalSipDomain)
+	to := fmt.Sprintf("<sip:%s@%s>", channelId, deviceDomain)
+
+	// 构建回放SDP（符合GB28181标准）
+	sdp := s.buildPlaybackSdp(port, isTcp, channelId, startTime, endTime, scale)
+
+	// Subject头格式：GB28181标准格式
+	// 格式：<channelId>:<streamType>,<serverId>:<streamType>
+	// 注意：回放模式通过SDP中的s=Playback标识，Subject头使用标准格式即可
+	subject := fmt.Sprintf("%s:0,%s:0", channelId, s.config.LocalSipId)
+
+	headers := map[string]string{
+		"Via":            fmt.Sprintf("SIP/2.0/UDP %s:%d;branch=%s;rport", s.config.LocalSipIp, s.config.LocalSipPort, branch),
+		"From":           from + ";tag=" + GenerateTag(),
+		"To":             to,
+		"Call-ID":        callId,
+		"CSeq":           "1 INVITE",
+		"Contact":        fmt.Sprintf("<sip:%s@%s>", s.config.LocalSipId, s.config.LocalSipDomain),
+		"Content-Type":   "application/sdp",
+		"Content-Length": fmt.Sprintf("%d", len(sdp)),
+		"Subject":        subject,
+		"Max-Forwards":   "70",
+		"User-Agent":     "LALServer",
+	}
+
+	request := BuildSipRequest(SipMethodInvite, requestUri, headers, sdp)
+
+	// 发送请求
+	addr := &net.UDPAddr{
+		IP:   net.ParseIP(device.Ip),
+		Port: device.Port,
+	}
+	s.sendRaw(request, addr)
+
+	// 记录流信息（标记为回放流）
+	s.mutex.Lock()
+	stream := &Stream{
+		DeviceId:   deviceId,
+		ChannelId:  channelId,
+		StreamName: streamName,
+		CallId:     callId,
+		Port:       port,
+		IsTcp:      isTcp,
+		StartTime:  time.Now(),
+		IsPlayback: true,
+		Scale:      scale,
+	}
+	s.streams[streamName] = stream
+	// 更新设备流索引
+	if s.deviceStreams[deviceId] == nil {
+		s.deviceStreams[deviceId] = make(map[string]*Stream)
+	}
+	s.deviceStreams[deviceId][streamName] = stream
+	s.mutex.Unlock()
+
+	Log.Infof("send PLAYBACK INVITE to device. device_id=%s, channel_id=%s, stream_name=%s, port=%d, start_time=%v, end_time=%v, scale=%.2f",
+		deviceId, channelId, streamName, port, startTime, endTime, scale)
+
+	return nil
 }
 
 // GetDevices 获取所有设备

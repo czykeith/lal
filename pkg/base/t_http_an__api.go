@@ -84,6 +84,18 @@ type ApiCtrlGb28181ByeReq struct {
 	StreamName string `json:"stream_name"` // 流名称（可选）
 }
 
+// ApiCtrlGb28181PlaybackReq GB28181回放请求
+type ApiCtrlGb28181PlaybackReq struct {
+	DeviceId   string  `json:"device_id"`   // 设备ID（国标编码）
+	ChannelId  string  `json:"channel_id"`  // 通道ID（国标编码）
+	StreamName string  `json:"stream_name"` // 流名称（可选，默认使用 device_id_channel_id）
+	Port       int     `json:"port"`        // RTP接收端口（可选，0表示自动分配）
+	IsTcpFlag  int     `json:"is_tcp_flag"` // 是否使用TCP传输（0=UDP，1=TCP，默认0）
+	StartTime  string  `json:"start_time"`  // 开始时间（格式：2006-01-02T15:04:05，必填）
+	EndTime    string  `json:"end_time"`    // 结束时间（格式：2006-01-02T15:04:05，必填）
+	Scale      float64 `json:"scale"`       // 倍速播放（1.0=正常速度，2.0=2倍速，0.5=0.5倍速，默认1.0）
+}
+
 // ApiCtrlGb28181PtzReq GB28181 PTZ控制请求
 type ApiCtrlGb28181PtzReq struct {
 	DeviceId  string `json:"device_id"`  // 设备ID（国标编码）
@@ -235,6 +247,15 @@ type ApiCtrlGb28181ByeResp struct {
 	Data struct {
 		StreamName string `json:"stream_name"`
 		SessionId  string `json:"session_id"`
+	} `json:"data"`
+}
+
+type ApiCtrlGb28181PlaybackResp struct {
+	ApiRespBasic
+	Data struct {
+		StreamName string `json:"stream_name"`
+		SessionId  string `json:"session_id"`
+		Port       int    `json:"port"`
 	} `json:"data"`
 }
 

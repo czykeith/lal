@@ -68,6 +68,7 @@ func (h *HttpApiServer) RunLoop() error {
 
 	mux.HandleFunc("/api/ctrl/gb28181_invite", h.ctrlGb28181InviteHandler)
 	mux.HandleFunc("/api/ctrl/gb28181_bye", h.ctrlGb28181ByeHandler)
+	mux.HandleFunc("/api/ctrl/gb28181_playback", h.ctrlGb28181PlaybackHandler)
 	mux.HandleFunc("/api/ctrl/gb28181_ptz", h.ctrlGb28181PtzHandler)
 	mux.HandleFunc("/api/ctrl/gb28181_devices", h.statGb28181DevicesHandler)
 	mux.HandleFunc("/api/ctrl/gb28181_streams", h.statGb28181StreamsHandler)
@@ -344,6 +345,35 @@ func (h *HttpApiServer) ctrlGb28181ByeHandler(w http.ResponseWriter, req *http.R
 	Log.Infof("http api gb28181 bye. req info=%+v", info)
 
 	resp := h.sm.CtrlGb28181Bye(info)
+	feedback(resp, w)
+}
+
+func (h *HttpApiServer) ctrlGb28181PlaybackHandler(w http.ResponseWriter, req *http.Request) {
+	var v base.ApiCtrlGb28181PlaybackResp
+	var info base.ApiCtrlGb28181PlaybackReq
+
+	j, err := unmarshalRequestJsonBody(req, &info, "device_id", "channel_id", "start_time", "end_time")
+	if err != nil {
+		Log.Warnf("http api gb28181 playback error. err=%+v", err)
+		v.ErrorCode = base.ErrorCodeParamMissing
+		v.Desp = base.DespParamMissing
+		feedback(v, w)
+		return
+	}
+
+	if !j.Exist("port") {
+		info.Port = 0
+	}
+	if !j.Exist("is_tcp_flag") {
+		info.IsTcpFlag = 0
+	}
+	if !j.Exist("scale") {
+		info.Scale = 1.0 // 默认正常速度
+	}
+
+	Log.Infof("http api gb28181 playback. req info=%+v", info)
+
+	resp := h.sm.CtrlGb28181Playback(info)
 	feedback(resp, w)
 }
 
