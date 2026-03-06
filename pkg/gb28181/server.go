@@ -44,6 +44,7 @@ type ServerConfig struct {
 	LocalSipIp           string // 本地SIP IP
 	LocalSipPort         int    // 本地SIP端口
 	LocalSipDomain       string // 本地SIP域
+	MediaIp              string // SDP中媒体地址(c=IN IP4)，为空则使用LocalSipIp。公网/NAT场景请填公网IP
 	Username             string // 认证用户名（可选）
 	Password             string // 认证密码（可选）
 	Expires              int    // 注册过期时间（秒）
@@ -71,9 +72,12 @@ type Device struct {
 	// 部分设备（如海康）会校验后续平台发起请求的 From/Contact 中的 serverId 是否一致。
 	RegisteredServerId     string
 	RegisteredServerDomain string
-	KeepaliveTime          time.Time     // 最后心跳时间
-	KeepaliveInterval      time.Duration // 心跳间隔（根据客户端实际心跳计算）
-	Channels               map[string]*Channel
+	// 设备对外可达的信令地址（优先取接收到的源地址raddr，避免Contact里是内网地址导致回包/INVITE失败）
+	RemoteIP          string
+	RemotePort        int
+	KeepaliveTime     time.Time     // 最后心跳时间
+	KeepaliveInterval time.Duration // 心跳间隔（根据客户端实际心跳计算）
+	Channels          map[string]*Channel
 	// Catalog 聚合状态（用于兼容分页/分片 Catalog 响应：同一个 SN 可能会多次返回）
 	LastCatalogSN     string
 	CatalogExpected   int
@@ -151,6 +155,55 @@ func getDeviceDomain(deviceId string) string {
 		return deviceId[:10] // 使用前10位作为域（区域编码）
 	}
 	return deviceId // 如果设备ID长度不足10位，使用完整ID
+}
+
+func isPrivateIPv4(ip net.IP) bool {
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return false
+	}
+	// 10.0.0.0/8
+	if ip4[0] == 10 {
+		return true
+	}
+	// 172.16.0.0/12
+	if ip4[0] == 172 && ip4[1] >= 16 && ip4[1] <= 31 {
+		return true
+	}
+	// 192.168.0.0/16
+	if ip4[0] == 192 && ip4[1] == 168 {
+		return true
+	}
+	// 127.0.0.0/8 loopback
+	if ip4[0] == 127 {
+		return true
+	}
+	// 169.254.0.0/16 link-local
+	if ip4[0] == 169 && ip4[1] == 254 {
+		return true
+	}
+	return false
+}
+
+func pickDeviceAddr(contactIP string, contactPort int, raddr *net.UDPAddr) (ip string, port int) {
+	ip = strings.TrimSpace(contactIP)
+	port = contactPort
+
+	if ip == "" {
+		ip = raddr.IP.String()
+	}
+	if port == 0 {
+		port = raddr.Port
+	}
+
+	// NAT兼容：Contact是内网、raddr是公网时，优先使用raddr（否则INVITE会发到内网）
+	cip := net.ParseIP(ip)
+	if cip != nil && isPrivateIPv4(cip) && raddr != nil && raddr.IP != nil && !isPrivateIPv4(raddr.IP) {
+		ip = raddr.IP.String()
+		port = raddr.Port
+	}
+
+	return ip, port
 }
 
 func (s *Gb28181Server) getServerIdForDevice(deviceId string) string {
@@ -365,13 +418,8 @@ func (s *Gb28181Server) handleRegister(msg *SipMessage, raddr *net.UDPAddr) {
 
 	// 提取Contact信息
 	contact := msg.Headers["contact"]
-	ip, port := ExtractContactAddr(contact)
-	if ip == "" {
-		ip = raddr.IP.String()
-	}
-	if port == 0 {
-		port = raddr.Port
-	}
+	contactIp, contactPort := ExtractContactAddr(contact)
+	ip, port := pickDeviceAddr(contactIp, contactPort, raddr)
 
 	// 提取设备注册时的平台注册信息（REGISTER Request-URI）
 	registeredServerId, registeredServerDomain := ExtractServerFromRequestUri(msg.RequestUri)
@@ -438,6 +486,8 @@ func (s *Gb28181Server) handleRegister(msg *SipMessage, raddr *net.UDPAddr) {
 	}
 	device.Ip = ip
 	device.Port = port
+	device.RemoteIP = raddr.IP.String()
+	device.RemotePort = raddr.Port
 	if registeredServerId != "" {
 		device.RegisteredServerId = registeredServerId
 		device.RegisteredServerDomain = registeredServerDomain
@@ -500,13 +550,8 @@ func (s *Gb28181Server) handleKeepalive(msg *SipMessage, raddr *net.UDPAddr) {
 
 	// 从 Contact 提取设备的真实 IP 和端口，兼容 NAT
 	contact := msg.Headers["contact"]
-	ip, port := ExtractContactAddr(contact)
-	if ip == "" {
-		ip = raddr.IP.String()
-	}
-	if port == 0 {
-		port = raddr.Port
-	}
+	contactIp, contactPort := ExtractContactAddr(contact)
+	ip, port := pickDeviceAddr(contactIp, contactPort, raddr)
 
 	// 从 Request-URI 提取平台注册信息（serverId / serverDomain）
 	registeredServerId, registeredServerDomain := ExtractServerFromRequestUri(msg.RequestUri)
@@ -532,6 +577,8 @@ func (s *Gb28181Server) handleKeepalive(msg *SipMessage, raddr *net.UDPAddr) {
 	// 更新设备的网络和平台注册信息
 	device.Ip = ip
 	device.Port = port
+	device.RemoteIP = raddr.IP.String()
+	device.RemotePort = raddr.Port
 	if registeredServerId != "" {
 		device.RegisteredServerId = registeredServerId
 		device.RegisteredServerDomain = registeredServerDomain
@@ -996,8 +1043,11 @@ func (s *Gb28181Server) Invite(deviceId, channelId, streamName string, port int,
 	callId := GenerateCallId()
 	branch := GenerateBranch()
 
-	// 构建INVITE请求（使用域格式，符合GB28181标准）
+	// 构建INVITE请求（使用设备注册时的域，兼容 domain 为 3402000000.spvmn.cn 等场景）
 	deviceDomain := getDeviceDomain(deviceId)
+	if device.RegisteredServerDomain != "" {
+		deviceDomain = device.RegisteredServerDomain
+	}
 	requestUri := fmt.Sprintf("sip:%s@%s", channelId, deviceDomain)
 	serverId := s.getServerIdForDevice(deviceId)
 	from := fmt.Sprintf("<sip:%s@%s>", serverId, s.config.LocalSipDomain)
@@ -1021,10 +1071,16 @@ func (s *Gb28181Server) Invite(deviceId, channelId, streamName string, port int,
 
 	request := BuildSipRequest(SipMethodInvite, requestUri, headers, sdp)
 
-	// 发送请求
+	// 发送请求：优先使用最后一次收到的源地址(raddr)记录，避免Contact是内网IP导致INVITE发错
+	targetIP := device.Ip
+	targetPort := device.Port
+	if device.RemoteIP != "" && device.RemotePort != 0 {
+		targetIP = device.RemoteIP
+		targetPort = device.RemotePort
+	}
 	addr := &net.UDPAddr{
-		IP:   net.ParseIP(device.Ip),
-		Port: device.Port,
+		IP:   net.ParseIP(targetIP),
+		Port: targetPort,
 	}
 	s.sendRaw(request, addr)
 
@@ -1116,6 +1172,11 @@ func (s *Gb28181Server) buildSdp(port int, isTcp bool) string {
 		protocol = "TCP/RTP/AVP"
 	}
 
+	mediaIp := s.config.MediaIp
+	if mediaIp == "" {
+		mediaIp = s.config.LocalSipIp
+	}
+
 	// 确定视频编码格式和RTP payload type
 	videoCodec := s.config.VideoCodec
 	if videoCodec == "" {
@@ -1199,6 +1260,13 @@ func (s *Gb28181Server) buildSdp(port int, isTcp bool) string {
 		rtpmapLines = append(rtpmapLines, fmtpParams)
 	}
 
+	// 兼容性优先：多数GB28181设备只认PS封装（payload=96），并且对多payload声明较敏感。
+	// 这里强制只声明PS，提升“收到INVITE但不发流 / RTP不来”的设备兼容性。
+	payloadTypes = []string{"96"}
+	rtpmapLines = []string{"a=rtpmap:96 PS/90000"}
+	// y= SSRC：10位数字字符串是常见兼容写法
+	ssrc := fmt.Sprintf("%010d", time.Now().UnixNano()%1e10)
+
 	// 构建SDP主体
 	sdp := fmt.Sprintf(`v=0
 o=%s 0 0 IN IP4 %s
@@ -1207,7 +1275,9 @@ c=IN IP4 %s
 t=0 0
 m=video %d %s %s
 a=recvonly
-`, s.config.LocalSipId, s.config.LocalSipIp, s.config.LocalSipIp, port, protocol, strings.Join(payloadTypes, " "))
+y=%s
+f=v/2/5/1
+`, s.config.LocalSipId, mediaIp, mediaIp, port, protocol, strings.Join(payloadTypes, " "), ssrc)
 
 	// 添加rtpmap行
 	for _, line := range rtpmapLines {
@@ -1236,6 +1306,11 @@ func (s *Gb28181Server) buildPlaybackSdp(port int, isTcp bool, channelId string,
 	protocol := "RTP/AVP"
 	if isTcp {
 		protocol = "TCP/RTP/AVP"
+	}
+
+	mediaIp := s.config.MediaIp
+	if mediaIp == "" {
+		mediaIp = s.config.LocalSipIp
 	}
 
 	// 确定视频编码格式和RTP payload type（复用buildSdp的逻辑）
@@ -1290,6 +1365,11 @@ func (s *Gb28181Server) buildPlaybackSdp(port int, isTcp bool, channelId string,
 		rtpmapLines = append(rtpmapLines, fmtpParams)
 	}
 
+	// 兼容性优先：回放同样强制只声明PS（payload=96）
+	payloadTypes = []string{"96"}
+	rtpmapLines = []string{"a=rtpmap:96 PS/90000"}
+	ssrc := fmt.Sprintf("%010d", time.Now().UnixNano()%1e10)
+
 	// 将时间转换为NTP时间戳（秒，符合GB28181标准）
 	// NTP时间戳 = Unix时间戳 + 2208988800（1900-01-01到1970-01-01的秒数）
 	ntpStart := uint64(startTime.Unix()) + 2208988800
@@ -1307,7 +1387,9 @@ c=IN IP4 %s
 t=%d %d
 m=video %d %s %s
 a=recvonly
-`, s.config.LocalSipId, s.config.LocalSipIp, channelId, s.config.LocalSipIp, ntpStart, ntpEnd, port, protocol, strings.Join(payloadTypes, " "))
+y=%s
+f=v/2/5/1
+`, s.config.LocalSipId, mediaIp, channelId, mediaIp, ntpStart, ntpEnd, port, protocol, strings.Join(payloadTypes, " "), ssrc)
 
 	// 添加rtpmap行
 	for _, line := range rtpmapLines {
