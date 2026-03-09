@@ -71,7 +71,7 @@ type ApiCtrlStartRelayReq struct {
 type ApiCtrlGb28181InviteReq struct {
 	DeviceId   string `json:"device_id"`   // 设备ID（国标编码）
 	ChannelId  string `json:"channel_id"`  // 通道ID（国标编码）
-	StreamName string `json:"stream_name"` // 流名称（可选，默认使用 device_id_channel_id）
+	StreamName string `json:"stream_name"` // 流名称（必填，全局唯一）
 	Port       int    `json:"port"`        // RTP接收端口（可选，0表示自动分配）
 	IsTcpFlag  int    `json:"is_tcp_flag"` // 是否使用TCP传输（0=UDP，1=TCP，默认0）
 	// StreamIndex 码流索引（可选；海康等设备常用 0=主，1=子，2=第三...）
@@ -80,16 +80,16 @@ type ApiCtrlGb28181InviteReq struct {
 
 // ApiCtrlGb28181ByeReq GB28181停止拉流请求
 type ApiCtrlGb28181ByeReq struct {
-	DeviceId   string `json:"device_id"`   // 设备ID（国标编码）
-	ChannelId  string `json:"channel_id"`  // 通道ID（国标编码）
-	StreamName string `json:"stream_name"` // 流名称（可选）
+	DeviceId   string `json:"device_id"`   // 设备ID（国标编码，可选，不再用于停止逻辑）
+	ChannelId  string `json:"channel_id"`  // 通道ID（国标编码，可选，不再用于停止逻辑）
+	StreamName string `json:"stream_name"` // 流名称（必填，全局唯一）
 }
 
 // ApiCtrlGb28181PlaybackReq GB28181回放请求
 type ApiCtrlGb28181PlaybackReq struct {
 	DeviceId   string  `json:"device_id"`   // 设备ID（国标编码）
 	ChannelId  string  `json:"channel_id"`  // 通道ID（国标编码）
-	StreamName string  `json:"stream_name"` // 流名称（可选，默认使用 device_id_channel_id）
+	StreamName string  `json:"stream_name"` // 流名称（必填，全局唯一）
 	Port       int     `json:"port"`        // RTP接收端口（可选，0表示自动分配）
 	IsTcpFlag  int     `json:"is_tcp_flag"` // 是否使用TCP传输（0=UDP，1=TCP，默认0）
 	StartTime  string  `json:"start_time"`  // 开始时间（格式：2006-01-02T15:04:05，必填）

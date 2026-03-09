@@ -46,6 +46,7 @@ type Conn struct {
 	check      bool
 	demuxer    *mpegps.PsDemuxer
 	streamName string
+	connKey    string
 	lalServer  ILalServer
 	lalSession CustomizePubSession
 	videoFrame Frame
@@ -74,6 +75,9 @@ func NewConn(conn net.Conn, observer IGbObserver, lal ILalServer) *Conn {
 		observer:  observer,
 		lalServer: lal,
 		buffer:    bytes.NewBuffer(nil),
+	}
+	if conn != nil && conn.RemoteAddr() != nil {
+		c.connKey = conn.RemoteAddr().String()
 	}
 
 	c.demuxer.OnFrame = c.OnFrame
@@ -168,7 +172,9 @@ func (c *Conn) Serve() (err error) {
 			c.streamName = mediaInfo.StreamName
 			c.oneSaveConn.Do(func() {
 				if c.mediaServer != nil {
-					c.mediaServer.conns.Store(c.streamName, c)
+					// 按 remoteAddr 保存连接，避免同一 streamName 覆盖导致 stop(BYE) 关不掉旧连接。
+					// stop 时将遍历并关闭所有 streamName 匹配的连接。
+					c.mediaServer.conns.Store(c.connKey, c)
 				}
 			})
 			if len(mediaInfo.DumpFileName) > 0 {

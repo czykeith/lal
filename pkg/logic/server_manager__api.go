@@ -247,14 +247,23 @@ func (sm *ServerManager) CtrlGb28181Invite(info base.ApiCtrlGb28181InviteReq) (r
 	}
 
 	streamName := info.StreamName
-	if streamName == "" {
-		streamName = info.DeviceId + info.ChannelId
-	}
 
 	// 统一使用码流索引 stream_index：0=主，1=子，2=第三...
 	streamIndex := info.StreamIndex
 	if streamIndex < 0 {
 		streamIndex = 0
+	}
+
+	// 重复拉流校验（全局）：
+	// 1) stream_name 已存在：幂等返回（避免因为 heuristic 选到不同 ChannelId 导致重复 INVITE）
+	if cur := sm.gb28181Server.FindChannelByStreamName(streamName); cur != nil && cur.MediaInfo.IsInvite {
+		ret.ErrorCode = base.ErrorCodeSucc
+		ret.Desp = base.DespSucc
+		ret.Data.StreamName = streamName
+		if port := parseGb28181MediaPort(cur.MediaInfo.MediaKey); port > 0 {
+			ret.Data.Port = port
+		}
+		return
 	}
 
 	// 内部通道选择目前仅区分主/子（heuristic），因此将 index 映射为主(0) / 子(1)。
@@ -266,24 +275,6 @@ func (sm *ServerManager) CtrlGb28181Invite(info base.ApiCtrlGb28181InviteReq) (r
 	if ch == nil {
 		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
 		ret.Desp = base.DespGb28181DeviceNotFound
-		return
-	}
-
-	// 防止重复拉流：
-	// - 如果该通道已经在拉流，且 stream_name 相同，则幂等返回成功（不重复发送 INVITE）。
-	// - 如果 stream_name 不同，则拒绝，避免一个通道被重复点播导致资源泄漏或状态错乱。
-	if ch.MediaInfo.IsInvite && ch.MediaInfo.StreamName != "" {
-		if ch.MediaInfo.StreamName == streamName {
-			ret.ErrorCode = base.ErrorCodeSucc
-			ret.Desp = base.DespSucc
-			ret.Data.StreamName = streamName
-			if port := parseGb28181MediaPort(ch.MediaInfo.MediaKey); port > 0 {
-				ret.Data.Port = port
-			}
-			return
-		}
-		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
-		ret.Desp = fmt.Sprintf("gb28181 already inviting. current_stream_name=%s", ch.MediaInfo.StreamName)
 		return
 	}
 
@@ -363,8 +354,17 @@ func (sm *ServerManager) CtrlGb28181Playback(info base.ApiCtrlGb28181PlaybackReq
 	}
 
 	streamName := info.StreamName
-	if streamName == "" {
-		streamName = info.DeviceId + info.ChannelId + "_playback"
+	// stream_name 作为唯一标识，必填（由 HTTP handler 校验）
+
+	// 回放重复校验：stream_name 已存在则幂等返回
+	if cur := sm.gb28181Server.FindChannelByStreamName(streamName); cur != nil && cur.MediaInfo.IsInvite {
+		ret.ErrorCode = base.ErrorCodeSucc
+		ret.Desp = base.DespSucc
+		ret.Data.StreamName = streamName
+		if port := parseGb28181MediaPort(cur.MediaInfo.MediaKey); port > 0 {
+			ret.Data.Port = port
+		}
+		return
 	}
 
 	// 回放暂时固定按主码流处理（streamType=0）；如需区分主/辅回放，可扩展 ApiCtrlGb28181PlaybackReq。
@@ -439,18 +439,11 @@ func (sm *ServerManager) CtrlGb28181Bye(info base.ApiCtrlGb28181ByeReq) (ret bas
 	}
 
 	streamName := info.StreamName
-	if streamName == "" {
-		streamName = info.DeviceId + info.ChannelId
-	}
-
-	// 优先按 streamName 定位正在拉流的通道，避免因 stream_index/heuristic 选择了不同的 channelId 导致停止失败。
+	// stream_name 作为唯一标识，停止时只按 stream_name 定位
 	ch := sm.gb28181Server.FindChannelByStreamName(streamName)
 	if ch == nil {
-		ch = sm.gb28181Server.FindChannel(info.DeviceId, info.ChannelId)
-	}
-	if ch == nil {
 		ret.ErrorCode = base.ErrorCodeGb28181ByeFail
-		ret.Desp = base.DespGb28181DeviceNotFound
+		ret.Desp = "gb28181 stream not found"
 		return
 	}
 

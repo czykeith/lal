@@ -304,7 +304,7 @@ func (h *HttpApiServer) ctrlGb28181InviteHandler(w http.ResponseWriter, req *htt
 	var v base.ApiCtrlGb28181InviteResp
 	var info base.ApiCtrlGb28181InviteReq
 
-	j, err := unmarshalRequestJsonBody(req, &info, "device_id", "channel_id")
+	j, err := unmarshalRequestJsonBody(req, &info, "device_id", "channel_id", "stream_name")
 	if err != nil {
 		Log.Warnf("http api gb28181 invite error. err=%+v", err)
 		v.ErrorCode = base.ErrorCodeParamMissing
@@ -333,7 +333,7 @@ func (h *HttpApiServer) ctrlGb28181InviteHandler(w http.ResponseWriter, req *htt
 func (h *HttpApiServer) ctrlGb28181ByeHandler(w http.ResponseWriter, req *http.Request) {
 	var info base.ApiCtrlGb28181ByeReq
 
-	_, err := unmarshalRequestJsonBody(req, &info, "device_id", "channel_id")
+	_, err := unmarshalRequestJsonBody(req, &info, "stream_name")
 	if err != nil {
 		Log.Warnf("http api gb28181 bye error. err=%+v", err)
 		var v base.ApiCtrlGb28181ByeResp
@@ -353,7 +353,7 @@ func (h *HttpApiServer) ctrlGb28181PlaybackHandler(w http.ResponseWriter, req *h
 	var v base.ApiCtrlGb28181PlaybackResp
 	var info base.ApiCtrlGb28181PlaybackReq
 
-	j, err := unmarshalRequestJsonBody(req, &info, "device_id", "channel_id", "start_time", "end_time")
+	j, err := unmarshalRequestJsonBody(req, &info, "device_id", "channel_id", "stream_name", "start_time", "end_time")
 	if err != nil {
 		Log.Warnf("http api gb28181 playback error. err=%+v", err)
 		v.ErrorCode = base.ErrorCodeParamMissing

@@ -479,6 +479,28 @@ func (s *GB28181Server) FindChannelByStreamName(streamName string) (channel *Cha
 	return found
 }
 
+// FindInvitingChannelByRequest 根据“请求视角”的 deviceId/channelId/streamIndex 查找正在拉流的通道。
+// 说明：由于主/子码流可能通过 heuristic 选择到不同的实际 ChannelId，这里使用 playInfo 记录的原始请求参数来判定重复拉流。
+func (s *GB28181Server) FindInvitingChannelByRequest(deviceId, channelId string, streamIndex int) (channel *Channel) {
+	var found *Channel
+	Devices.Range(func(_, value any) bool {
+		d := value.(*Device)
+		d.channelMap.Range(func(_, v any) bool {
+			ch := v.(*Channel)
+			if !ch.MediaInfo.IsInvite || ch.playInfo == nil {
+				return true
+			}
+			if ch.playInfo.DeviceId == deviceId && ch.playInfo.ChannelId == channelId && ch.playInfo.StreamIndex == streamIndex {
+				found = ch
+				return false
+			}
+			return true
+		})
+		return found == nil
+	})
+	return found
+}
+
 // FindChannelWithStreamType 根据主/辅码流选择通道。
 //
 // streamType: 0=主码流，1=辅码流（默认仍推荐业务侧通过 ChannelId 精确指定）。
