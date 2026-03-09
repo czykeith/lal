@@ -155,7 +155,19 @@ func (c *Conn) Serve() (err error) {
 			var mediaInfo *MediaInfo
 			var ok bool
 			if pkt.SSRC != 0 {
+				// 先按 SSRC 精确匹配
 				mediaInfo, ok = c.observer.CheckSsrc(pkt.SSRC)
+				if !ok {
+					// 兼容部分设备：INVITE 时未约定/未记录 SSRC，首个 RTP 包携带的 SSRC 才是真实值。
+					// 此时按 mediaKey 兜底：如果找到 MediaInfo 且 Ssrc 仍为 0，则把当前 SSRC 绑定进去并视为有效。
+					if miByKey, ok2 := c.observer.GetMediaInfoByKey(c.key); ok2 {
+						if miByKey.Ssrc == 0 {
+							miByKey.Ssrc = pkt.SSRC
+							mediaInfo = miByKey
+							ok = true
+						}
+					}
+				}
 				if !ok {
 					// 降噪：未知 SSRC 直接关闭连接（多为扫描或非预期推流）
 					base.Log.Debug("invalid ssrc:", pkt.SSRC, " remoteaddr:", c.conn.RemoteAddr().String(), " localaddr:", c.conn.LocalAddr().String())
