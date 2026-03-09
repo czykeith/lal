@@ -231,12 +231,17 @@ func (channel *Channel) Invite(opt *InviteOptions, streamName string, playInfo *
 
 	invite.SetBody(body, true)
 
-	// Subject（GB28181 常用）：通道ID:0,平台ID:0
-	// 注：海康等设备通常要求该处为 0；码流索引请使用 SDP 的 streamprofile/streamid 扩展。
+	// Subject：通道ID:索引,平台ID:索引
+	// 说明：
+	// - 主流 stream_index=0 时为 ...:0,...:0（与常见示例一致）
+	// - 子码流等其它索引用 stream_index 直接表示，便于部分实现按 Subject 选择码流。
 	subject := sip.GenericHeader{
-		HeaderName: "Subject", Contents: fmt.Sprintf("%s:0,%s:0", channel.ChannelId, channel.conf.Serial),
+		HeaderName: "Subject", Contents: fmt.Sprintf("%s:%d,%s:%d", channel.ChannelId, streamIndex, channel.conf.Serial, streamIndex),
 	}
 	invite.AppendHeader(&subject)
+
+	base.Log.Info("GB28181 INVITE >>>", "\n", invite.String())
+
 	inviteRes, err := d.SipRequestForResponse(invite)
 	if err != nil {
 		base.Log.Error("invite failed, err:", err, " invite msg:", invite.String())
@@ -407,6 +412,9 @@ func (channel *Channel) Bye(streamName string) (err error) {
 		byeReq.SetMethod(sip.BYE)
 		seq, _ := byeReq.CSeq()
 		seq.SeqNo += 1
+
+		base.Log.Info("GB28181 BYE >>>", "\n", byeReq.String())
+
 		channel.device.sipSvr.Send(byeReq)
 	}
 	channel.stopMediaServer()

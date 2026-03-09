@@ -197,6 +197,8 @@ func (d *Device) Subscribe(conf GB28181Config) int {
 
 	request.SetBody(BuildCatalogXML(d.sn, d.ID), true)
 
+	base.Log.Info("GB28181 SUBSCRIBE >>>", "\n", request.String())
+
 	response, err := d.SipRequestForResponse(request)
 	if err == nil && response != nil {
 		if response.StatusCode() == http.StatusOK {
@@ -218,6 +220,8 @@ func (d *Device) QueryDeviceInfo(conf GB28181Config) {
 		contentType := sip.ContentType("Application/MANSCDP+xml")
 		request.AppendHeader(&contentType)
 		request.SetBody(BuildDeviceInfoXML(d.sn, d.ID), true)
+
+		base.Log.Info("GB28181 MESSAGE(DeviceInfo) >>>", "\n", request.String())
 
 		response, _ := d.SipRequestForResponse(request)
 		if response != nil {
