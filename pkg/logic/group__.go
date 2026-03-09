@@ -409,6 +409,13 @@ func (group *Group) HasInSession() bool {
 	return group.hasInSession()
 }
 
+// HasPsPubSessionForStream 是否已有该流名的 GB28181 RTP Pub Session（用于 onGb28181Invite 判断是否可跳过创建）
+func (group *Group) HasPsPubSessionForStream(streamName string) bool {
+	group.mutex.Lock()
+	defer group.mutex.Unlock()
+	return group.psPubSession != nil && group.psPubSession.StreamName() == streamName
+}
+
 func (group *Group) HasOutSession() bool {
 	group.mutex.Lock()
 	defer group.mutex.Unlock()

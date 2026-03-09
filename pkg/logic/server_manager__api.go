@@ -720,10 +720,15 @@ func (sm *ServerManager) onGb28181Invite(deviceId, channelId, streamName string,
 
 	group := sm.getOrCreateGroup("", streamName)
 
-	// 检查Group是否已经有输入会话（服务器主动拉流时，RTP Pub Session已经在API调用时创建）
-	if group.HasInSession() {
-		Log.Debugf("group already has input session, skip StartRtpPub. stream_name=%s", streamName)
+	// 仅当已有本流的 GB28181 RTP session 时跳过（API 主动拉流时在发 INVITE/Playback 前已创建，200 OK 回调无需再建）
+	if group.HasPsPubSessionForStream(streamName) {
+		Log.Debugf("group already has GB28181 RTP session for stream, skip StartRtpPub. stream_name=%s", streamName)
 		return nil
+	}
+	// 若已有其他类型输入（如 RTMP/RTSP 推流），则无法再创建 RTP 收流，应返回错误而非静默跳过
+	if group.HasInSession() {
+		Log.Warnf("group already has other input session (not GB28181 RTP), cannot StartRtpPub. stream_name=%s", streamName)
+		return fmt.Errorf("stream group already has input session (not GB28181), cannot start RTP pub: %s", streamName)
 	}
 
 	// 设备主动推流时，需要在这里创建RTP Pub Session
