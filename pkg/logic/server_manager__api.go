@@ -274,6 +274,7 @@ func (sm *ServerManager) CtrlGb28181Invite(info base.ApiCtrlGb28181InviteReq) (r
 		ChannelId:  info.ChannelId,
 		StreamName: streamName,
 		SinglePort: false,
+		StreamType: streamType,
 	}
 	code, err := ch.Invite(&gb28181.InviteOptions{}, streamName, playInfo)
 	if err != nil || code != 200 {

@@ -183,6 +183,12 @@ func (channel *Channel) Invite(opt *InviteOptions, streamName string, playInfo *
 		"y=" + opt.ssrc,
 	}
 
+	// 根据 StreamType 通过 SDP 指定主/子码流（部分海康等设备支持）
+	// 约定：0=主码流 -> a=control:stream=0；1=辅码流 -> a=control:stream=1
+	if playInfo.StreamType >= 0 {
+		sdpInfo = append(sdpInfo, fmt.Sprintf("a=control:stream=%d", playInfo.StreamType))
+	}
+
 	if playInfo.NetWork == "tcp" {
 		sdpInfo = append(sdpInfo, "a=setup:passive", "a=connection:new")
 	}
