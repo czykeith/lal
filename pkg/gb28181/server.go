@@ -369,7 +369,12 @@ func (s *GB28181Server) removeBanDevice() {
 func (s *GB28181Server) statusCheck() {
 	Devices.Range(func(key, value any) bool {
 		d := value.(*Device)
-		if int(time.Since(d.LastKeepaliveAt).Seconds()) > s.keepaliveInterval*3 {
+		ka := d.LastKeepaliveAt
+		if ka.IsZero() {
+			// 兼容：部分设备可能不发送 Keepalive MESSAGE，改用 UpdateTime 作为活跃时间。
+			ka = d.UpdateTime
+		}
+		if int(time.Since(ka).Seconds()) > s.keepaliveInterval*3 {
 			Devices.Delete(key)
 			base.Log.Warn("Device Keepalive timeout, id:", d.ID, " LastKeepaliveAt:", d.LastKeepaliveAt, " updateTime:", d.UpdateTime)
 		} else if time.Since(d.UpdateTime) > s.HeartbeatInterval*3 {
@@ -396,12 +401,15 @@ func (s *GB28181Server) getDeviceInfos() (deviceInfos *DeviceInfos) {
 	}
 	Devices.Range(func(key, value any) bool {
 		d := value.(*Device)
-		d.Status = DeviceOfflineStatus
+		keepaliveTime := ""
+		if !d.LastKeepaliveAt.IsZero() {
+			keepaliveTime = d.LastKeepaliveAt.Format("2006-01-02 15:04:05")
+		}
 		deviceItem := &DeviceItem{
 			DeviceId:      d.ID,
 			Name:          d.Name,
 			RegisterTime:  d.RegisterTime.Format("2006-01-02 15:04:05"),
-			KeepaliveTime: d.LastKeepaliveAt.Format("2006-01-02 15:04:05"),
+			KeepaliveTime: keepaliveTime,
 			Status:        d.Status,
 			Channels:      make([]*ChannelItem, 0),
 		}
@@ -697,6 +705,14 @@ func (s *GB28181Server) OnRegister(req sip.Request, tx sip.ServerTransaction) {
 			}
 		}
 
+		// REGISTER 成功即视为在线与活跃（兼容不发 Keepalive MESSAGE 的设备）
+		if d != nil && !isUnregister {
+			now := time.Now()
+			d.Status = DeviceOnlineStatus
+			d.UpdateTime = now
+			d.LastKeepaliveAt = now
+		}
+
 		DeviceNonce.Delete(id)
 		DeviceRegisterCount.Delete(id)
 		resp := sip.NewResponseFromRequest("", req, http.StatusOK, "OK", "")
@@ -887,7 +903,11 @@ func (s *GB28181Server) StoreDevice(id string, req sip.Request) (d *Device) {
 	deviceIp := req.Source()
 	if _d, ok := Devices.Load(id); ok {
 		d = _d.(*Device)
-		d.UpdateTime = time.Now()
+		now := time.Now()
+		d.UpdateTime = now
+		// 兼容部分设备仅通过 REGISTER 续期，不发送 Keepalive MESSAGE。
+		// 将 REGISTER 视为一次活跃/心跳。
+		d.LastKeepaliveAt = now
 		d.NetAddr = deviceIp
 		d.addr = deviceAddr
 		d.network = strings.ToLower(req.Transport())
@@ -907,18 +927,20 @@ func (s *GB28181Server) StoreDevice(id string, req sip.Request) (d *Device) {
 		sipIp := s.conf.SipIP
 		mediaIp := s.conf.MediaConfig.MediaIp
 		name := sipMaybeStringTrim(from.DisplayName)
+		now := time.Now()
 		d = &Device{
-			ID:           id,
-			Name:         name,
-			RegisterTime: time.Now(),
-			UpdateTime:   time.Now(),
-			Status:       DeviceRegisterStatus,
-			addr:         deviceAddr,
-			sipIP:        sipIp,
-			mediaIP:      mediaIp,
-			NetAddr:      deviceIp,
-			conf:         s.conf,
-			network:      strings.ToLower(req.Transport()),
+			ID:              id,
+			Name:            name,
+			RegisterTime:    now,
+			UpdateTime:      now,
+			LastKeepaliveAt: now,
+			Status:          DeviceRegisterStatus,
+			addr:            deviceAddr,
+			sipIP:           sipIp,
+			mediaIP:         mediaIp,
+			NetAddr:         deviceIp,
+			conf:            s.conf,
+			network:         strings.ToLower(req.Transport()),
 		}
 		if d.network == "udp" {
 			d.sipSvr = s.sipUdpSvr
@@ -956,7 +978,10 @@ func (s *GB28181Server) RecoverDevice(d *Device, req sip.Request) {
 	} else {
 		d.sipSvr = s.sipTcpSvr
 	}
-	d.UpdateTime = time.Now()
+	now := time.Now()
+	d.UpdateTime = now
+	// 同 StoreDevice：REGISTER/Recover 视为活跃/心跳
+	d.LastKeepaliveAt = now
 
 	base.Log.Info("RecoverDevice, deviceIp:", deviceIp, " serverIp:", servIp, " mediaIp:", mediaIp, " sipIP:", sipIp)
 }
