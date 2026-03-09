@@ -183,10 +183,12 @@ func (channel *Channel) Invite(opt *InviteOptions, streamName string, playInfo *
 		"y=" + opt.ssrc,
 	}
 
-	// 根据 StreamType 通过 SDP 指定主/子码流（部分海康等设备支持）
-	// 约定：0=主码流 -> a=control:stream=0；1=辅码流 -> a=control:stream=1
-	if playInfo.StreamType >= 0 {
-		sdpInfo = append(sdpInfo, fmt.Sprintf("a=control:stream=%d", playInfo.StreamType))
+	// 主/子码流标识（常用扩展，海康等设备支持）
+	// Subject 末尾 :1=主、:2=子（见下方）；SDP 中 streamprofile 与 streamid 二选一或同时携带
+	if playInfo.StreamType == 1 {
+		sdpInfo = append(sdpInfo, "a=streamprofile=sub", "a=streamid:2")
+	} else {
+		sdpInfo = append(sdpInfo, "a=streamprofile=main", "a=streamid:1")
 	}
 
 	if playInfo.NetWork == "tcp" {
@@ -202,8 +204,13 @@ func (channel *Channel) Invite(opt *InviteOptions, streamName string, playInfo *
 
 	invite.SetBody(strings.Join(sdpInfo, "\r\n")+"\r\n", true)
 
+	// Subject 末尾为主/子码流标识（海康等常用）：:1=主码流，:2=子码流
+	streamTag := 1
+	if playInfo.StreamType == 1 {
+		streamTag = 2
+	}
 	subject := sip.GenericHeader{
-		HeaderName: "Subject", Contents: fmt.Sprintf("%s:%s,%s:0", channel.ChannelId, opt.ssrc, channel.conf.Serial),
+		HeaderName: "Subject", Contents: fmt.Sprintf("%s:%s,%s:%d", channel.ChannelId, opt.ssrc, channel.conf.Serial, streamTag),
 	}
 	invite.AppendHeader(&subject)
 	inviteRes, err := d.SipRequestForResponse(invite)

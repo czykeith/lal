@@ -30,7 +30,7 @@ type PlayInfo struct {
 	StreamName   string `json:"stream_name" form:"stream_name" url:"stream_name"`          // 对应的流名
 	SinglePort   bool   `json:"single_port" form:"single_port" url:"single_port"`          // 是否单端口
 	DumpFileName string `json:"dump_file_name" form:"dump_file_name" url:"dump_file_name"` // dump文件路径
-	// StreamType 码流类型（0=主码流，1=辅码流），仅内部使用；用于生成 a=control:stream=<n>。
+	// StreamType 码流类型（0=主码流，1=辅码流），仅内部使用；用于生成 a=streamprofile=main/sub。
 	StreamType int `json:"-" form:"-" url:"-"`
 }
 type ReqPlay struct {
