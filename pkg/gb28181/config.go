@@ -13,6 +13,15 @@ type GB28181Config struct {
 	KeepaliveInterval int                `json:"keepalive_interval"`
 	QuickLogin        bool               `json:"quick_login"`
 	MediaConfig       GB28181MediaConfig `json:"media_config"`
+
+	// Video* 用于生成 INVITE 的 SDP（f=/fmtp 等），尽量对齐 lalmax 配置语义。
+	VideoCodec     string `json:"video_codec"`     // H264/H265（默认H264）
+	VideoWidth     int    `json:"video_width"`     // 分辨率宽（0表示不指定）
+	VideoHeight    int    `json:"video_height"`    // 分辨率高（0表示不指定）
+	VideoBitrate   int    `json:"video_bitrate"`   // kbps（0表示不指定）
+	VideoFramerate int    `json:"video_framerate"` // fps（0表示不指定）
+	VideoProfile   string `json:"video_profile"`   // baseline/main/high（可选）
+	VideoLevel     string `json:"video_level"`     // 例如 3.1/4.0（可选）
 }
 
 // GB28181MediaConfig 媒体服务配置

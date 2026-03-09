@@ -999,5 +999,12 @@ func gb28181ConfigFromLogic(c Gb28181Config) gb28181.GB28181Config {
 			ListenPort:            uint16(rtpMin),
 			MultiPortMaxIncrement: inc,
 		},
+		VideoCodec:     c.VideoCodec,
+		VideoWidth:     c.VideoWidth,
+		VideoHeight:    c.VideoHeight,
+		VideoBitrate:   c.VideoBitrate,
+		VideoFramerate: c.VideoFramerate,
+		VideoProfile:   c.VideoProfile,
+		VideoLevel:     c.VideoLevel,
 	}
 }

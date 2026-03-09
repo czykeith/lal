@@ -193,6 +193,17 @@ func (channel *Channel) Invite(opt *InviteOptions, streamName string, playInfo *
 		"y=" + opt.ssrc,
 	}
 
+	// 视频参数（GB28181 常用：f= 行；部分设备也会接受 fmtp 扩展）
+	// f= v/编码格式/分辨率/帧率/码率类型/码率大小 a///
+	//
+	// 编码格式（常见映射）：1=H264，4=H265；分辨率：1=QCIF，2=CIF，3=4CIF，4=720P，5=1080P；也可用 WxH。
+	if f := buildGb28181SdpFLine(channel.conf); f != "" {
+		sdpInfo = append(sdpInfo, "f="+f)
+	}
+	if fmtp := buildGb28181SdpFmtpLine(channel.conf); fmtp != "" {
+		sdpInfo = append(sdpInfo, "a=fmtp:96 "+fmtp)
+	}
+
 	// 码流索引（常用扩展，海康等设备支持，0=主，1=子，2=第三...）
 	// 说明：
 	// - 海康常见写法：Subject 为 "通道ID:索引,平台ID:索引"（示例：3402..:0,1001:0）
@@ -220,9 +231,10 @@ func (channel *Channel) Invite(opt *InviteOptions, streamName string, playInfo *
 
 	invite.SetBody(body, true)
 
-	// Subject（海康等常用）：通道ID:索引,平台ID:索引
+	// Subject（GB28181 常用）：通道ID:0,平台ID:0
+	// 注：海康等设备通常要求该处为 0；码流索引请使用 SDP 的 streamprofile/streamid 扩展。
 	subject := sip.GenericHeader{
-		HeaderName: "Subject", Contents: fmt.Sprintf("%s:%d,%s:%d", channel.ChannelId, streamIndex, channel.conf.Serial, streamIndex),
+		HeaderName: "Subject", Contents: fmt.Sprintf("%s:0,%s:0", channel.ChannelId, channel.conf.Serial),
 	}
 	invite.AppendHeader(&subject)
 	inviteRes, err := d.SipRequestForResponse(invite)
@@ -288,6 +300,81 @@ func (channel *Channel) Invite(opt *InviteOptions, streamName string, playInfo *
 
 	}
 	return
+}
+
+func buildGb28181SdpFLine(conf GB28181Config) string {
+	// video fields
+	codec := strings.ToUpper(strings.TrimSpace(conf.VideoCodec))
+	var vEnc string
+	switch codec {
+	case "", "H264":
+		// 默认 H264
+		vEnc = "1"
+	case "H265", "HEVC":
+		vEnc = "4"
+	default:
+		// 未知则不强制声明
+		vEnc = ""
+	}
+
+	// resolution mapping
+	var vRes string
+	w, h := conf.VideoWidth, conf.VideoHeight
+	if w > 0 && h > 0 {
+		switch {
+		case w == 176 && h == 144:
+			vRes = "1" // QCIF
+		case w == 352 && h == 288:
+			vRes = "2" // CIF
+		case (w == 704 && h == 576) || (w == 720 && h == 576):
+			vRes = "3" // 4CIF/D1
+		case w == 1280 && h == 720:
+			vRes = "4" // 720P
+		case w == 1920 && h == 1080:
+			vRes = "5" // 1080P
+		default:
+			// 2022 扩展：支持 WxH
+			vRes = fmt.Sprintf("%dx%d", w, h)
+		}
+	}
+
+	var vFps string
+	if conf.VideoFramerate > 0 {
+		vFps = fmt.Sprintf("%d", conf.VideoFramerate)
+	}
+
+	// bitrate: type + size(kbps)
+	var vBrType string
+	var vBrSize string
+	if conf.VideoBitrate > 0 {
+		vBrType = "1"
+		vBrSize = fmt.Sprintf("%d", conf.VideoBitrate)
+	}
+
+	// no fields -> return empty
+	if vEnc == "" && vRes == "" && vFps == "" && vBrType == "" && vBrSize == "" {
+		return ""
+	}
+
+	// keep full structure with empty fields allowed
+	// v/<enc>/<res>/<fps>/<brType>/<brSize>a///
+	return fmt.Sprintf("v/%s/%s/%s/%s/%sa///", vEnc, vRes, vFps, vBrType, vBrSize)
+}
+
+func buildGb28181SdpFmtpLine(conf GB28181Config) string {
+	// PS over RTP 的 fmtp 并非标准，但部分设备会解析；做 best-effort 传递。
+	profile := strings.TrimSpace(conf.VideoProfile)
+	level := strings.TrimSpace(conf.VideoLevel)
+	if profile == "" && level == "" {
+		return ""
+	}
+	if profile != "" && level != "" {
+		return fmt.Sprintf("profile=%s;level=%s", profile, level)
+	}
+	if profile != "" {
+		return fmt.Sprintf("profile=%s", profile)
+	}
+	return fmt.Sprintf("level=%s", level)
 }
 func (channel *Channel) GetCallId() string {
 	if channel.ackReq != nil {
