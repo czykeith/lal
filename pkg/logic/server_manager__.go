@@ -23,6 +23,7 @@ import (
 
 	"github.com/q191201771/lal/pkg/base"
 	"github.com/q191201771/lal/pkg/gb28181"
+	"github.com/q191201771/lal/pkg/gb28181/mediaserver"
 	"github.com/q191201771/lal/pkg/hls"
 	"github.com/q191201771/lal/pkg/httpflv"
 	"github.com/q191201771/lal/pkg/httpts"
@@ -48,7 +49,7 @@ type ServerManager struct {
 	httpApiServer *HttpApiServer
 	pprofServer   *http.Server
 	wsrtspServer  *rtsp.WebsocketServer
-	gb28181Server *gb28181.Gb28181Server
+	gb28181Server *gb28181.GB28181Server
 	exitChan      chan struct{}
 
 	mutex        sync.Mutex
@@ -59,6 +60,26 @@ type ServerManager struct {
 	notifyHandlerThread taskpool.Pool
 
 	ipBlacklist IpBlacklist
+}
+
+// gbLalAdapter 适配 logic.ILalServer 为 mediaserver.ILalServer，供 GB28181 媒体接入使用。
+type gbLalAdapter struct {
+	inner ILalServer
+}
+
+// AddCustomizePubSession 实现 mediaserver.ILalServer 接口，返回 mediaserver.CustomizePubSession。
+func (a *gbLalAdapter) AddCustomizePubSession(streamName string) (mediaserver.CustomizePubSession, error) {
+	return a.inner.AddCustomizePubSession(streamName)
+}
+
+// DelCustomizePubSession 实现 mediaserver.ILalServer 接口。
+func (a *gbLalAdapter) DelCustomizePubSession(sess mediaserver.CustomizePubSession) {
+	// 实际返回的是 logic.ICustomizePubSessionContext，这里做一次类型断言再删除，避免引入循环依赖。
+	if ctx, ok := sess.(ICustomizePubSessionContext); ok {
+		a.inner.DelCustomizePubSession(ctx)
+		return
+	}
+	Log.Warnf("gb28181 del customize pub session ignored: unexpected type %T", sess)
 }
 
 func NewServerManager(modOption ...ModOption) *ServerManager {
@@ -135,56 +156,11 @@ Doc: %s
 	}
 
 	if sm.config.Gb28181Config.Enable {
-		// 设置SIP收流端口范围（优先使用新配置，兼容旧配置）
-		rtpPortMin := sm.config.Gb28181Config.SipRtpPortMin
-		rtpPortMax := sm.config.Gb28181Config.SipRtpPortMax
-		// 如果新配置未设置，使用旧配置（向后兼容）
-		if rtpPortMin == 0 || rtpPortMax == 0 {
-			rtpPortMin = sm.config.Gb28181Config.RtpPortMin
-			rtpPortMax = sm.config.Gb28181Config.RtpPortMax
-		}
-		// 如果仍未设置，使用默认值
-		if rtpPortMin == 0 {
-			rtpPortMin = 30000
-		}
-		if rtpPortMax == 0 {
-			rtpPortMax = 60000
-		}
-		if rtpPortMin > 0 && rtpPortMax > rtpPortMin {
-			gb28181.SetRtpPortRange(uint16(rtpPortMin), uint16(rtpPortMax))
-			Log.Infof("set SIP RTP port range. min=%d, max=%d", rtpPortMin, rtpPortMax)
-		}
-
-		gb28181Config := &gb28181.ServerConfig{
-			LocalSipId:           sm.config.Gb28181Config.LocalSipId,
-			LocalSipIp:           sm.config.Gb28181Config.LocalSipIp,
-			LocalSipPort:         sm.config.Gb28181Config.LocalSipPort,
-			LocalSipDomain:       sm.config.Gb28181Config.LocalSipDomain,
-			Username:             sm.config.Gb28181Config.Username,
-			Password:             sm.config.Gb28181Config.Password,
-			Expires:              sm.config.Gb28181Config.Expires,
-			CatalogQueryInterval: sm.config.Gb28181Config.CatalogQueryInterval,
-			VideoCodec:           sm.config.Gb28181Config.VideoCodec,
-			VideoWidth:           sm.config.Gb28181Config.VideoWidth,
-			VideoHeight:          sm.config.Gb28181Config.VideoHeight,
-			VideoBitrate:         sm.config.Gb28181Config.VideoBitrate,
-			VideoFramerate:       sm.config.Gb28181Config.VideoFramerate,
-			VideoProfile:         sm.config.Gb28181Config.VideoProfile,
-			VideoLevel:           sm.config.Gb28181Config.VideoLevel,
-		}
-		if gb28181Config.LocalSipPort == 0 {
-			gb28181Config.LocalSipPort = 5060
-		}
-		sm.gb28181Server = gb28181.NewGb28181Server(gb28181Config)
-		sm.gb28181Server.SetOnInvite(func(deviceId, channelId, streamName string, port int, isTcp bool) error {
-			return sm.onGb28181Invite(deviceId, channelId, streamName, port, isTcp)
-		})
-		sm.gb28181Server.SetOnBye(func(deviceId, channelId, streamName string) error {
-			return sm.onGb28181Bye(deviceId, channelId, streamName)
-		})
-		sm.gb28181Server.SetOnReconnect(func(deviceId string) error {
-			return sm.onGb28181Reconnect(deviceId)
-		})
+		gb28181Conf := gb28181ConfigFromLogic(sm.config.Gb28181Config)
+		adapter := &gbLalAdapter{inner: sm}
+		sm.gb28181Server = gb28181.NewGB28181Server(gb28181Conf, adapter)
+		sm.gb28181Server.Start()
+		Log.Infof("gb28181 server started (lalmax).")
 	}
 
 	if sm.config.PprofConfig.Enable {
@@ -381,21 +357,7 @@ func (sm *ServerManager) RunLoop() error {
 		}()
 	}
 
-	if sm.gb28181Server != nil {
-		if err := sm.gb28181Server.Listen(); err != nil {
-			return fmt.Errorf("gb28181 server listen failed: %w", err)
-		}
-		go func() {
-			defer func() {
-				if r := recover(); r != nil {
-					Log.Errorf("gb28181 server panic recovered: %+v", r)
-				}
-			}()
-			if err := sm.gb28181Server.RunLoop(); err != nil {
-				Log.Errorf("gb28181 server error: %+v", err)
-			}
-		}()
-	}
+	// gb28181 (lalmax) 已在 Start() 中启动 SIP，无需在此 Listen/RunLoop
 
 	uis := uint32(sm.config.HttpNotifyConfig.UpdateIntervalSec)
 	var updateInfo base.UpdateInfo
@@ -987,4 +949,55 @@ func (sm *ServerManager) serveHls(writer http.ResponseWriter, req *http.Request)
 	}
 
 	sm.hlsServerHandler.ServeHTTP(writer, req)
+}
+
+// gb28181ConfigFromLogic 将 logic 的 Gb28181Config 转换为 gb28181.GB28181Config（lalmax 格式）
+func gb28181ConfigFromLogic(c Gb28181Config) gb28181.GB28181Config {
+	rtpMin := c.SipRtpPortMin
+	rtpMax := c.SipRtpPortMax
+	if rtpMin == 0 {
+		rtpMin = c.RtpPortMin
+	}
+	if rtpMax == 0 {
+		rtpMax = c.RtpPortMax
+	}
+	if rtpMin == 0 {
+		rtpMin = 30000
+	}
+	if rtpMax == 0 {
+		rtpMax = 60000
+	}
+	inc := uint16(rtpMax - rtpMin)
+	if inc > 3000 {
+		inc = 3000
+	}
+	sipPort := uint16(c.LocalSipPort)
+	if sipPort == 0 {
+		sipPort = 5060
+	}
+	realm := c.LocalSipDomain
+	if realm == "" {
+		realm = c.LocalSipId
+	}
+	if len(realm) > 10 {
+		realm = realm[:10]
+	}
+	return gb28181.GB28181Config{
+		Enable:     true,
+		ListenAddr: "0.0.0.0",
+		SipIP:      c.LocalSipIp,
+		SipPort:    sipPort,
+		Serial:     c.LocalSipId,
+		Realm:      realm,
+		Username:   c.Username,
+		Password:   c.Password,
+		// 保持和你之前实现尽量一致：只要设备发心跳就认为在线并记录在 Devices 中。
+		KeepaliveInterval: 60,
+		QuickLogin:        true,
+		MediaConfig: gb28181.GB28181MediaConfig{
+			MediaIp:               c.LocalSipIp,
+			ListenPort:            uint16(rtpMin),
+			MultiPortMaxIncrement: inc,
+		},
+	}
 }

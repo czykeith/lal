@@ -11,6 +11,7 @@ package logic
 import (
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 	"time"
 
@@ -234,7 +235,7 @@ func (sm *ServerManager) CtrlStopRelay(streamName string) (ret base.ApiCtrlStopR
 	return
 }
 
-// CtrlGb28181Invite GB28181拉流
+// CtrlGb28181Invite GB28181拉流（lalmax：FindChannel + channel.Invite）
 func (sm *ServerManager) CtrlGb28181Invite(info base.ApiCtrlGb28181InviteReq) (ret base.ApiCtrlGb28181InviteResp) {
 	sm.mutex.Lock()
 	defer sm.mutex.Unlock()
@@ -245,78 +246,51 @@ func (sm *ServerManager) CtrlGb28181Invite(info base.ApiCtrlGb28181InviteReq) (r
 		return
 	}
 
-	// 生成流名称
 	streamName := info.StreamName
 	if streamName == "" {
 		streamName = info.DeviceId + info.ChannelId
 	}
 
-	// 检查拉流任务是否已经存在
-	if sm.gb28181Server.HasStream(streamName) {
+	ch := sm.gb28181Server.FindChannel(info.DeviceId, info.ChannelId)
+	if ch == nil {
 		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
-		ret.Desp = fmt.Sprintf("stream already exists: %s", streamName)
+		ret.Desp = base.DespGb28181DeviceNotFound
 		return
 	}
 
-	// 检查Group是否已经有输入流
-	group := sm.getGroup("", streamName)
-	if group != nil && group.HasInSession() {
-		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
-		ret.Desp = fmt.Sprintf("stream group already has input session: %s", streamName)
-		return
+	network := "udp"
+	if info.IsTcpFlag == 1 {
+		network = "tcp"
 	}
-
-	// 获取或创建Group
-	if group == nil {
-		group = sm.getOrCreateGroup("", streamName)
-	}
-
-	// 启动RTP Pub
-	var port int
-	if info.Port > 0 {
-		port = info.Port
-	}
-	isTcp := info.IsTcpFlag == 1
-
-	rtpPubReq := base.ApiCtrlStartRtpPubReq{
+	playInfo := &gb28181.PlayInfo{
+		NetWork:    network,
+		DeviceId:   info.DeviceId,
+		ChannelId:  info.ChannelId,
 		StreamName: streamName,
-		Port:       port,
-		TimeoutMs:  10000,
-		IsTcpFlag:  info.IsTcpFlag,
+		SinglePort: false,
 	}
-
-	rtpPubResp := group.StartRtpPub(rtpPubReq)
-	if rtpPubResp.ErrorCode != base.ErrorCodeSucc {
+	code, err := ch.Invite(&gb28181.InviteOptions{}, streamName, playInfo)
+	if err != nil || code != 200 {
 		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
-		ret.Desp = rtpPubResp.Desp
-		return
-	}
-
-	// 发送INVITE信令
-	// 获取码流类型（0=主码流，1=辅码流，默认1）
-	streamType := info.StreamType
-	if streamType != 0 && streamType != 1 {
-		streamType = 1 // 默认辅码流
-	}
-
-	err := sm.gb28181Server.Invite(info.DeviceId, info.ChannelId, streamName, rtpPubResp.Data.Port, isTcp, streamType)
-	if err != nil {
-		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
-		ret.Desp = err.Error()
-		// 如果INVITE失败，需要停止RTP Pub
-		group.StopRtpPub(streamName)
+		if err != nil {
+			ret.Desp = err.Error()
+		} else {
+			ret.Desp = fmt.Sprintf("invite failed, code=%d", code)
+		}
 		return
 	}
 
 	ret.ErrorCode = base.ErrorCodeSucc
 	ret.Desp = base.DespSucc
 	ret.Data.StreamName = streamName
-	ret.Data.SessionId = rtpPubResp.Data.SessionId
-	ret.Data.Port = rtpPubResp.Data.Port
+	// 从 Channel 的 MediaKey 中解析收流端口号，例如 \"udp30000\" / \"tcp30000\"
+	if port := parseGb28181MediaPort(ch.MediaInfo.MediaKey); port > 0 {
+		ret.Data.Port = port
+	}
 	return
 }
 
-// CtrlGb28181Playback GB28181回放
+// CtrlGb28181Playback GB28181回放（lalmax：FindChannel + channel.Invite 带 Start/End）
 func (sm *ServerManager) CtrlGb28181Playback(info base.ApiCtrlGb28181PlaybackReq) (ret base.ApiCtrlGb28181PlaybackResp) {
 	sm.mutex.Lock()
 	defer sm.mutex.Unlock()
@@ -327,18 +301,9 @@ func (sm *ServerManager) CtrlGb28181Playback(info base.ApiCtrlGb28181PlaybackReq
 		return
 	}
 
-	// 解析时间
-	// 支持格式：2006-01-02T15:04:05 或 2006-01-02 15:04:05
-	timeLayouts := []string{
-		"2006-01-02T15:04:05",
-		"2006-01-02 15:04:05",
-		time.RFC3339,
-		time.RFC3339Nano,
-	}
-
+	timeLayouts := []string{"2006-01-02T15:04:05", "2006-01-02 15:04:05", time.RFC3339, time.RFC3339Nano}
 	var startTime, endTime time.Time
 	var err error
-
 	for _, layout := range timeLayouts {
 		startTime, err = time.Parse(layout, info.StartTime)
 		if err == nil {
@@ -347,10 +312,9 @@ func (sm *ServerManager) CtrlGb28181Playback(info base.ApiCtrlGb28181PlaybackReq
 	}
 	if err != nil {
 		ret.ErrorCode = base.ErrorCodeParamMissing
-		ret.Desp = fmt.Sprintf("invalid start_time format: %s, supported formats: 2006-01-02T15:04:05, 2006-01-02 15:04:05", info.StartTime)
+		ret.Desp = fmt.Sprintf("invalid start_time: %s", info.StartTime)
 		return
 	}
-
 	for _, layout := range timeLayouts {
 		endTime, err = time.Parse(layout, info.EndTime)
 		if err == nil {
@@ -359,89 +323,80 @@ func (sm *ServerManager) CtrlGb28181Playback(info base.ApiCtrlGb28181PlaybackReq
 	}
 	if err != nil {
 		ret.ErrorCode = base.ErrorCodeParamMissing
-		ret.Desp = fmt.Sprintf("invalid end_time format: %s, supported formats: 2006-01-02T15:04:05, 2006-01-02 15:04:05", info.EndTime)
+		ret.Desp = fmt.Sprintf("invalid end_time: %s", info.EndTime)
 		return
 	}
-
-	// 验证时间范围
-	if endTime.Before(startTime) || endTime.Equal(startTime) {
+	if !endTime.After(startTime) {
 		ret.ErrorCode = base.ErrorCodeParamMissing
 		ret.Desp = "end_time must be after start_time"
 		return
 	}
 
-	// 生成流名称
 	streamName := info.StreamName
 	if streamName == "" {
 		streamName = info.DeviceId + info.ChannelId + "_playback"
 	}
 
-	// 检查回放任务是否已经存在
-	if sm.gb28181Server.HasStream(streamName) {
+	ch := sm.gb28181Server.FindChannel(info.DeviceId, info.ChannelId)
+	if ch == nil {
 		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
-		ret.Desp = fmt.Sprintf("playback stream already exists: %s", streamName)
+		ret.Desp = base.DespGb28181DeviceNotFound
 		return
 	}
 
-	// 检查Group是否已经有输入流
-	group := sm.getGroup("", streamName)
-	if group != nil && group.HasInSession() {
-		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
-		ret.Desp = fmt.Sprintf("stream group already has input session: %s", streamName)
-		return
+	network := "udp"
+	if info.IsTcpFlag == 1 {
+		network = "tcp"
 	}
-
-	// 获取或创建Group
-	if group == nil {
-		group = sm.getOrCreateGroup("", streamName)
-	}
-
-	// 启动RTP Pub
-	var port int
-	if info.Port > 0 {
-		port = info.Port
-	}
-	isTcp := info.IsTcpFlag == 1
-
-	rtpPubReq := base.ApiCtrlStartRtpPubReq{
+	playInfo := &gb28181.PlayInfo{
+		NetWork:    network,
+		DeviceId:   info.DeviceId,
+		ChannelId:  info.ChannelId,
 		StreamName: streamName,
-		Port:       port,
-		TimeoutMs:  10000,
-		IsTcpFlag:  info.IsTcpFlag,
+		SinglePort: false,
 	}
-
-	rtpPubResp := group.StartRtpPub(rtpPubReq)
-	if rtpPubResp.ErrorCode != base.ErrorCodeSucc {
+	opt := &gb28181.InviteOptions{
+		Start: int(startTime.Unix()),
+		End:   int(endTime.Unix()),
+	}
+	code, err := ch.Invite(opt, streamName, playInfo)
+	if err != nil || code != 200 {
 		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
-		ret.Desp = rtpPubResp.Desp
-		return
-	}
-
-	// 验证倍速参数
-	scale := info.Scale
-	if scale <= 0 {
-		scale = 1.0 // 默认正常速度
-	}
-
-	// 发送回放INVITE信令
-	err = sm.gb28181Server.Playback(info.DeviceId, info.ChannelId, streamName, rtpPubResp.Data.Port, isTcp, startTime, endTime, scale)
-	if err != nil {
-		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
-		ret.Desp = err.Error()
-		// 如果回放失败，需要停止RTP Pub
-		group.StopRtpPub(streamName)
+		if err != nil {
+			ret.Desp = err.Error()
+		} else {
+			ret.Desp = fmt.Sprintf("playback invite failed, code=%d", code)
+		}
 		return
 	}
 
 	ret.ErrorCode = base.ErrorCodeSucc
 	ret.Desp = base.DespSucc
 	ret.Data.StreamName = streamName
-	ret.Data.SessionId = rtpPubResp.Data.SessionId
-	ret.Data.Port = rtpPubResp.Data.Port
+	if port := parseGb28181MediaPort(ch.MediaInfo.MediaKey); port > 0 {
+		ret.Data.Port = port
+	}
 	return
 }
 
-// CtrlGb28181Bye GB28181停止拉流
+// parseGb28181MediaPort 从 lalmax 的 MediaKey（形如 "udp30000" 或 "tcp30000"）中提取端口号。
+func parseGb28181MediaPort(mediaKey string) int {
+	if mediaKey == "" {
+		return 0
+	}
+	for i := 0; i < len(mediaKey); i++ {
+		c := mediaKey[i]
+		if c >= '0' && c <= '9' {
+			if p, err := strconv.Atoi(mediaKey[i:]); err == nil {
+				return p
+			}
+			break
+		}
+	}
+	return 0
+}
+
+// CtrlGb28181Bye GB28181停止拉流（lalmax：FindChannel + channel.Bye）
 func (sm *ServerManager) CtrlGb28181Bye(info base.ApiCtrlGb28181ByeReq) (ret base.ApiCtrlGb28181ByeResp) {
 	sm.mutex.Lock()
 	defer sm.mutex.Unlock()
@@ -452,25 +407,23 @@ func (sm *ServerManager) CtrlGb28181Bye(info base.ApiCtrlGb28181ByeReq) (ret bas
 		return
 	}
 
-	// 确定流名称
 	streamName := info.StreamName
 	if streamName == "" {
 		streamName = info.DeviceId + info.ChannelId
 	}
 
-	// 发送BYE信令
-	err := sm.gb28181Server.Bye(info.DeviceId, info.ChannelId, streamName)
+	ch := sm.gb28181Server.FindChannel(info.DeviceId, info.ChannelId)
+	if ch == nil {
+		ret.ErrorCode = base.ErrorCodeGb28181ByeFail
+		ret.Desp = base.DespGb28181DeviceNotFound
+		return
+	}
+
+	err := ch.Bye(streamName)
 	if err != nil {
 		ret.ErrorCode = base.ErrorCodeGb28181ByeFail
 		ret.Desp = err.Error()
 		return
-	}
-
-	// 停止RTP Pub
-	group := sm.getGroup("", streamName)
-	if group != nil {
-		sessionId := group.StopRtpPub(streamName)
-		ret.Data.SessionId = sessionId
 	}
 
 	ret.ErrorCode = base.ErrorCodeSucc
@@ -479,7 +432,7 @@ func (sm *ServerManager) CtrlGb28181Bye(info base.ApiCtrlGb28181ByeReq) (ret bas
 	return
 }
 
-// StatGb28181Devices 获取GB28181设备列表
+// StatGb28181Devices 获取GB28181设备列表（lalmax：GetDeviceInfos）
 func (sm *ServerManager) StatGb28181Devices() (ret base.ApiStatGb28181DeviceResp) {
 	sm.mutex.Lock()
 	defer sm.mutex.Unlock()
@@ -490,32 +443,25 @@ func (sm *ServerManager) StatGb28181Devices() (ret base.ApiStatGb28181DeviceResp
 		return
 	}
 
-	devices := sm.gb28181Server.GetDevices()
-	deviceInfos := make([]base.Gb28181DeviceInfo, 0, len(devices))
-
-	// 遍历设备，返回设备信息（不再主动查询Catalog，由后台策略决定）
-	for _, device := range devices {
+	infos := sm.gb28181Server.GetDeviceInfos()
+	deviceInfos := make([]base.Gb28181DeviceInfo, 0, len(infos.DeviceItems))
+	for _, item := range infos.DeviceItems {
 		deviceInfo := base.Gb28181DeviceInfo{
-			DeviceId:      device.DeviceId,
-			DeviceName:    device.DeviceName,
-			Status:        device.Status,
-			RegisterTime:  device.RegisterTime.Format("2006-01-02 15:04:05"),
-			KeepaliveTime: device.KeepaliveTime.Format("2006-01-02 15:04:05"),
-			Channels:      make([]base.Gb28181ChannelInfo, 0),
+			DeviceId:      item.DeviceId,
+			DeviceName:    item.Name,
+			Status:        string(item.Status),
+			RegisterTime:  item.RegisterTime,
+			KeepaliveTime: item.KeepaliveTime,
+			Channels:      make([]base.Gb28181ChannelInfo, 0, len(item.Channels)),
 		}
-
-		// 使用线程安全的方法获取通道列表
-		channels := device.GetChannels()
-		for _, channel := range channels {
-			channelInfo := base.Gb28181ChannelInfo{
-				ChannelId:   channel.ChannelId,
-				ChannelName: channel.ChannelName,
-				Status:      channel.Status,
-				StreamName:  channel.StreamName,
-			}
-			deviceInfo.Channels = append(deviceInfo.Channels, channelInfo)
+		for _, ch := range item.Channels {
+			deviceInfo.Channels = append(deviceInfo.Channels, base.Gb28181ChannelInfo{
+				ChannelId:   ch.ChannelId,
+				ChannelName: ch.Name,
+				Status:      string(ch.Status),
+				StreamName:  ch.StreamName,
+			})
 		}
-
 		deviceInfos = append(deviceInfos, deviceInfo)
 	}
 
@@ -525,7 +471,7 @@ func (sm *ServerManager) StatGb28181Devices() (ret base.ApiStatGb28181DeviceResp
 	return
 }
 
-// CtrlGb28181Ptz GB28181 PTZ控制
+// CtrlGb28181Ptz GB28181 PTZ控制（lalmax：FindChannel + channel.Ptz*）
 func (sm *ServerManager) CtrlGb28181Ptz(info base.ApiCtrlGb28181PtzReq) (ret base.ApiCtrlGb28181PtzResp) {
 	sm.mutex.Lock()
 	defer sm.mutex.Unlock()
@@ -536,19 +482,49 @@ func (sm *ServerManager) CtrlGb28181Ptz(info base.ApiCtrlGb28181PtzReq) (ret bas
 		return
 	}
 
-	// 转换命令字符串为PTZCommand类型
-	// 注意：这里需要直接使用 gb28181 包的类型，但由于包访问限制，我们通过字符串传递
-	// 实际调用时在 gb28181 包内部进行转换
-	ptzControl := gb28181.PTZControl{
-		DeviceId:  info.DeviceId,
-		ChannelId: info.ChannelId,
-		Command:   gb28181.PTZCommand(info.Command),
-		Speed:     info.Speed,
-		Preset:    info.Preset,
+	ch := sm.gb28181Server.FindChannel(info.DeviceId, info.ChannelId)
+	if ch == nil {
+		ret.ErrorCode = base.ErrorCodeGb28181PtzFail
+		ret.Desp = base.DespGb28181DeviceNotFound
+		return
 	}
 
-	// 发送PTZ控制命令
-	err := sm.gb28181Server.ControlPTZ(ptzControl)
+	speed := byte(info.Speed)
+	if speed == 0 {
+		speed = 5
+	}
+	if speed > 8 {
+		speed = 8
+	}
+	speed *= 25 // lalmax 约定
+
+	var err error
+	switch info.Command {
+	case "Stop":
+		err = ch.PtzStop(&gb28181.PtzStop{DeviceId: info.DeviceId, ChannelId: info.ChannelId})
+	case "Up":
+		err = ch.PtzDirection(&gb28181.PtzDirection{DeviceId: info.DeviceId, ChannelId: info.ChannelId, Up: true, Speed: speed})
+	case "Down":
+		err = ch.PtzDirection(&gb28181.PtzDirection{DeviceId: info.DeviceId, ChannelId: info.ChannelId, Down: true, Speed: speed})
+	case "Left":
+		err = ch.PtzDirection(&gb28181.PtzDirection{DeviceId: info.DeviceId, ChannelId: info.ChannelId, Left: true, Speed: speed})
+	case "Right":
+		err = ch.PtzDirection(&gb28181.PtzDirection{DeviceId: info.DeviceId, ChannelId: info.ChannelId, Right: true, Speed: speed})
+	case "ZoomIn":
+		err = ch.PtzZoom(&gb28181.PtzZoom{DeviceId: info.DeviceId, ChannelId: info.ChannelId, ZoomIn: true, Speed: speed})
+	case "ZoomOut":
+		err = ch.PtzZoom(&gb28181.PtzZoom{DeviceId: info.DeviceId, ChannelId: info.ChannelId, ZoomOut: true, Speed: speed})
+	case "CallPreset":
+		err = ch.PtzPreset(&gb28181.PtzPreset{DeviceId: info.DeviceId, ChannelId: info.ChannelId, Cmd: gb28181.PresetCallPoint, Point: byte(info.Preset)})
+	case "SetPreset":
+		err = ch.PtzPreset(&gb28181.PtzPreset{DeviceId: info.DeviceId, ChannelId: info.ChannelId, Cmd: gb28181.PresetEditPoint, Point: byte(info.Preset)})
+	case "DelPreset":
+		err = ch.PtzPreset(&gb28181.PtzPreset{DeviceId: info.DeviceId, ChannelId: info.ChannelId, Cmd: gb28181.PresetDelPoint, Point: byte(info.Preset)})
+	default:
+		ret.ErrorCode = base.ErrorCodeGb28181PtzFail
+		ret.Desp = fmt.Sprintf("unsupported ptz command: %s", info.Command)
+		return
+	}
 	if err != nil {
 		ret.ErrorCode = base.ErrorCodeGb28181PtzFail
 		ret.Desp = err.Error()
@@ -563,7 +539,7 @@ func (sm *ServerManager) CtrlGb28181Ptz(info base.ApiCtrlGb28181PtzReq) (ret bas
 	return
 }
 
-// QueryGb28181DeviceInfo 查询GB28181设备信息
+// QueryGb28181DeviceInfo 查询GB28181设备信息（lalmax：GetDevice + QueryDeviceInfo）
 func (sm *ServerManager) QueryGb28181DeviceInfo(info base.ApiQueryGb28181DeviceInfoReq) (ret base.ApiQueryGb28181DeviceInfoResp) {
 	sm.mutex.Lock()
 	defer sm.mutex.Unlock()
@@ -574,32 +550,25 @@ func (sm *ServerManager) QueryGb28181DeviceInfo(info base.ApiQueryGb28181DeviceI
 		return
 	}
 
-	// 获取设备信息
-	device := sm.gb28181Server.GetDevice(info.DeviceId)
-	if device == nil {
+	d := sm.gb28181Server.GetDevice(info.DeviceId)
+	if d == nil {
 		ret.ErrorCode = base.ErrorCodeGb28181DeviceNotFound
 		ret.Desp = base.DespGb28181DeviceNotFound
 		return
 	}
 
-	// 发送查询请求（设备信息需要从设备响应中获取，这里先返回基本信息）
-	err := sm.gb28181Server.QueryDeviceInfo(info.DeviceId)
-	if err != nil {
-		ret.ErrorCode = base.ErrorCodeGb28181QueryFail
-		ret.Desp = err.Error()
-		return
-	}
+	sm.gb28181Server.QueryDeviceInfo(info.DeviceId)
 
 	ret.ErrorCode = base.ErrorCodeSucc
 	ret.Desp = base.DespSucc
-	ret.Data.DeviceId = device.DeviceId
-	ret.Data.DeviceName = device.DeviceName
-	// 注意：Manufacturer、Model、Firmware 需要从设备响应中获取，这里暂时返回空
-	// 实际应用中应该等待设备响应并解析XML
+	ret.Data.DeviceId = d.ID
+	ret.Data.DeviceName = d.Name
+	ret.Data.Manufacturer = d.Manufacturer
+	ret.Data.Model = d.Model
 	return
 }
 
-// QueryGb28181DeviceStatus 查询GB28181设备状态
+// QueryGb28181DeviceStatus 查询GB28181设备状态（lalmax：GetDevice 状态）
 func (sm *ServerManager) QueryGb28181DeviceStatus(info base.ApiQueryGb28181DeviceStatusReq) (ret base.ApiQueryGb28181DeviceStatusResp) {
 	sm.mutex.Lock()
 	defer sm.mutex.Unlock()
@@ -610,30 +579,21 @@ func (sm *ServerManager) QueryGb28181DeviceStatus(info base.ApiQueryGb28181Devic
 		return
 	}
 
-	// 获取设备信息
-	device := sm.gb28181Server.GetDevice(info.DeviceId)
-	if device == nil {
+	d := sm.gb28181Server.GetDevice(info.DeviceId)
+	if d == nil {
 		ret.ErrorCode = base.ErrorCodeGb28181DeviceNotFound
 		ret.Desp = base.DespGb28181DeviceNotFound
 		return
 	}
 
-	// 发送查询请求
-	err := sm.gb28181Server.QueryDeviceStatus(info.DeviceId)
-	if err != nil {
-		ret.ErrorCode = base.ErrorCodeGb28181QueryFail
-		ret.Desp = err.Error()
-		return
-	}
-
 	ret.ErrorCode = base.ErrorCodeSucc
 	ret.Desp = base.DespSucc
-	ret.Data.DeviceId = device.DeviceId
-	ret.Data.Status = device.Status
+	ret.Data.DeviceId = d.ID
+	ret.Data.Status = string(d.Status)
 	return
 }
 
-// QueryGb28181Channels 查询GB28181通道列表
+// QueryGb28181Channels 查询GB28181通道列表（lalmax：GetDevice + GetChannels，先拉取目录）
 func (sm *ServerManager) QueryGb28181Channels(info base.ApiQueryGb28181ChannelsReq) (ret base.ApiQueryGb28181ChannelsResp) {
 	sm.mutex.Lock()
 	defer sm.mutex.Unlock()
@@ -644,33 +604,23 @@ func (sm *ServerManager) QueryGb28181Channels(info base.ApiQueryGb28181ChannelsR
 		return
 	}
 
-	// 获取设备信息
-	device := sm.gb28181Server.GetDevice(info.DeviceId)
-	if device == nil {
+	d := sm.gb28181Server.GetDevice(info.DeviceId)
+	if d == nil {
 		ret.ErrorCode = base.ErrorCodeGb28181DeviceNotFound
 		ret.Desp = base.DespGb28181DeviceNotFound
 		return
 	}
 
-	// 发送查询请求
-	err := sm.gb28181Server.QueryCatalog(info.DeviceId)
-	if err != nil {
-		ret.ErrorCode = base.ErrorCodeGb28181QueryFail
-		ret.Desp = err.Error()
-		return
-	}
-
-	// 获取通道列表
-	channels := device.GetChannels()
+	sm.gb28181Server.QueryCatalog(info.DeviceId)
+	channels := d.GetChannels()
 	channelInfos := make([]base.Gb28181ChannelInfo, 0, len(channels))
-	for _, channel := range channels {
-		channelInfo := base.Gb28181ChannelInfo{
-			ChannelId:   channel.ChannelId,
-			ChannelName: channel.ChannelName,
-			Status:      channel.Status,
-			StreamName:  channel.StreamName,
-		}
-		channelInfos = append(channelInfos, channelInfo)
+	for _, ch := range channels {
+		channelInfos = append(channelInfos, base.Gb28181ChannelInfo{
+			ChannelId:   ch.ChannelId,
+			ChannelName: ch.Name,
+			Status:      string(ch.Status),
+			StreamName:  ch.StreamName,
+		})
 	}
 
 	ret.ErrorCode = base.ErrorCodeSucc
@@ -680,7 +630,7 @@ func (sm *ServerManager) QueryGb28181Channels(info base.ApiQueryGb28181ChannelsR
 	return
 }
 
-// StatGb28181Streams 获取GB28181流列表
+// StatGb28181Streams 获取GB28181流列表（lalmax：GetAllStreams）
 func (sm *ServerManager) StatGb28181Streams() (ret base.ApiStatGb28181StreamsResp) {
 	sm.mutex.Lock()
 	defer sm.mutex.Unlock()
@@ -693,18 +643,12 @@ func (sm *ServerManager) StatGb28181Streams() (ret base.ApiStatGb28181StreamsRes
 
 	streams := sm.gb28181Server.GetAllStreams()
 	streamInfos := make([]base.Gb28181StreamInfo, 0, len(streams))
-
-	for _, stream := range streams {
-		streamInfo := base.Gb28181StreamInfo{
-			DeviceId:   stream.DeviceId,
-			ChannelId:  stream.ChannelId,
-			StreamName: stream.StreamName,
-			CallId:     stream.CallId,
-			Port:       stream.Port,
-			IsTcp:      stream.IsTcp,
-			StartTime:  stream.StartTime.Format("2006-01-02 15:04:05"),
-		}
-		streamInfos = append(streamInfos, streamInfo)
+	for _, s := range streams {
+		streamInfos = append(streamInfos, base.Gb28181StreamInfo{
+			DeviceId:   s.DeviceId,
+			ChannelId:  s.ChannelId,
+			StreamName: s.StreamName,
+		})
 	}
 
 	ret.ErrorCode = base.ErrorCodeSucc
@@ -713,116 +657,4 @@ func (sm *ServerManager) StatGb28181Streams() (ret base.ApiStatGb28181StreamsRes
 	return
 }
 
-// onGb28181Invite GB28181 INVITE回调
-func (sm *ServerManager) onGb28181Invite(deviceId, channelId, streamName string, port int, isTcp bool) error {
-	sm.mutex.Lock()
-	defer sm.mutex.Unlock()
-
-	group := sm.getOrCreateGroup("", streamName)
-
-	// 仅当已有本流的 GB28181 RTP session 时跳过（API 主动拉流时在发 INVITE/Playback 前已创建，200 OK 回调无需再建）
-	if group.HasPsPubSessionForStream(streamName) {
-		Log.Debugf("group already has GB28181 RTP session for stream, skip StartRtpPub. stream_name=%s", streamName)
-		return nil
-	}
-	// 若已有其他类型输入（如 RTMP/RTSP 推流），则无法再创建 RTP 收流，应返回错误而非静默跳过
-	if group.HasInSession() {
-		Log.Warnf("group already has other input session (not GB28181 RTP), cannot StartRtpPub. stream_name=%s", streamName)
-		return fmt.Errorf("stream group already has input session (not GB28181), cannot start RTP pub: %s", streamName)
-	}
-
-	// 设备主动推流时，需要在这里创建RTP Pub Session
-	rtpPubReq := base.ApiCtrlStartRtpPubReq{
-		StreamName: streamName,
-		Port:       port,
-		TimeoutMs:  10000,
-		IsTcpFlag:  0,
-	}
-	if isTcp {
-		rtpPubReq.IsTcpFlag = 1
-	}
-
-	rtpPubResp := group.StartRtpPub(rtpPubReq)
-	if rtpPubResp.ErrorCode != base.ErrorCodeSucc {
-		return fmt.Errorf("start rtp pub failed: %s", rtpPubResp.Desp)
-	}
-
-	return nil
-}
-
-// onGb28181Bye GB28181 BYE回调
-func (sm *ServerManager) onGb28181Bye(deviceId, channelId, streamName string) error {
-	sm.mutex.Lock()
-	defer sm.mutex.Unlock()
-
-	group := sm.getGroup("", streamName)
-	if group != nil {
-		group.StopRtpPub(streamName)
-	}
-
-	return nil
-}
-
-// onGb28181Reconnect GB28181设备重连回调
-func (sm *ServerManager) onGb28181Reconnect(deviceId string) error {
-	if sm.gb28181Server == nil {
-		return nil
-	}
-
-	// 获取该设备的所有流
-	streams := sm.gb28181Server.GetStreamsByDeviceId(deviceId)
-	if len(streams) == 0 {
-		return nil
-	}
-
-	Log.Infof("device reconnect detected. device_id=%s, stream_count=%d", deviceId, len(streams))
-
-	sm.mutex.Lock()
-	defer sm.mutex.Unlock()
-
-	// 遍历所有流，尝试恢复拉流
-	for _, stream := range streams {
-		// 检查Group是否还有输入会话
-		group := sm.getGroup("", stream.StreamName)
-		if group != nil && group.HasInSession() {
-			Log.Debugf("stream already has input session, skip restore. device_id=%s, stream_name=%s", deviceId, stream.StreamName)
-			continue
-		}
-
-		// 获取或创建Group
-		if group == nil {
-			group = sm.getOrCreateGroup("", stream.StreamName)
-		}
-
-		// 重新启动RTP Pub
-		rtpPubReq := base.ApiCtrlStartRtpPubReq{
-			StreamName: stream.StreamName,
-			Port:       stream.Port,
-			TimeoutMs:  10000,
-			IsTcpFlag:  0,
-		}
-		if stream.IsTcp {
-			rtpPubReq.IsTcpFlag = 1
-		}
-
-		rtpPubResp := group.StartRtpPub(rtpPubReq)
-		if rtpPubResp.ErrorCode != base.ErrorCodeSucc {
-			Log.Warnf("restore stream failed. device_id=%s, stream_name=%s, err=%s", deviceId, stream.StreamName, rtpPubResp.Desp)
-			continue
-		}
-
-		// 重新发送INVITE信令
-		// 恢复流时使用主码流（streamType=0）
-		err := sm.gb28181Server.Invite(stream.DeviceId, stream.ChannelId, stream.StreamName, rtpPubResp.Data.Port, stream.IsTcp, 0)
-		if err != nil {
-			Log.Warnf("restore stream INVITE failed. device_id=%s, stream_name=%s, err=%+v", deviceId, stream.StreamName, err)
-			// 如果INVITE失败，停止RTP Pub
-			group.StopRtpPub(stream.StreamName)
-			continue
-		}
-
-		Log.Infof("stream restored. device_id=%s, channel_id=%s, stream_name=%s", stream.DeviceId, stream.ChannelId, stream.StreamName)
-	}
-
-	return nil
-}
+// lalmax GB28181 通过 mediaserver Conn 直接调用 AddCustomizePubSession，无需 onInvite/onBye/onReconnect 回调

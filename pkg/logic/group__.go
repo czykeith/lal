@@ -14,8 +14,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/q191201771/lal/pkg/gb28181"
-
 	"github.com/q191201771/lal/pkg/base"
 	"github.com/q191201771/lal/pkg/hls"
 	"github.com/q191201771/lal/pkg/httpflv"
@@ -95,8 +93,7 @@ type Group struct {
 	rtmpPubSession      *rtmp.ServerSession
 	rtspPubSession      *rtsp.PubSession
 	customizePubSession *CustomizePubSessionContext
-	psPubSession        *gb28181.PubSession
-	rtsp2RtmpRemuxer    *remux.AvPacket2RtmpRemuxer // TODO(chef): [refactor] 重命名为avPacket2RtmpRemuxer，因为除了rtsp，customize pub和gb28181 pub都是 202208
+	rtsp2RtmpRemuxer    *remux.AvPacket2RtmpRemuxer
 	rtmp2RtspRemuxer    *remux.Rtmp2RtspRemuxer
 	rtmp2MpegtsRemuxer  *remux.Rtmp2MpegtsRemuxer
 	// pull
@@ -105,9 +102,6 @@ type Group struct {
 	relayProxy *relayProxy
 	// rtmp pub使用 TODO(chef): [doc] 更新这个注释，是共同使用 202210
 	dummyAudioFilter *remux.DummyAudioFilter
-	// ps pub使用
-	psPubTimeoutSec            uint32 // 超时时间
-	psPubPrevInactiveCheckTick int64  // 上次检查时间
 	// rtmp sub使用
 	rtmpGopCache *remux.GopCache
 	// httpflv sub使用
@@ -159,17 +153,16 @@ func NewGroup(appName string, streamName string, config *Config, option GroupOpt
 			StreamName: streamName,
 			AppName:    appName,
 		},
-		exitChan:                   make(chan struct{}, 1),
-		rtmpSubSessionSet:          make(map[*rtmp.ServerSession]struct{}),
-		httpflvSubSessionSet:       make(map[*httpflv.SubSession]struct{}),
-		httptsSubSessionSet:        make(map[*httpts.SubSession]struct{}),
-		rtspSubSessionSet:          make(map[*rtsp.SubSession]struct{}),
-		hlsSubSessionSet:           make(map[*hls.SubSession]struct{}),
-		rtmpGopCache:               remux.NewGopCache("rtmp", uk, config.RtmpConfig.GopNum, config.RtmpConfig.SingleGopMaxFrameNum),
-		httpflvGopCache:            remux.NewGopCache("httpflv", uk, config.HttpflvConfig.GopNum, config.HttpflvConfig.SingleGopMaxFrameNum),
-		httptsGopCache:             remux.NewGopCacheMpegts(uk, config.HttptsConfig.GopNum, config.HttptsConfig.SingleGopMaxFrameNum),
-		psPubPrevInactiveCheckTick: -1,
-		inVideoFpsRecords:          base.NewPeriodRecord(32),
+		exitChan:             make(chan struct{}, 1),
+		rtmpSubSessionSet:    make(map[*rtmp.ServerSession]struct{}),
+		httpflvSubSessionSet: make(map[*httpflv.SubSession]struct{}),
+		httptsSubSessionSet:  make(map[*httpts.SubSession]struct{}),
+		rtspSubSessionSet:    make(map[*rtsp.SubSession]struct{}),
+		hlsSubSessionSet:     make(map[*hls.SubSession]struct{}),
+		rtmpGopCache:         remux.NewGopCache("rtmp", uk, config.RtmpConfig.GopNum, config.RtmpConfig.SingleGopMaxFrameNum),
+		httpflvGopCache:      remux.NewGopCache("httpflv", uk, config.HttpflvConfig.GopNum, config.HttpflvConfig.SingleGopMaxFrameNum),
+		httptsGopCache:       remux.NewGopCacheMpegts(uk, config.HttptsConfig.GopNum, config.HttptsConfig.SingleGopMaxFrameNum),
+		inVideoFpsRecords:    base.NewPeriodRecord(32),
 	}
 
 	g.hlsCalcSessionStatIntervalSec = uint32(config.HlsConfig.FragmentDurationMs / 100) // equals to (ms/1000) * 10
@@ -233,10 +226,6 @@ func (group *Group) Dispose() {
 	if group.rtspPubSession != nil {
 		group.rtspPubSession.Dispose()
 	}
-	if group.psPubSession != nil {
-		group.psPubSession.Dispose()
-	}
-
 	for session := range group.rtmpSubSessionSet {
 		session.Dispose()
 	}
@@ -277,8 +266,6 @@ func (group *Group) GetStat(maxsub int) base.StatGroup {
 		group.stat.StatPub = base.Session2StatPub(group.rtmpPubSession)
 	} else if group.rtspPubSession != nil {
 		group.stat.StatPub = base.Session2StatPub(group.rtspPubSession)
-	} else if group.psPubSession != nil {
-		group.stat.StatPub = base.Session2StatPub(group.psPubSession)
 	} else {
 		group.stat.StatPub = base.StatPub{}
 	}
@@ -354,11 +341,6 @@ func (group *Group) KickSession(sessionId string) bool {
 			group.rtspPubSession.Dispose()
 			return true
 		}
-	} else if strings.HasPrefix(sessionId, base.UkPrePsPubSession) {
-		if group.psPubSession != nil && group.psPubSession.UniqueKey() == sessionId {
-			group.psPubSession.Dispose()
-			return true
-		}
 	} else if strings.HasPrefix(sessionId, base.UkPreFlvSubSession) {
 		// TODO chef: 考虑数据结构改成sessionIdzuokey的map
 		for s := range group.httpflvSubSessionSet {
@@ -409,13 +391,6 @@ func (group *Group) HasInSession() bool {
 	return group.hasInSession()
 }
 
-// HasPsPubSessionForStream 是否已有该流名的 GB28181 RTP Pub Session（用于 onGb28181Invite 判断是否可跳过创建）
-func (group *Group) HasPsPubSessionForStream(streamName string) bool {
-	group.mutex.Lock()
-	defer group.mutex.Unlock()
-	return group.psPubSession != nil && group.psPubSession.StreamName() == streamName
-}
-
 func (group *Group) HasOutSession() bool {
 	group.mutex.Lock()
 	defer group.mutex.Unlock()
@@ -443,24 +418,6 @@ func (group *Group) OutSessionNum() int {
 
 // disposeInactiveSessions 关闭不活跃的session
 func (group *Group) disposeInactiveSessions(tickCount uint32) {
-	if group.psPubSession != nil {
-		if group.psPubTimeoutSec == 0 {
-			// noop
-			// 没有超时逻辑
-		} else {
-			if group.psPubPrevInactiveCheckTick == -1 ||
-				tickCount-uint32(group.psPubPrevInactiveCheckTick) >= group.psPubTimeoutSec {
-
-				if readAlive, _ := group.psPubSession.IsAlive(); !readAlive {
-					Log.Warnf("[%s] session timeout. session=%s", group.UniqueKey, group.psPubSession.UniqueKey())
-					group.psPubSession.Dispose()
-				}
-
-				group.psPubPrevInactiveCheckTick = int64(tickCount)
-			}
-		}
-	}
-
 	// 以下都是以 CheckSessionAliveIntervalSec 为间隔的清理逻辑
 
 	if tickCount%base.LogicCheckSessionAliveIntervalSec != 0 {
@@ -553,10 +510,6 @@ func (group *Group) updateAllSessionStat() {
 	if group.rtspPubSession != nil {
 		group.rtspPubSession.UpdateStat(calcSessionStatIntervalSec)
 	}
-	if group.psPubSession != nil {
-		group.psPubSession.UpdateStat(calcSessionStatIntervalSec)
-	}
-
 	group.updatePullSessionStat()
 
 	for session := range group.rtmpSubSessionSet {
@@ -581,8 +534,7 @@ func (group *Group) updateAllSessionStat() {
 }
 
 func (group *Group) hasPubSession() bool {
-	return group.rtmpPubSession != nil || group.rtspPubSession != nil || group.customizePubSession != nil ||
-		group.psPubSession != nil
+	return group.rtmpPubSession != nil || group.rtspPubSession != nil || group.customizePubSession != nil
 }
 
 func (group *Group) hasSubSession() bool {
@@ -624,8 +576,8 @@ func (group *Group) inSessionUniqueKey() string {
 	if group.rtspPubSession != nil {
 		return group.rtspPubSession.UniqueKey()
 	}
-	if group.psPubSession != nil {
-		return group.psPubSession.UniqueKey()
+	if group.customizePubSession != nil {
+		return group.customizePubSession.UniqueKey()
 	}
 	return group.pullSessionUniqueKey()
 }

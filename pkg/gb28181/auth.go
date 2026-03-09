@@ -1,116 +1,43 @@
-// Copyright 2024, Chef.  All rights reserved.
-// https://github.com/q191201771/lal
-//
-// Use of this source code is governed by a MIT-style license
-// that can be found in the License file.
-//
-// Author: Chef (191201771@qq.com)
-
 package gb28181
 
 import (
 	"crypto/md5"
 	"fmt"
-	"regexp"
-	"strings"
-	"time"
+
+	"github.com/ghettovoice/gosip/sip"
+	"github.com/q191201771/lal/pkg/base"
 )
 
-// Authorization Digest 认证信息
 type Authorization struct {
-	Username  string
-	Realm     string
-	Nonce     string
-	URI       string
-	Response  string
-	Algorithm string
-	Cnonce    string
-	Qop       string
-	Nc        string
+	*sip.Authorization
 }
 
-// ParseAuthorization 从 Authorization 头中解析认证信息
-func ParseAuthorization(authHeader string) *Authorization {
-	if authHeader == "" {
-		return nil
-	}
+func (a *Authorization) Verify(username, passwd, realm, nonce string) bool {
 
-	auth := &Authorization{
-		Algorithm: "MD5", // 默认算法
-	}
+	//1、将 username,realm,password 依次组合获取 1 个字符串，并用算法加密的到密文 r1
+	s1 := fmt.Sprintf("%s:%s:%s", username, realm, passwd)
+	r1 := a.getDigest(s1)
+	//2、将 method，即REGISTER ,uri 依次组合获取 1 个字符串，并对这个字符串使用算法 加密得到密文 r2
+	s2 := fmt.Sprintf("REGISTER:%s", a.Uri())
+	r2 := a.getDigest(s2)
 
-	// 移除 "Digest " 前缀
-	authHeader = strings.TrimPrefix(authHeader, "Digest ")
-	authHeader = strings.TrimSpace(authHeader)
-
-	// 解析各个字段
-	re := regexp.MustCompile(`(\w+)="?([^",\s]+)"?`)
-	matches := re.FindAllStringSubmatch(authHeader, -1)
-
-	for _, match := range matches {
-		if len(match) >= 3 {
-			key := strings.ToLower(match[1])
-			value := match[2]
-
-			switch key {
-			case "username":
-				auth.Username = value
-			case "realm":
-				auth.Realm = value
-			case "nonce":
-				auth.Nonce = value
-			case "uri":
-				auth.URI = value
-			case "response":
-				auth.Response = value
-			case "algorithm":
-				auth.Algorithm = value
-			case "cnonce":
-				auth.Cnonce = value
-			case "qop":
-				auth.Qop = value
-			case "nc":
-				auth.Nc = value
-			}
-		}
-	}
-
-	return auth
-}
-
-// Verify 验证 Digest 认证响应
-func (a *Authorization) Verify(username, password, method, uri string) bool {
-	if a == nil {
+	if r1 == "" || r2 == "" {
+		base.Log.Error("Authorization algorithm wrong")
 		return false
 	}
+	//3、将密文 1，nonce 和密文 2 依次组合获取 1 个字符串，并对这个字符串使用算法加密，获得密文 r3，即Response
+	s3 := fmt.Sprintf("%s:%s:%s", r1, nonce, r2)
+	r3 := a.getDigest(s3)
 
-	// 计算 HA1 = MD5(username:realm:password)
-	ha1 := fmt.Sprintf("%x", md5.Sum([]byte(fmt.Sprintf("%s:%s:%s", username, a.Realm, password))))
+	//4、计算服务端和客户端上报的是否相等
+	return r3 == a.Response()
+}
 
-	// 计算 HA2 = MD5(method:uri)
-	ha2 := fmt.Sprintf("%x", md5.Sum([]byte(fmt.Sprintf("%s:%s", method, uri))))
-
-	// 计算 Response
-	var response string
-	if a.Qop != "" {
-		// 如果使用 qop，Response = MD5(HA1:nonce:nc:cnonce:qop:HA2)
-		response = fmt.Sprintf("%x", md5.Sum([]byte(fmt.Sprintf("%s:%s:%s:%s:%s:%s", ha1, a.Nonce, a.Nc, a.Cnonce, a.Qop, ha2))))
-	} else {
-		// 如果没有 qop，Response = MD5(HA1:nonce:HA2)
-		response = fmt.Sprintf("%x", md5.Sum([]byte(fmt.Sprintf("%s:%s:%s", ha1, a.Nonce, ha2))))
+func (a *Authorization) getDigest(raw string) string {
+	switch a.Algorithm() {
+	case "MD5":
+		return fmt.Sprintf("%x", md5.Sum([]byte(raw)))
+	default: //如果没有算法，默认使用MD5
+		return fmt.Sprintf("%x", md5.Sum([]byte(raw)))
 	}
-
-	return strings.EqualFold(response, a.Response)
-}
-
-// BuildWWWAuthenticate 构建 WWW-Authenticate 响应头（401 挑战）
-func BuildWWWAuthenticate(realm, nonce string) string {
-	return fmt.Sprintf(`Digest realm="%s", nonce="%s", algorithm=MD5`, realm, nonce)
-}
-
-// GenerateNonce 生成随机 nonce（简化版本，实际应该使用更安全的随机数生成）
-func GenerateNonce() string {
-	// 使用时间戳和随机数生成 nonce
-	// 实际应用中应该使用更安全的随机数生成器
-	return fmt.Sprintf("%x", md5.Sum([]byte(fmt.Sprintf("%d", time.Now().UnixNano()))))
 }

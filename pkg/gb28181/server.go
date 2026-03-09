@@ -1,2394 +1,851 @@
-// Copyright 2024, Chef.  All rights reserved.
-// https://github.com/q191201771/lal
-//
-// Use of this source code is governed by a MIT-style license
-// that can be found in the License file.
-//
-// Author: Chef (191201771@qq.com)
-
 package gb28181
 
 import (
+	"bytes"
 	"encoding/xml"
 	"fmt"
 	"net"
-	"regexp"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/q191201771/naza/pkg/nazanet"
+	"github.com/ghettovoice/gosip"
+	"github.com/ghettovoice/gosip/log"
+	"github.com/ghettovoice/gosip/sip"
+	udpTransport "github.com/pion/transport/v3/udp"
+	"github.com/q191201771/lal/pkg/base"
+	"github.com/q191201771/lal/pkg/gb28181/mediaserver"
+	"golang.org/x/net/html/charset"
 )
 
-// Gb28181Server GB28181信令服务器
-type Gb28181Server struct {
-	addr               string
-	conn               *nazanet.UdpConnection
-	udpConn            *net.UDPConn // 底层UDP连接，用于发送数据
-	config             *ServerConfig
-	devices            map[string]*Device            // 设备ID -> 设备信息
-	streams            map[string]*Stream            // stream_name -> 流信息
-	deviceStreams      map[string]map[string]*Stream // 设备ID -> stream_name -> 流信息（索引优化）
-	nonces             map[string]string             // 设备ID -> nonce（用于认证）
-	mutex              sync.RWMutex
-	stopChan           chan struct{} // 停止信号
-	onInvite           func(deviceId, channelId, streamName string, port int, isTcp bool) error
-	onBye              func(deviceId, channelId, streamName string) error
-	onReconnect        func(deviceId string) error
-	inviteAckedCallIds map[string]struct{} // 已对 INVITE 200 OK 发过 ACK 的 Call-ID，同一会话只触发一次 onInvite
+type IMediaOpObserver interface {
+	OnStartMediaServer(netWork string, singlePort bool, deviceId string, channelId string) *mediaserver.GB28181MediaServer
+	OnStopMediaServer(netWork string, singlePort bool, deviceId string, channelId string, StreamName string) error
+}
+type GB28181Server struct {
+	conf              GB28181Config
+	RegisterValidity  time.Duration // 注册有效期，单位秒，默认 3600
+	HeartbeatInterval time.Duration // 心跳间隔，单位秒，默认 60
+	RemoveBanInterval time.Duration // 移除禁止设备间隔,默认600s
+	keepaliveInterval int
+
+	lalServer mediaserver.ILalServer
+
+	udpAvailConnPool *AvailConnPool
+	tcpAvailConnPool *AvailConnPool
+
+	sipUdpSvr gosip.Server
+	sipTcpSvr gosip.Server
+
+	MediaServerMap sync.Map
+	disposeOnce    sync.Once
 }
 
-// ServerConfig GB28181服务器配置
-type ServerConfig struct {
-	LocalSipId           string // 本地SIP ID
-	LocalSipIp           string // 本地SIP IP
-	LocalSipPort         int    // 本地SIP端口
-	LocalSipDomain       string // 本地SIP域
-	MediaIp              string // SDP中媒体地址(c=IN IP4)，为空则使用LocalSipIp。公网/NAT场景请填公网IP
-	Username             string // 认证用户名（可选）
-	Password             string // 认证密码（可选）
-	Expires              int    // 注册过期时间（秒）
-	CatalogQueryInterval int    // Catalog查询间隔（秒），0表示不启用定时查询
-	// 视频参数配置
-	VideoCodec     string // 视频编码格式：H264/H265（默认H264）
-	VideoWidth     int    // 视频宽度（分辨率，默认0表示不指定）
-	VideoHeight    int    // 视频高度（分辨率，默认0表示不指定）
-	VideoBitrate   int    // 视频码率（kbps，默认0表示不指定）
-	VideoFramerate int    // 视频帧率（fps，默认0表示不指定）
-	VideoProfile   string // H264 Profile：baseline/main/high（默认不指定）
-	VideoLevel     string // H264 Level：如3.1、4.0等（默认不指定）
+const MaxRegisterCount = 3
+
+var (
+	logger log.Logger
+	sipsvr gosip.Server
+)
+
+func init() {
+	logger = log.NewDefaultLogrusLogger().WithPrefix("LalMaxServer")
 }
 
-// Device 设备信息
-type Device struct {
-	DeviceId     string
-	DeviceName   string
-	Manufacturer string
-	Model        string
-	Ip           string
-	Port         int
-	Status       string // online/offline/alarmed
-	RegisterTime time.Time
-	// 设备注册时REGISTER Request-URI中携带的平台信息，例如：
-	// REGISTER sip:<serverId>@<serverDomain> SIP/2.0
-	// 部分设备（如海康）会校验后续平台发起请求的 From/Contact 中的 serverId 是否一致。
-	RegisteredServerId     string
-	RegisteredServerDomain string
-	// 设备对外可达的信令地址（优先取接收到的源地址raddr，避免Contact里是内网地址导致回包/INVITE失败）
-	RemoteIP          string
-	RemotePort        int
-	KeepaliveTime     time.Time     // 最后心跳时间
-	KeepaliveInterval time.Duration // 心跳间隔（根据客户端实际心跳计算）
-	Channels          map[string]*Channel
-	// Catalog 聚合状态（用于兼容分页/分片 Catalog 响应：同一个 SN 可能会多次返回）
-	LastCatalogSN     string
-	CatalogExpected   int
-	CatalogReceived   int
-	CatalogUpdateTime time.Time
-	mutex             sync.RWMutex
-}
-
-// GetChannels 获取通道列表的副本（线程安全）
-func (d *Device) GetChannels() []*Channel {
-	d.mutex.RLock()
-	defer d.mutex.RUnlock()
-
-	channels := make([]*Channel, 0, len(d.Channels))
-	for _, ch := range d.Channels {
-		channels = append(channels, ch)
+func NewGB28181Server(conf GB28181Config, lal mediaserver.ILalServer) *GB28181Server {
+	if conf.ListenAddr == "" {
+		conf.ListenAddr = "0.0.0.0"
 	}
-	return channels
+	if conf.SipPort == 0 {
+		conf.SipPort = 5060
+	}
+	if conf.KeepaliveInterval == 0 {
+		conf.KeepaliveInterval = 60
+	}
+	if conf.Serial == "" {
+		conf.Serial = "34020000002000000001"
+	}
+
+	if conf.Realm == "" {
+		conf.Realm = "3402000000"
+	}
+
+	if conf.MediaConfig.MediaIp == "" {
+		conf.MediaConfig.MediaIp = "0.0.0.0"
+	}
+
+	if conf.MediaConfig.ListenPort == 0 {
+		conf.MediaConfig.ListenPort = 30000
+	}
+	if conf.MediaConfig.MultiPortMaxIncrement == 0 {
+		conf.MediaConfig.MultiPortMaxIncrement = 3000
+	}
+	gb28181Server := &GB28181Server{
+		conf:              conf,
+		RegisterValidity:  3600 * time.Second,
+		HeartbeatInterval: 60 * time.Second,
+		RemoveBanInterval: 600 * time.Second,
+		keepaliveInterval: conf.KeepaliveInterval,
+		lalServer:         lal,
+		udpAvailConnPool:  NewAvailConnPool(conf.MediaConfig.ListenPort+1, conf.MediaConfig.ListenPort+conf.MediaConfig.MultiPortMaxIncrement),
+		tcpAvailConnPool:  NewAvailConnPool(conf.MediaConfig.ListenPort+1, conf.MediaConfig.ListenPort+conf.MediaConfig.MultiPortMaxIncrement),
+	}
+	gb28181Server.tcpAvailConnPool.onListenWithPort = func(port uint16) (net.Listener, error) {
+		return net.Listen("tcp", fmt.Sprintf(":%d", port))
+	}
+
+	gb28181Server.udpAvailConnPool.onListenWithPort = func(port uint16) (net.Listener, error) {
+		addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", port))
+		if err != nil {
+			base.Log.Error("gb28181 media server udp listen failed,err:", err)
+			return nil, err
+		}
+
+		return udpTransport.Listen("udp", addr)
+	}
+	return gb28181Server
 }
 
-// Channel 通道信息
-type Channel struct {
-	ChannelId   string
-	ChannelName string
-	Status      string // ON/OFF（GB28181）或 idle/streaming
-	StreamName  string
-	Longitude   string // 经度（NOTIFY MobilePosition 更新）
-	Latitude    string // 纬度
+func (s *GB28181Server) Start() {
+	s.sipUdpSvr = s.newSipServer("udp")
+	s.sipTcpSvr = s.newSipServer("tcp")
+	go s.startJob()
+}
+func (s *GB28181Server) newSipServer(network string) gosip.Server {
+	srvConf := gosip.ServerConfig{}
+
+	if s.conf.SipIP != "" {
+		srvConf.Host = s.conf.SipIP
+	}
+	sipSvr := gosip.NewServer(srvConf, nil, nil, logger)
+	sipSvr.OnRequest(sip.REGISTER, s.OnRegister)
+	sipSvr.OnRequest(sip.MESSAGE, s.OnMessage)
+	sipSvr.OnRequest(sip.NOTIFY, s.OnNotify)
+	sipSvr.OnRequest(sip.BYE, s.OnBye)
+
+	addr := s.conf.ListenAddr + ":" + strconv.Itoa(int(s.conf.SipPort))
+	err := sipSvr.Listen(network, addr)
+	if err != nil {
+		base.Log.Fatalf("%+v", err)
+	}
+
+	base.Log.Info(" start sip server listen. addr= " + addr + "  network:" + network)
+	return sipSvr
+}
+func (s *GB28181Server) Dispose() {
+	s.disposeOnce.Do(
+		func() {
+			s.MediaServerMap.Range(func(_, value any) bool {
+				mediaServer := value.(*mediaserver.GB28181MediaServer)
+				mediaServer.Dispose()
+				return true
+			})
+			s.sipTcpSvr.Shutdown()
+			s.sipUdpSvr.Shutdown()
+		})
+}
+func (s *GB28181Server) OnStartMediaServer(netWork string, singlePort bool, deviceId string, channelId string) *mediaserver.GB28181MediaServer {
+	isTcpFlag := false
+	if netWork == "tcp" {
+		isTcpFlag = true
+	}
+	var mediasvr *mediaserver.GB28181MediaServer
+	if singlePort {
+		if isTcpFlag {
+			value, ok := s.MediaServerMap.Load(fmt.Sprintf("%s%d", "tcp", s.conf.MediaConfig.ListenPort))
+			if ok {
+				mediasvr = value.(*mediaserver.GB28181MediaServer)
+			}
+		} else {
+			value, ok := s.MediaServerMap.Load(fmt.Sprintf("%s%d", "udp", s.conf.MediaConfig.ListenPort))
+			if ok {
+				mediasvr = value.(*mediaserver.GB28181MediaServer)
+			}
+		}
+	} else {
+		value, ok := s.MediaServerMap.Load(fmt.Sprintf("%s%s", deviceId, channelId))
+		if ok {
+			mediasvr = value.(*mediaserver.GB28181MediaServer)
+		}
+	}
+	var listener net.Listener
+	var err error
+	var port uint16
+	if mediasvr == nil {
+		if singlePort {
+			if isTcpFlag {
+				mediasvr = mediaserver.NewGB28181MediaServer(int(s.conf.MediaConfig.ListenPort), fmt.Sprintf("%s%d", "tcp", s.conf.MediaConfig.ListenPort), s, s.lalServer)
+				listener, err = s.tcpAvailConnPool.ListenWithPort(s.conf.MediaConfig.ListenPort)
+				if err != nil {
+					base.Log.Error("gb28181 media server tcp Listen failed:%s", err.Error())
+					return nil
+				}
+				s.MediaServerMap.Store(fmt.Sprintf("%s%d", "tcp", s.conf.MediaConfig.ListenPort), mediasvr)
+			} else {
+				mediasvr = mediaserver.NewGB28181MediaServer(int(s.conf.MediaConfig.ListenPort), fmt.Sprintf("%s%d", "udp", s.conf.MediaConfig.ListenPort), s, s.lalServer)
+				listener, err = s.udpAvailConnPool.ListenWithPort(s.conf.MediaConfig.ListenPort)
+				if err != nil {
+					base.Log.Error("gb28181 media server udp Listen failed:%s", err.Error())
+					return nil
+				}
+				s.MediaServerMap.Store(fmt.Sprintf("%s%d", "udp", s.conf.MediaConfig.ListenPort), mediasvr)
+			}
+		} else {
+			mediaKey := ""
+			if isTcpFlag {
+				listener, port, err = s.tcpAvailConnPool.Acquire()
+				if err != nil {
+					base.Log.Error("gb28181 media server tcp acquire failed:%s", err.Error())
+					return nil
+				}
+				mediaKey = fmt.Sprintf("%s%d", "tcp", port)
+			} else {
+				listener, port, err = s.udpAvailConnPool.Acquire()
+				if err != nil {
+					base.Log.Error("gb28181 media server udp acquire failed:%s", err.Error())
+					return nil
+				}
+				mediaKey = fmt.Sprintf("%s%d", "udp", port)
+			}
+			mediasvr = mediaserver.NewGB28181MediaServer(int(port), mediaKey, s, s.lalServer)
+			s.MediaServerMap.Store(fmt.Sprintf("%s%s", deviceId, channelId), mediasvr)
+		}
+		go mediasvr.Start(listener)
+	}
+	return mediasvr
+}
+func (s *GB28181Server) OnStopMediaServer(netWork string, singlePort bool, deviceId string, channelId string, StreamName string) error {
+	isTcpFlag := false
+	if netWork == "tcp" {
+		isTcpFlag = true
+	}
+	var mediasvr *mediaserver.GB28181MediaServer
+	if singlePort {
+		if isTcpFlag {
+			key := fmt.Sprintf("%s%d", "tcp", s.conf.MediaConfig.ListenPort)
+			value, ok := s.MediaServerMap.Load(key)
+			if ok {
+				mediasvr = value.(*mediaserver.GB28181MediaServer)
+				s.MediaServerMap.Delete(key)
+			}
+		} else {
+			key := fmt.Sprintf("%s%d", "udp", s.conf.MediaConfig.ListenPort)
+			value, ok := s.MediaServerMap.Load(key)
+			if ok {
+				mediasvr = value.(*mediaserver.GB28181MediaServer)
+				s.MediaServerMap.Delete(key)
+			}
+		}
+	} else {
+		key := fmt.Sprintf("%s%s", deviceId, channelId)
+		value, ok := s.MediaServerMap.Load(key)
+		if ok {
+			mediasvr = value.(*mediaserver.GB28181MediaServer)
+			s.MediaServerMap.Delete(key)
+		}
+	}
+	if mediasvr != nil {
+		if singlePort {
+			mediasvr.CloseConn(StreamName)
+		} else {
+			mediasvr.Dispose()
+		}
+	}
+	return nil
+}
+func (s *GB28181Server) CheckSsrc(ssrc uint32) (*mediaserver.MediaInfo, bool) {
+	var isValidSsrc bool
+	var mediaInfo *mediaserver.MediaInfo
+
+	Devices.Range(func(_, value any) bool {
+		d := value.(*Device)
+		d.channelMap.Range(func(key, value any) bool {
+			ch := value.(*Channel)
+			if ch.MediaInfo.Ssrc == ssrc {
+				isValidSsrc = true
+				mediaInfo = &ch.MediaInfo
+				return false
+			}
+			return true
+		})
+		if isValidSsrc {
+			return false
+		}
+		return true
+	})
+
+	if isValidSsrc {
+		return mediaInfo, true
+	}
+
+	return nil, false
+}
+func (s *GB28181Server) GetMediaInfoByKey(key string) (*mediaserver.MediaInfo, bool) {
+	var isValidMediaInfo bool
+	var mediaInfo *mediaserver.MediaInfo
+
+	Devices.Range(func(_, value any) bool {
+		d := value.(*Device)
+		d.channelMap.Range(func(_, value any) bool {
+			ch := value.(*Channel)
+			if ch.MediaInfo.MediaKey == key {
+				isValidMediaInfo = true
+				mediaInfo = &ch.MediaInfo
+				return false
+			}
+			return true
+		})
+		if isValidMediaInfo {
+			return false
+		}
+		return true
+	})
+
+	if isValidMediaInfo {
+		return mediaInfo, true
+	}
+
+	return nil, false
 }
 
-// Stream 流信息
-type Stream struct {
+func (s *GB28181Server) NotifyClose(streamName string) {
+	var ok bool
+	Devices.Range(func(_, value any) bool {
+		d := value.(*Device)
+		d.channelMap.Range(func(key, value any) bool {
+			ch := value.(*Channel)
+			if ch.MediaInfo.StreamName == streamName {
+				if ch.MediaInfo.IsInvite {
+					ch.Bye(streamName)
+				}
+				ch.MediaInfo.Clear()
+				ok = true
+				return false
+			}
+			return true
+		})
+		if ok {
+			return false
+		}
+		return true
+	})
+}
+
+func (s *GB28181Server) startJob() {
+	statusTick := time.NewTicker(s.HeartbeatInterval / 2)
+	banTick := time.NewTicker(s.RemoveBanInterval)
+	for {
+		select {
+		case <-banTick.C:
+			if s.conf.Username != "" || s.conf.Password != "" {
+				s.removeBanDevice()
+			}
+		case <-statusTick.C:
+			s.statusCheck()
+		}
+	}
+}
+
+func (s *GB28181Server) removeBanDevice() {
+	DeviceRegisterCount.Range(func(key, value interface{}) bool {
+		if value.(int) > MaxRegisterCount {
+			DeviceRegisterCount.Delete(key)
+		}
+		return true
+	})
+}
+
+// statusCheck
+// -  当设备超过 3 倍心跳时间未发送过心跳（通过 UpdateTime 判断）, 视为离线
+// - 	当设备超过注册有效期内为发送过消息，则从设备列表中删除
+// UpdateTime 在设备发送心跳之外的消息也会被更新，相对于 LastKeepaliveAt 更能体现出设备最会一次活跃的时间
+func (s *GB28181Server) statusCheck() {
+	Devices.Range(func(key, value any) bool {
+		d := value.(*Device)
+		if int(time.Since(d.LastKeepaliveAt).Seconds()) > s.keepaliveInterval*3 {
+			Devices.Delete(key)
+			base.Log.Warn("Device Keepalive timeout, id:", d.ID, " LastKeepaliveAt:", d.LastKeepaliveAt, " updateTime:", d.UpdateTime)
+		} else if time.Since(d.UpdateTime) > s.HeartbeatInterval*3 {
+			d.Status = DeviceOfflineStatus
+			d.channelMap.Range(func(key, value any) bool {
+				ch := value.(*Channel)
+				ch.Status = ChannelOffStatus
+				return true
+			})
+			base.Log.Warn("Device offline, id:", d.ID, " registerTime:", d.RegisterTime, " updateTime:", d.UpdateTime)
+		}
+		return true
+	})
+}
+
+// GetDeviceInfos 返回设备及通道列表，供 HTTP API 使用
+func (s *GB28181Server) GetDeviceInfos() (deviceInfos *DeviceInfos) {
+	return s.getDeviceInfos()
+}
+
+func (s *GB28181Server) getDeviceInfos() (deviceInfos *DeviceInfos) {
+	deviceInfos = &DeviceInfos{
+		DeviceItems: make([]*DeviceItem, 0),
+	}
+	Devices.Range(func(key, value any) bool {
+		d := value.(*Device)
+		d.Status = DeviceOfflineStatus
+		deviceItem := &DeviceItem{
+			DeviceId:      d.ID,
+			Name:          d.Name,
+			RegisterTime:  d.RegisterTime.Format("2006-01-02 15:04:05"),
+			KeepaliveTime: d.LastKeepaliveAt.Format("2006-01-02 15:04:05"),
+			Status:        d.Status,
+			Channels:      make([]*ChannelItem, 0),
+		}
+		d.channelMap.Range(func(key, value any) bool {
+			ch := value.(*Channel)
+			channel := &ChannelItem{
+				ChannelId:    ch.ChannelId,
+				Name:         ch.Name,
+				Manufacturer: ch.Manufacturer,
+				Owner:        ch.Owner,
+				CivilCode:    ch.CivilCode,
+				Address:      ch.Address,
+				Status:       ch.Status,
+				Longitude:    ch.Longitude,
+				Latitude:     ch.Latitude,
+				StreamName:   ch.StreamName,
+			}
+			deviceItem.Channels = append(deviceItem.Channels, channel)
+			return true
+		})
+		deviceInfos.DeviceItems = append(deviceInfos.DeviceItems, deviceItem)
+		return true
+	})
+	return deviceInfos
+}
+func (s *GB28181Server) GetAllSyncChannels() {
+	Devices.Range(func(key, value any) bool {
+		d := value.(*Device)
+		d.syncChannels()
+		return true
+	})
+}
+func (s *GB28181Server) GetSyncChannels(deviceId string) bool {
+	if v, ok := Devices.Load(deviceId); ok {
+		d := v.(*Device)
+		d.syncChannels()
+		return true
+	} else {
+		return false
+	}
+}
+func (s *GB28181Server) FindChannel(deviceId string, channelId string) (channel *Channel) {
+	if v, ok := Devices.Load(deviceId); ok {
+		d := v.(*Device)
+		if ch, ok := d.channelMap.Load(channelId); ok {
+			channel = ch.(*Channel)
+			return channel
+		} else {
+			return nil
+		}
+	} else {
+		return nil
+	}
+}
+
+// GetDevice 根据设备 ID 获取设备，供 API 使用
+func (s *GB28181Server) GetDevice(deviceId string) *Device {
+	if v, ok := Devices.Load(deviceId); ok {
+		return v.(*Device)
+	}
+	return nil
+}
+
+// QueryDeviceInfo 向设备查询设备信息
+func (s *GB28181Server) QueryDeviceInfo(deviceId string) {
+	if d := s.GetDevice(deviceId); d != nil {
+		d.QueryDeviceInfo(s.conf)
+	}
+}
+
+// QueryCatalog 向设备查询通道目录
+func (s *GB28181Server) QueryCatalog(deviceId string) int {
+	if d := s.GetDevice(deviceId); d != nil {
+		return d.Catalog(s.conf)
+	}
+	return 0
+}
+
+// StreamInfo 流信息，用于 GetAllStreams
+type StreamInfo struct {
 	DeviceId   string
 	ChannelId  string
 	StreamName string
-	CallId     string
-	SessionId  string
-	Port       int
-	IsTcp      bool
-	StartTime  time.Time
-	IsPlayback bool    // 是否为回放流
-	Scale      float64 // 倍速（回放时使用）
 }
 
-// NewGb28181Server 创建GB28181信令服务器
-func NewGb28181Server(config *ServerConfig) *Gb28181Server {
-	if config.Expires == 0 {
-		config.Expires = 3600
-	}
-	if config.LocalSipDomain == "" {
-		config.LocalSipDomain = config.LocalSipId
-	}
-
-	server := &Gb28181Server{
-		config:             config,
-		devices:            make(map[string]*Device),
-		streams:            make(map[string]*Stream),
-		deviceStreams:      make(map[string]map[string]*Stream),
-		nonces:             make(map[string]string),
-		stopChan:           make(chan struct{}),
-		inviteAckedCallIds: make(map[string]struct{}),
-	}
-
-	// 启动设备状态监控
-	go server.monitorDevices()
-
-	// 启动定时Catalog查询（如果配置了查询间隔）
-	if config.CatalogQueryInterval > 0 {
-		go server.scheduleCatalogQuery()
-	}
-
-	return server
-}
-
-// getDeviceDomain 获取设备域（GB28181标准：使用设备ID的前10位作为区域编码/域）
-func getDeviceDomain(deviceId string) string {
-	if len(deviceId) >= 10 {
-		return deviceId[:10] // 使用前10位作为域（区域编码）
-	}
-	return deviceId // 如果设备ID长度不足10位，使用完整ID
-}
-
-func isPrivateIPv4(ip net.IP) bool {
-	ip4 := ip.To4()
-	if ip4 == nil {
-		return false
-	}
-	// 10.0.0.0/8
-	if ip4[0] == 10 {
+// GetAllStreams 返回当前已邀请（正在拉流）的通道列表
+func (s *GB28181Server) GetAllStreams() (list []StreamInfo) {
+	list = make([]StreamInfo, 0)
+	Devices.Range(func(_, value any) bool {
+		d := value.(*Device)
+		d.channelMap.Range(func(_, value any) bool {
+			ch := value.(*Channel)
+			if ch.MediaInfo.StreamName != "" {
+				list = append(list, StreamInfo{
+					DeviceId:   d.ID,
+					ChannelId:  ch.ChannelId,
+					StreamName: ch.MediaInfo.StreamName,
+				})
+			}
+			return true
+		})
 		return true
-	}
-	// 172.16.0.0/12
-	if ip4[0] == 172 && ip4[1] >= 16 && ip4[1] <= 31 {
-		return true
-	}
-	// 192.168.0.0/16
-	if ip4[0] == 192 && ip4[1] == 168 {
-		return true
-	}
-	// 127.0.0.0/8 loopback
-	if ip4[0] == 127 {
-		return true
-	}
-	// 169.254.0.0/16 link-local
-	if ip4[0] == 169 && ip4[1] == 254 {
-		return true
-	}
-	return false
-}
-
-func pickDeviceAddr(contactIP string, contactPort int, raddr *net.UDPAddr) (ip string, port int) {
-	ip = strings.TrimSpace(contactIP)
-	port = contactPort
-
-	if ip == "" {
-		ip = raddr.IP.String()
-	}
-	if port == 0 {
-		port = raddr.Port
-	}
-
-	// NAT兼容：Contact是内网、raddr是公网时，优先使用raddr（否则INVITE会发到内网）
-	cip := net.ParseIP(ip)
-	if cip != nil && isPrivateIPv4(cip) && raddr != nil && raddr.IP != nil && !isPrivateIPv4(raddr.IP) {
-		ip = raddr.IP.String()
-		port = raddr.Port
-	}
-
-	return ip, port
-}
-
-func (s *Gb28181Server) getServerIdForDevice(deviceId string) string {
-	s.mutex.RLock()
-	d := s.devices[deviceId]
-	s.mutex.RUnlock()
-	if d != nil && d.RegisteredServerId != "" {
-		return d.RegisteredServerId
-	}
-	return s.config.LocalSipId
-}
-
-// SetOnInvite 设置INVITE回调
-func (s *Gb28181Server) SetOnInvite(fn func(deviceId, channelId, streamName string, port int, isTcp bool) error) {
-	s.onInvite = fn
-}
-
-// SetOnBye 设置BYE回调
-func (s *Gb28181Server) SetOnBye(fn func(deviceId, channelId, streamName string) error) {
-	s.onBye = fn
-}
-
-// SetOnReconnect 设置设备重连回调
-func (s *Gb28181Server) SetOnReconnect(fn func(deviceId string) error) {
-	s.onReconnect = fn
-}
-
-// Listen 监听UDP端口
-func (s *Gb28181Server) Listen() error {
-	addr := fmt.Sprintf(":%d", s.config.LocalSipPort)
-
-	// 创建底层UDP连接用于发送
-	udpAddr, err := net.ResolveUDPAddr("udp", addr)
-	if err != nil {
-		return err
-	}
-	udpConn, err := net.ListenUDP("udp", udpAddr)
-	if err != nil {
-		return err
-	}
-	s.udpConn = udpConn
-
-	// 创建UdpConnection用于接收（通过RunLoop）
-	conn, err := nazanet.NewUdpConnection(func(option *nazanet.UdpConnectionOption) {
-		option.LAddr = addr
-		option.Conn = udpConn
 	})
-	if err != nil {
-		udpConn.Close()
-		return err
-	}
-	s.conn = conn
-	s.addr = addr
-	Log.Infof("GB28181 server listen on %s", addr)
-	return nil
+	return list
 }
+func (s *GB28181Server) OnRegister(req sip.Request, tx sip.ServerTransaction) {
+	from, ok := req.From()
+	if !ok || from.Address == nil {
+		base.Log.Error("OnRegister, no from")
+		return
+	}
+	id := from.Address.User().String()
 
-// RunLoop 运行循环
-func (s *Gb28181Server) RunLoop() error {
-	return s.conn.RunLoop(func(b []byte, raddr *net.UDPAddr, err error) bool {
-		if len(b) == 0 && err != nil {
-			return false
+	base.Log.Info("OnRegister", " id:", id, " source:", req.Source(), " req:", req.String())
+
+	isUnregister := false
+	if exps := req.GetHeaders("Expires"); len(exps) > 0 {
+		exp := exps[0]
+		expSec, err := strconv.ParseInt(exp.Value(), 10, 32)
+		if err != nil {
+			base.Log.Error(err)
+			return
 		}
-
-		s.handleMessage(b, raddr)
-		return true
-	})
-}
-
-// handleMessage 处理接收到的SIP消息
-func (s *Gb28181Server) handleMessage(data []byte, raddr *net.UDPAddr) {
-	// 打印原始消息内容（用于调试）
-	Log.Infof("========== GB28181 收到消息 ==========")
-	Log.Infof("来源地址: %s:%d", raddr.IP.String(), raddr.Port)
-	Log.Infof("消息长度: %d 字节", len(data))
-	Log.Infof("原始消息内容:\n%s", string(data))
-	Log.Infof("----------------------------------------")
-
-	msg, err := ParseSipMessage(data)
-	if err != nil {
-		Log.Warnf("parse sip message failed. err=%+v", err)
+		if expSec == 0 {
+			isUnregister = true
+		}
+	} else {
+		base.Log.Error("has no expire header")
 		return
 	}
 
-	// 打印解析后的消息详细信息
-	Log.Infof("解析后的消息信息:")
-	Log.Infof("  方法: %s", msg.Method)
-	Log.Infof("  请求URI: %s", msg.RequestUri)
-	Log.Infof("  状态码: %d", msg.StatusCode)
-	Log.Infof("  状态文本: %s", msg.StatusText)
-	Log.Infof("  消息头:")
-	for key, value := range msg.Headers {
-		Log.Infof("    %s: %s", key, value)
-	}
-	if msg.Body != "" {
-		bodyPreviewLen := 500
-		if len(msg.Body) < bodyPreviewLen {
-			bodyPreviewLen = len(msg.Body)
-		}
-		Log.Infof("  消息体长度: %d 字节", len(msg.Body))
-		Log.Infof("  消息体内容(前%d字节):\n%s", bodyPreviewLen, msg.Body[:bodyPreviewLen])
-		if len(msg.Body) > bodyPreviewLen {
-			Log.Infof("  ... (消息体还有 %d 字节未显示)", len(msg.Body)-bodyPreviewLen)
-		}
-	}
-	Log.Infof("========================================")
+	base.Log.Info("OnRegister", " isUnregister:", isUnregister, " id:", id, " source:", req.Source(), " destination:", req.Destination())
 
-	switch msg.Method {
-	case SipMethodRegister:
-		s.handleRegister(msg, raddr)
-	case SipMethodMessage:
-		s.handleKeepalive(msg, raddr)
-	case SipMethodInvite:
-		s.handleInvite(msg, raddr)
-	case SipMethodAck:
-		s.handleAck(msg, raddr)
-	case SipMethodBye:
-		s.handleBye(msg, raddr)
-	case SipMethodNotify:
-		s.handleNotify(msg, raddr)
-	default:
-		if msg.StatusCode > 0 {
-			s.handleResponse(msg, raddr)
-		}
-	}
-}
-
-// handleRegister 处理REGISTER请求
-func (s *Gb28181Server) handleRegister(msg *SipMessage, raddr *net.UDPAddr) {
-	deviceId := ExtractDeviceId(msg.Headers["from"])
-	if deviceId == "" {
-		Log.Warnf("extract device id failed. from=%s", msg.Headers["from"])
-		s.sendResponse(msg, 400, "Bad Request", raddr)
+	if len(id) != 20 {
+		base.Log.Error("invalid id: ", id)
 		return
 	}
 
-	// 检查是否需要认证
-	authHeader := msg.Headers["authorization"]
-	if s.config.Password != "" {
-		// 如果配置了密码，需要认证
-		if authHeader == "" {
-			// 没有 Authorization 头，发送 401 挑战
-			nonce := GenerateNonce()
-			s.mutex.Lock()
-			s.nonces[deviceId] = nonce
-			s.mutex.Unlock()
+	passAuth := false
+	// 不需要密码情况
+	if s.conf.Username == "" && s.conf.Password == "" {
+		passAuth = true
+	} else {
+		// 需要密码情况 设备第一次上报，返回401和加密算法
+		if hdrs := req.GetHeaders("Authorization"); len(hdrs) > 0 {
+			authenticateHeader := hdrs[0].(*sip.GenericHeader)
+			auth := &Authorization{sip.AuthFromValue(authenticateHeader.Contents)}
 
-			realm := s.config.LocalSipDomain
-			if realm == "" {
-				realm = s.config.LocalSipId
+			// 有些摄像头没有配置用户名的地方，用户名就是摄像头自己的国标id
+			var username string
+			if auth.Username() == id {
+				username = id
+			} else {
+				username = s.conf.Username
 			}
 
-			callId := msg.Headers["call-id"]
-			from := msg.Headers["from"]
-			to := msg.Headers["to"]
-			cseq := msg.Headers["cseq"]
-			via := msg.Headers["via"]
-
-			headers := map[string]string{
-				"Via":              via,
-				"From":             from,
-				"To":               to + ";tag=" + GenerateTag(),
-				"Call-ID":          callId,
-				"CSeq":             cseq,
-				"WWW-Authenticate": BuildWWWAuthenticate(realm, nonce),
-				"Content-Length":   "0",
+			if dc, ok := DeviceRegisterCount.LoadOrStore(id, 1); ok && dc.(int) > MaxRegisterCount {
+				response := sip.NewResponseFromRequest("", req, http.StatusForbidden, "Forbidden", "")
+				tx.Respond(response)
+				return
+			} else {
+				// 设备第二次上报，校验
+				_nonce, loaded := DeviceNonce.Load(id)
+				if loaded && auth.Verify(username, s.conf.Password, s.conf.Realm, _nonce.(string)) {
+					passAuth = true
+				} else {
+					DeviceRegisterCount.Store(id, dc.(int)+1)
+				}
 			}
-
-			response := BuildSipResponse(401, "Unauthorized", headers, "")
-			s.sendRaw(response, raddr)
-			Log.Infof("send 401 challenge to device. device_id=%s", deviceId)
-			return
-		}
-
-		// 验证认证信息
-		auth := ParseAuthorization(authHeader)
-		if auth == nil {
-			Log.Warnf("parse authorization header failed. device_id=%s", deviceId)
-			s.sendResponse(msg, 401, "Unauthorized", raddr)
-			return
-		}
-
-		// 获取存储的 nonce
-		s.mutex.RLock()
-		storedNonce, hasNonce := s.nonces[deviceId]
-		s.mutex.RUnlock()
-
-		if !hasNonce || storedNonce != auth.Nonce {
-			Log.Warnf("invalid nonce. device_id=%s, stored=%s, received=%s", deviceId, storedNonce, auth.Nonce)
-			s.sendResponse(msg, 401, "Unauthorized", raddr)
-			return
-		}
-
-		// 验证用户名和密码
-		username := s.config.Username
-		if username == "" {
-			username = deviceId
-		}
-
-		uri := msg.RequestUri
-		if !auth.Verify(username, s.config.Password, "REGISTER", uri) {
-			Log.Warnf("authentication failed. device_id=%s, username=%s", deviceId, username)
-			s.sendResponse(msg, 403, "Forbidden", raddr)
-			return
-		}
-
-		// 认证成功，清除 nonce
-		s.mutex.Lock()
-		delete(s.nonces, deviceId)
-		s.mutex.Unlock()
-
-		Log.Infof("device authentication success. device_id=%s", deviceId)
-	}
-
-	// 提取Contact信息
-	contact := msg.Headers["contact"]
-	contactIp, contactPort := ExtractContactAddr(contact)
-	ip, port := pickDeviceAddr(contactIp, contactPort, raddr)
-
-	// 提取设备注册时的平台注册信息（REGISTER Request-URI）
-	registeredServerId, registeredServerDomain := ExtractServerFromRequestUri(msg.RequestUri)
-
-	// 获取过期时间
-	expires := s.config.Expires
-	if expHeader := msg.Headers["expires"]; expHeader != "" {
-		if exp, err := strconv.Atoi(expHeader); err == nil && exp > 0 {
-			expires = exp
 		}
 	}
 
-	// 检查是否是注销请求（Expires=0）
-	if expires == 0 {
-		// 设备注销：标记为离线，但不删除设备，以便API接口能查询到离线设备信息
-		s.mutex.Lock()
-		device, exists := s.devices[deviceId]
-		if exists {
-			// 更新设备状态为离线
-			device.Status = "offline"
-			Log.Infof("device unregister, marked as offline. device_id=%s", deviceId)
+	if passAuth {
+		var d *Device
+		if isUnregister {
+			tmpd, ok := Devices.LoadAndDelete(id)
+			if ok {
+				base.Log.Info("Unregister Device, id:", id)
+				d = tmpd.(*Device)
+			} else {
+				return
+			}
 		} else {
-			Log.Warnf("device unregister but device not found. device_id=%s", deviceId)
-		}
-		// 清除认证nonce
-		delete(s.nonces, deviceId)
-		s.mutex.Unlock()
-
-		// 发送200 OK响应
-		callId := msg.Headers["call-id"]
-		from := msg.Headers["from"]
-		to := msg.Headers["to"]
-		cseq := msg.Headers["cseq"]
-		via := msg.Headers["via"]
-
-		headers := map[string]string{
-			"Via":            via,
-			"From":           from,
-			"To":             to + ";tag=" + GenerateTag(),
-			"Call-ID":        callId,
-			"CSeq":           cseq,
-			"Contact":        fmt.Sprintf("<sip:%s@%s>", s.config.LocalSipId, s.config.LocalSipDomain),
-			"Expires":        "0",
-			"Content-Length": "0",
+			if v, ok := Devices.Load(id); ok {
+				d = v.(*Device)
+				s.RecoverDevice(d, req)
+			} else {
+				d = s.StoreDevice(id, req)
+			}
 		}
 
-		response := BuildSipResponse(200, "OK", headers, "")
-		s.sendRaw(response, raddr)
-		return
+		DeviceNonce.Delete(id)
+		DeviceRegisterCount.Delete(id)
+		resp := sip.NewResponseFromRequest("", req, http.StatusOK, "OK", "")
+		to, _ := resp.To()
+		resp.ReplaceHeaders("To", []sip.Header{&sip.ToHeader{Address: to.Address, Params: sip.NewParams().Add("tag", sip.String{Str: RandNumString(9)})}})
+		resp.RemoveHeader("Allow")
+		expires := sip.Expires(3600)
+		resp.AppendHeader(&expires)
+		resp.AppendHeader(&sip.GenericHeader{
+			HeaderName: "Date",
+			Contents:   time.Now().Format(TIME_LAYOUT),
+		})
+		_ = tx.Respond(resp)
+
+		if !isUnregister {
+			//订阅设备更新
+			go d.syncChannels()
+		}
+	} else {
+		base.Log.Info("OnRegister unauthorized, id:", id, " source:", req.Source(), " destination:", req.Destination())
+		response := sip.NewResponseFromRequest("", req, http.StatusUnauthorized, "Unauthorized", "")
+		_nonce, _ := DeviceNonce.LoadOrStore(id, RandNumString(32))
+		auth := fmt.Sprintf(
+			`Digest realm="%s",algorithm=%s,nonce="%s"`,
+			s.conf.Realm,
+			"MD5",
+			_nonce.(string),
+		)
+		response.AppendHeader(&sip.GenericHeader{
+			HeaderName: "WWW-Authenticate",
+			Contents:   auth,
+		})
+		_ = tx.Respond(response)
 	}
+}
 
-	// 更新或创建设备
-	s.mutex.Lock()
-	device, exists := s.devices[deviceId]
-	isReconnect := exists // 设备已存在，说明是重连
-	if !exists {
-		device = &Device{
-			DeviceId:     deviceId,
-			DeviceName:   deviceId,
-			Channels:     make(map[string]*Channel),
+func (s *GB28181Server) OnMessage(req sip.Request, tx sip.ServerTransaction) {
+	from, _ := req.From()
+	id := from.Address.User().String()
+	base.Log.Info("SIP<-OnMessage, id:", id, " source:", req.Source(), " req:", req.String())
+	temp := &struct {
+		XMLName      xml.Name
+		CmdType      string
+		SN           int // 请求序列号，一般用于对应 request 和 response
+		DeviceID     string
+		DeviceName   string
+		Manufacturer string
+		Model        string
+		Channel      string
+		DeviceList   []ChannelInfo `xml:"DeviceList>Item"`
+		SumNum       int           // 录像结果的总数 SumNum，录像结果会按照多条消息返回，可用于判断是否全部返回
+	}{}
+	decoder := xml.NewDecoder(bytes.NewReader([]byte(req.Body())))
+	decoder.CharsetReader = charset.NewReaderLabel
+	err := decoder.Decode(temp)
+	if err != nil {
+		err = DecodeGbk(temp, []byte(req.Body()))
+		if err != nil {
+			base.Log.Error("decode catelog err:", err)
+		}
+	}
+	if v, ok := Devices.Load(id); ok {
+		d := v.(*Device)
+		switch d.Status {
+		case DeviceOfflineStatus, DeviceRecoverStatus:
+			s.RecoverDevice(d, req)
+			//go d.syncChannels(s.conf)
+		case DeviceRegisterStatus:
+			d.Status = DeviceOnlineStatus
+		}
+		d.UpdateTime = time.Now()
+
+		var body string
+		switch temp.CmdType {
+		case "Keepalive":
+			d.LastKeepaliveAt = time.Now()
+			//callID !="" 说明是订阅的事件类型信息
+			//if d.lastSyncTime.IsZero() {
+			//	go d.syncChannels(s.conf)
+			//}
+		case "Catalog":
+			d.UpdateChannels(temp.DeviceList...)
+		case "DeviceInfo":
+			// 主设备信息
+			d.Name = temp.DeviceName
+			d.Manufacturer = temp.Manufacturer
+			d.Model = temp.Model
+		case "Alarm":
+			d.Status = DeviceAlarmedStatus
+			body = BuildAlarmResponseXML(d.ID)
+		default:
+			base.Log.Warn("Not supported CmdType, CmdType:", temp.CmdType, " body:", req.Body())
+			response := sip.NewResponseFromRequest("", req, http.StatusBadRequest, "", "")
+			tx.Respond(response)
+			return
+		}
+
+		tx.Respond(sip.NewResponseFromRequest("", req, http.StatusOK, "OK", body))
+	} else {
+		if s.conf.QuickLogin {
+			switch temp.CmdType {
+			case "Keepalive":
+				d := s.StoreDevice(id, req)
+				d.LastKeepaliveAt = time.Now()
+				tx.Respond(sip.NewResponseFromRequest("", req, http.StatusOK, "OK", ""))
+				go d.syncChannels()
+				return
+			}
+		}
+
+		base.Log.Warn("Unauthorized message, device not found, id:", id)
+		tx.Respond(sip.NewResponseFromRequest("", req, http.StatusBadRequest, "device not found", ""))
+	}
+}
+
+func (s *GB28181Server) OnNotify(req sip.Request, tx sip.ServerTransaction) {
+	from, _ := req.From()
+	id := from.Address.User().String()
+	if v, ok := Devices.Load(id); ok {
+		d := v.(*Device)
+		d.UpdateTime = time.Now()
+		temp := &struct {
+			XMLName    xml.Name
+			CmdType    string
+			DeviceID   string
+			Time       string           //位置订阅-GPS时间
+			Longitude  string           //位置订阅-经度
+			Latitude   string           //位置订阅-维度
+			DeviceList []*notifyMessage `xml:"DeviceList>Item"` //目录订阅
+		}{}
+		decoder := xml.NewDecoder(bytes.NewReader([]byte(req.Body())))
+		decoder.CharsetReader = charset.NewReaderLabel
+		err := decoder.Decode(temp)
+		if err != nil {
+			err = DecodeGbk(temp, []byte(req.Body()))
+			if err != nil {
+				base.Log.Error("decode catelog failed, err:", err)
+			}
+		}
+		var body string
+		switch temp.CmdType {
+		case "Catalog":
+			//目录状态
+			d.UpdateChannelStatus(temp.DeviceList, s.conf)
+		case "MobilePosition":
+			//更新channel的坐标
+			d.UpdateChannelPosition(temp.DeviceID, temp.Time, temp.Longitude, temp.Latitude)
+		default:
+			base.Log.Warn("Not supported CmdType, cmdType:", temp.CmdType, " body:", req.Body())
+			response := sip.NewResponseFromRequest("", req, http.StatusBadRequest, "", "")
+			tx.Respond(response)
+			return
+		}
+
+		tx.Respond(sip.NewResponseFromRequest("", req, http.StatusOK, "OK", body))
+	} else {
+		tx.Respond(sip.NewResponseFromRequest("", req, http.StatusBadRequest, "device not found", ""))
+	}
+}
+
+func (s *GB28181Server) OnBye(req sip.Request, tx sip.ServerTransaction) {
+	callIdStr := ""
+	if callId, ok := req.CallID(); ok {
+		callIdStr = callId.Value()
+	}
+	from, _ := req.From()
+	devId := from.Address.User().String()
+	if _d, ok := Devices.Load(devId); ok {
+		d := _d.(*Device)
+		d.channelMap.Range(func(key, value any) bool {
+			ch := value.(*Channel)
+			if ch.GetCallId() == callIdStr {
+				ch.byeClear()
+				return false
+			}
+			return true
+		})
+	}
+	tx.Respond(sip.NewResponseFromRequest("", req, http.StatusOK, "OK", ""))
+}
+
+func (s *GB28181Server) StoreDevice(id string, req sip.Request) (d *Device) {
+	from, _ := req.From()
+	deviceAddr := sip.Address{
+		DisplayName: from.DisplayName,
+		Uri:         from.Address,
+	}
+	deviceIp := req.Source()
+	if _d, ok := Devices.Load(id); ok {
+		d = _d.(*Device)
+		d.UpdateTime = time.Now()
+		d.NetAddr = deviceIp
+		d.addr = deviceAddr
+		d.network = strings.ToLower(req.Transport())
+		if d.network == "udp" {
+			d.sipSvr = s.sipUdpSvr
+		} else {
+			d.sipSvr = s.sipTcpSvr
+		}
+		base.Log.Info("UpdateDevice, netaddr:", d.NetAddr)
+	} else {
+		servIp := req.Recipient().Host()
+
+		sipIp := s.conf.SipIP
+		mediaIp := s.conf.MediaConfig.MediaIp
+		d = &Device{
+			ID:           id,
 			RegisterTime: time.Now(),
+			UpdateTime:   time.Now(),
+			Status:       DeviceRegisterStatus,
+			addr:         deviceAddr,
+			sipIP:        sipIp,
+			mediaIP:      mediaIp,
+			NetAddr:      deviceIp,
+			conf:         s.conf,
+			network:      strings.ToLower(req.Transport()),
 		}
-		s.devices[deviceId] = device
-	}
-	device.Ip = ip
-	device.Port = port
-	device.RemoteIP = raddr.IP.String()
-	device.RemotePort = raddr.Port
-	if registeredServerId != "" {
-		device.RegisteredServerId = registeredServerId
-		device.RegisteredServerDomain = registeredServerDomain
-	}
-	device.Status = "online"
-	device.KeepaliveTime = time.Now()
-	s.mutex.Unlock()
-
-	Log.Infof("device register. device_id=%s, ip=%s, port=%d, expires=%d, is_reconnect=%v, reg_server_id=%s, reg_server_domain=%s",
-		deviceId, ip, port, expires, isReconnect, registeredServerId, registeredServerDomain)
-
-	// 设备注册成功后，主动查询通道列表
-	go s.queryCatalog(deviceId)
-
-	// 如果是设备重连，尝试恢复拉流任务
-	if isReconnect && s.onReconnect != nil {
-		go func() {
-			// 延迟一点时间，等待设备完全上线
-			time.Sleep(500 * time.Millisecond)
-			if err := s.onReconnect(deviceId); err != nil {
-				Log.Warnf("device reconnect callback failed. device_id=%s, err=%+v", deviceId, err)
-			}
-		}()
-	}
-
-	// 发送200 OK响应
-	callId := msg.Headers["call-id"]
-	from := msg.Headers["from"]
-	to := msg.Headers["to"]
-	cseq := msg.Headers["cseq"]
-	via := msg.Headers["via"]
-
-	headers := map[string]string{
-		"Via":            via,
-		"From":           from,
-		"To":             to + ";tag=" + GenerateTag(),
-		"Call-ID":        callId,
-		"CSeq":           cseq,
-		"Contact":        fmt.Sprintf("<sip:%s@%s>", s.config.LocalSipId, s.config.LocalSipDomain),
-		"Expires":        fmt.Sprintf("%d", expires),
-		"Content-Length": "0",
-	}
-
-	response := BuildSipResponse(200, "OK", headers, "")
-	s.sendRaw(response, raddr)
-}
-
-// handleKeepalive 处理MESSAGE请求（心跳或响应）
-//
-// 与 lalmax 保持一致：即使服务重启、未收到 REGISTER，也可以从 keepalive 中解析并更新设备注册信息。
-// - 从 From/Request-URI/Via/Contact 中提取设备ID、平台ID、设备IP和端口等信息
-// - 如果设备不存在，则创建 Device 记录，相当于“从心跳中恢复注册信息”
-// - 如果设备已存在，则更新 IP/Port 和心跳时间
-func (s *Gb28181Server) handleKeepalive(msg *SipMessage, raddr *net.UDPAddr) {
-	deviceId := ExtractDeviceId(msg.Headers["from"])
-	if deviceId == "" {
-		s.sendResponse(msg, 400, "Bad Request", raddr)
-		return
-	}
-
-	// 从 Contact 提取设备的真实 IP 和端口，兼容 NAT
-	contact := msg.Headers["contact"]
-	contactIp, contactPort := ExtractContactAddr(contact)
-	ip, port := pickDeviceAddr(contactIp, contactPort, raddr)
-
-	// 从 Request-URI 提取平台注册信息（serverId / serverDomain）
-	registeredServerId, registeredServerDomain := ExtractServerFromRequestUri(msg.RequestUri)
-
-	now := time.Now()
-
-	s.mutex.Lock()
-	device, exists := s.devices[deviceId]
-	isNewDevice := !exists
-	if !exists {
-		// 设备不存在时，仿照 lalmax，从 keepalive 中"注册"设备
-		device = &Device{
-			DeviceId:     deviceId,
-			DeviceName:   deviceId,
-			Channels:     make(map[string]*Channel),
-			RegisterTime: now,
-		}
-		s.devices[deviceId] = device
-		Log.Infof("create device from keepalive. device_id=%s, ip=%s, port=%d, reg_server_id=%s, reg_server_domain=%s",
-			deviceId, ip, port, registeredServerId, registeredServerDomain)
-	}
-
-	// 更新设备的网络和平台注册信息
-	device.Ip = ip
-	device.Port = port
-	device.RemoteIP = raddr.IP.String()
-	device.RemotePort = raddr.Port
-	if registeredServerId != "" {
-		device.RegisteredServerId = registeredServerId
-		device.RegisteredServerDomain = registeredServerDomain
-	}
-
-	// 计算心跳间隔（基于客户端实际心跳时间）
-	if !device.KeepaliveTime.IsZero() {
-		interval := now.Sub(device.KeepaliveTime)
-		// 如果间隔合理（10秒到300秒之间），更新心跳间隔
-		// 使用加权平均，平滑处理心跳间隔变化
-		if interval >= 10*time.Second && interval <= 300*time.Second {
-			if device.KeepaliveInterval == 0 {
-				device.KeepaliveInterval = interval
-			} else {
-				// 加权平均：新值占30%，旧值占70%，平滑处理
-				device.KeepaliveInterval = time.Duration(float64(device.KeepaliveInterval)*0.7 + float64(interval)*0.3)
-			}
-		}
-	}
-	device.KeepaliveTime = now
-	device.Status = "online"
-	s.mutex.Unlock()
-
-	// 如果是从 keepalive 新创建的设备，主动查询通道列表（与 REGISTER 处理保持一致）
-	if isNewDevice {
-		go s.queryCatalog(deviceId)
-	}
-
-	// 检查消息体并按 CmdType 分发（与 lalmax 一致：Keepalive/Catalog/DeviceInfo/Alarm）
-	body := msg.Body
-	var messageResponseBody string
-	if len(body) > 0 {
-		Log.Infof("========== 收到 MESSAGE ==========")
-		Log.Infof("设备ID: %s, 来源: %s:%d, 体长: %d", deviceId, raddr.IP.String(), raddr.Port, len(body))
-
-		bodyLower := strings.ToLower(body)
-		isCatalogResponse := strings.Contains(body, "<?xml") &&
-			(strings.Contains(bodyLower, "<response>") || strings.Contains(body, "<Response>")) &&
-			strings.Contains(bodyLower, "<cmdtype>catalog</cmdtype>")
-		if !isCatalogResponse {
-			isCatalogResponse = strings.Contains(body, "<?xml") && strings.Contains(bodyLower, "<cmdtype>catalog</cmdtype>")
-		}
-
-		if isCatalogResponse {
-			Log.Infof("检测到 Catalog 响应，开始解析. device_id=%s", deviceId)
-			s.parseCatalogResponse(deviceId, body)
-		} else if strings.Contains(body, "<?xml") {
-			// 解析 CmdType，处理 DeviceInfo / Alarm（参考 lalmax OnMessage）
-			var msgBody struct {
-				CmdType      string `xml:"CmdType"`
-				SN           string `xml:"SN"`
-				DeviceName   string `xml:"DeviceName"`
-				Manufacturer string `xml:"Manufacturer"`
-				Model        string `xml:"Model"`
-			}
-			if err := ParseXMLResponse([]byte(body), &msgBody); err == nil {
-				switch strings.TrimSpace(msgBody.CmdType) {
-				case "DeviceInfo":
-					s.mutex.Lock()
-					if d, ok := s.devices[deviceId]; ok {
-						if msgBody.DeviceName != "" {
-							d.DeviceName = msgBody.DeviceName
-						}
-						if msgBody.Manufacturer != "" {
-							d.Manufacturer = msgBody.Manufacturer
-						}
-						if msgBody.Model != "" {
-							d.Model = msgBody.Model
-						}
-					}
-					s.mutex.Unlock()
-				case "Alarm":
-					s.mutex.Lock()
-					if d, ok := s.devices[deviceId]; ok {
-						d.Status = "alarmed"
-					}
-					s.mutex.Unlock()
-					sn := msgBody.SN
-					if sn == "" {
-						sn = strconv.Itoa(GenerateSN())
-					}
-					messageResponseBody = BuildAlarmResponseXML(deviceId, "Alarm", sn)
-				}
-			}
-		}
-	}
-
-	if messageResponseBody != "" {
-		s.sendResponseWithBody(msg, 200, "OK", messageResponseBody, raddr)
-	} else {
-		s.sendResponse(msg, 200, "OK", raddr)
-	}
-}
-
-// handleInvite 处理INVITE请求（设备主动推流）
-func (s *Gb28181Server) handleInvite(msg *SipMessage, raddr *net.UDPAddr) {
-	deviceId := ExtractDeviceId(msg.Headers["from"])
-	if deviceId == "" {
-		s.sendResponse(msg, 400, "Bad Request", raddr)
-		return
-	}
-
-	// 从SDP中提取信息（目前暂时不需要解析SDP）
-	callId := msg.Headers["call-id"]
-
-	// 检查设备是否存在
-	s.mutex.RLock()
-	_, exists := s.devices[deviceId]
-	s.mutex.RUnlock()
-
-	if !exists {
-		Log.Warnf("receive INVITE from unregistered device. device_id=%s", deviceId)
-		s.sendResponse(msg, 404, "Not Found", raddr)
-		return
-	}
-
-	Log.Infof("receive INVITE from device. device_id=%s, call_id=%s", deviceId, callId)
-
-	// 检查是否已经存在相同的Call-ID的流
-	s.mutex.RLock()
-	var existingStream *Stream
-	for _, stream := range s.streams {
-		if stream.CallId == callId {
-			existingStream = stream
-			break
-		}
-	}
-	s.mutex.RUnlock()
-
-	var targetStream *Stream
-	if existingStream != nil {
-		Log.Warnf("receive duplicate INVITE with same Call-ID. device_id=%s, call_id=%s, existing_stream=%s", deviceId, callId, existingStream.StreamName)
-		targetStream = existingStream
-		// 发送200 OK响应（即使流已存在）
-	} else {
-		// 解析SDP获取RTP端口等信息（简化处理）
-		// 实际应该解析SDP获取RTP信息，这里使用默认端口段分配端口
-		// 生成流名称（使用device_id+channel_id，设备主动推流时channel_id使用device_id）
-		channelId := deviceId // 简化处理，使用设备ID作为通道ID
-		streamName := deviceId + channelId
-
-		// 从端口池分配一个端口用于接收RTP数据（端口为0表示自动分配）
-		port := 0
-
-		// 记录流信息（设备主动推流）
-		s.mutex.Lock()
-		stream := &Stream{
-			DeviceId:   deviceId,
-			ChannelId:  channelId,
-			StreamName: streamName,
-			CallId:     callId,
-			Port:       port,
-			IsTcp:      false,
-			StartTime:  time.Now(),
-		}
-		s.streams[streamName] = stream
-		// 更新设备流索引
-		if s.deviceStreams[deviceId] == nil {
-			s.deviceStreams[deviceId] = make(map[string]*Stream)
-		}
-		s.deviceStreams[deviceId][streamName] = stream
-		targetStream = stream
-		s.mutex.Unlock()
-
-		Log.Infof("accept INVITE from device. device_id=%s, stream_name=%s", deviceId, streamName)
-	}
-
-	// 发送200 OK响应，构建包含服务器RTP端口的SDP
-	// 注意：对于设备主动推流，服务器需要在SDP中告诉设备使用哪个端口接收RTP
-	// 这里先使用端口0（自动分配），实际端口会在创建RTP Pub Session时确定
-	from := msg.Headers["from"]
-	to := msg.Headers["to"]
-	cseq := msg.Headers["cseq"]
-	via := msg.Headers["via"]
-	tag := GenerateTag()
-
-	headers := map[string]string{
-		"Via":            via,
-		"From":           from,
-		"To":             to + ";tag=" + tag,
-		"Call-ID":        callId,
-		"CSeq":           cseq,
-		"Contact":        fmt.Sprintf("<sip:%s@%s>", s.config.LocalSipId, s.config.LocalSipDomain),
-		"Content-Type":   "application/sdp",
-		"Content-Length": "0", // 先设置为0，后面会更新
-	}
-
-	// 构建SDP响应（对齐 lalmax：o=channelId、y=ssrc、无 f=）
-	ssrc := fmt.Sprintf("%010d", time.Now().UnixNano()%1e10)
-	responseSdp := s.buildSdp(targetStream.Port, targetStream.IsTcp, targetStream.ChannelId, ssrc)
-	headers["Content-Length"] = fmt.Sprintf("%d", len(responseSdp))
-	response := BuildSipResponse(200, "OK", headers, responseSdp)
-	s.sendRaw(response, raddr)
-}
-
-// handleAck 处理ACK请求
-func (s *Gb28181Server) handleAck(msg *SipMessage, raddr *net.UDPAddr) {
-	// ACK通常不需要响应
-	callId := msg.Headers["call-id"]
-	Log.Debugf("receive ACK from %s, call_id=%s", raddr.String(), callId)
-
-	// 对于设备主动推流，收到ACK后应该调用onInvite回调创建RTP Pub Session
-	// 查找对应的流
-	s.mutex.RLock()
-	var targetStream *Stream
-	for _, stream := range s.streams {
-		if stream.CallId == callId {
-			targetStream = stream
-			break
-		}
-	}
-	s.mutex.RUnlock()
-
-	if targetStream != nil && s.onInvite != nil {
-		// 设备主动推流：收到ACK后调用回调创建RTP Pub Session
-		Log.Infof("receive ACK for device push stream. call_id=%s, stream_name=%s", callId, targetStream.StreamName)
-		if err := s.onInvite(targetStream.DeviceId, targetStream.ChannelId, targetStream.StreamName, targetStream.Port, targetStream.IsTcp); err != nil {
-			Log.Warnf("onInvite callback failed after ACK. err=%+v", err)
-		}
-	}
-}
-
-// handleBye 处理BYE请求
-func (s *Gb28181Server) handleBye(msg *SipMessage, raddr *net.UDPAddr) {
-	deviceId := ExtractDeviceId(msg.Headers["from"])
-	if deviceId == "" {
-		s.sendResponse(msg, 400, "Bad Request", raddr)
-		return
-	}
-
-	Log.Infof("receive BYE from device. device_id=%s", deviceId)
-
-	// 查找并停止对应的流（使用索引优化）
-	s.mutex.Lock()
-	if deviceStreams, ok := s.deviceStreams[deviceId]; ok {
-		streamNames := make([]string, 0, len(deviceStreams))
-		streams := make([]*Stream, 0, len(deviceStreams))
-		for streamName, stream := range deviceStreams {
-			streamNames = append(streamNames, streamName)
-			streams = append(streams, stream)
-		}
-		// 先释放锁，调用回调
-		s.mutex.Unlock()
-
-		if s.onBye != nil {
-			for i, streamName := range streamNames {
-				s.onBye(streams[i].DeviceId, streams[i].ChannelId, streamName)
-			}
-		}
-
-		// 重新加锁删除
-		s.mutex.Lock()
-		for _, streamName := range streamNames {
-			delete(s.streams, streamName)
-		}
-		delete(s.deviceStreams, deviceId)
-		s.mutex.Unlock()
-	} else {
-		s.mutex.Unlock()
-	}
-
-	// 发送200 OK响应
-	callId := msg.Headers["call-id"]
-	from := msg.Headers["from"]
-	to := msg.Headers["to"]
-	cseq := msg.Headers["cseq"]
-	via := msg.Headers["via"]
-
-	headers := map[string]string{
-		"Via":            via,
-		"From":           from,
-		"To":             to + ";tag=" + GenerateTag(),
-		"Call-ID":        callId,
-		"CSeq":           cseq,
-		"Content-Length": "0",
-	}
-
-	response := BuildSipResponse(200, "OK", headers, "")
-	s.sendRaw(response, raddr)
-}
-
-// handleNotify 处理 NOTIFY 请求（参考 lalmax OnNotify：目录状态、MobilePosition）
-func (s *Gb28181Server) handleNotify(msg *SipMessage, raddr *net.UDPAddr) {
-	deviceId := ExtractDeviceId(msg.Headers["from"])
-	if deviceId == "" {
-		s.sendResponse(msg, 400, "Bad Request", raddr)
-		return
-	}
-
-	s.mutex.RLock()
-	_, exists := s.devices[deviceId]
-	s.mutex.RUnlock()
-	if !exists {
-		Log.Warnf("receive NOTIFY from unknown device. device_id=%s", deviceId)
-		s.sendResponse(msg, 404, "Not Found", raddr)
-		return
-	}
-
-	body := msg.Body
-	if body == "" || !strings.Contains(body, "<?xml") {
-		s.sendResponse(msg, 200, "OK", raddr)
-		return
-	}
-
-	// 解析 NOTIFY 体：CmdType + Catalog(DeviceList) 或 MobilePosition
-	type NotifyItem struct {
-		DeviceID  string `xml:"DeviceID"`
-		Name      string `xml:"Name"`
-		Event     string `xml:"Event"` // ON,OFF,VLOST,DEFECT,ADD,DEL,UPDATE
-		Status    string `xml:"Status"`
-		ParentID  string `xml:"ParentID"`
-		Longitude string `xml:"Longitude"`
-		Latitude  string `xml:"Latitude"`
-	}
-	var notifyStruct struct {
-		CmdType    string `xml:"CmdType"`
-		DeviceID   string `xml:"DeviceID"`
-		Time       string `xml:"Time"`
-		Longitude  string `xml:"Longitude"`
-		Latitude   string `xml:"Latitude"`
-		DeviceList struct {
-			Items []NotifyItem `xml:"Item"`
-		} `xml:"DeviceList"`
-	}
-	if err := ParseXMLResponse([]byte(body), &notifyStruct); err != nil {
-		Log.Warnf("parse NOTIFY body failed. device_id=%s, err=%v", deviceId, err)
-		s.sendResponse(msg, 200, "OK", raddr)
-		return
-	}
-
-	switch notifyStruct.CmdType {
-	case "Catalog":
-		for _, item := range notifyStruct.DeviceList.Items {
-			s.updateChannelStatus(deviceId, item.DeviceID, item.Event, item.Name, item.Status)
-		}
-	case "MobilePosition":
-		chId := notifyStruct.DeviceID
-		if chId == "" {
-			chId = deviceId
-		}
-		s.updateChannelPosition(deviceId, chId, notifyStruct.Longitude, notifyStruct.Latitude)
-	default:
-		Log.Debugf("NOTIFY CmdType not handled. device_id=%s, cmd_type=%s", deviceId, notifyStruct.CmdType)
-	}
-
-	s.sendResponse(msg, 200, "OK", raddr)
-}
-
-// updateChannelStatus 根据 NOTIFY Catalog 事件更新通道状态（ON/OFF/ADD/DEL/UPDATE）
-func (s *Gb28181Server) updateChannelStatus(deviceId, channelId, event, name, status string) {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-	device, ok := s.devices[deviceId]
-	if !ok {
-		return
-	}
-	if device.Channels == nil {
-		device.Channels = make(map[string]*Channel)
-	}
-	switch event {
-	case "ON":
-		if ch, ok := device.Channels[channelId]; ok {
-			ch.Status = "ON"
-		}
-	case "OFF", "VLOST", "DEFECT":
-		if ch, ok := device.Channels[channelId]; ok {
-			ch.Status = "OFF"
-		}
-	case "ADD":
-		device.Channels[channelId] = &Channel{ChannelId: channelId, ChannelName: name, Status: status}
-		if status == "" {
-			device.Channels[channelId].Status = "ON"
-		}
-	case "DEL":
-		delete(device.Channels, channelId)
-	case "UPDATE":
-		if ch, ok := device.Channels[channelId]; ok {
-			if name != "" {
-				ch.ChannelName = name
-			}
-			if status != "" {
-				ch.Status = status
-			}
+		if d.network == "udp" {
+			d.sipSvr = s.sipUdpSvr
 		} else {
-			device.Channels[channelId] = &Channel{ChannelId: channelId, ChannelName: name, Status: status}
+			d.sipSvr = s.sipTcpSvr
 		}
+		d.WithMediaServer(s)
+		base.Log.Info("StoreDevice, deviceIp:", deviceIp, " serverIp:", servIp, " mediaIp:", mediaIp, " sipIP:", sipIp)
+		Devices.Store(id, d)
 	}
+
+	return d
 }
 
-// updateChannelPosition 更新通道或设备经纬度（NOTIFY MobilePosition）
-func (s *Gb28181Server) updateChannelPosition(deviceId, channelId, longitude, latitude string) {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-	device, ok := s.devices[deviceId]
-	if !ok {
-		return
+func (s *GB28181Server) RecoverDevice(d *Device, req sip.Request) {
+	from, _ := req.From()
+	d.addr = sip.Address{
+		DisplayName: from.DisplayName,
+		Uri:         from.Address,
 	}
-	if ch, ok := device.Channels[channelId]; ok {
-		ch.Longitude = longitude
-		ch.Latitude = latitude
-	} else if channelId == deviceId {
-		// 设备级位置可存到第一个通道或扩展 Device，此处仅更新已有通道
-		if len(device.Channels) > 0 {
-			for _, ch := range device.Channels {
-				ch.Longitude = longitude
-				ch.Latitude = latitude
-				break
-			}
-		}
-	}
-}
-
-// handleResponse 处理响应消息
-func (s *Gb28181Server) handleResponse(msg *SipMessage, raddr *net.UDPAddr) {
-	Log.Infof("========== 收到 SIP 响应 ==========")
-	Log.Infof("状态码: %d %s", msg.StatusCode, msg.StatusText)
-	Log.Infof("来源地址: %s:%d", raddr.IP.String(), raddr.Port)
-	callId := msg.Headers["call-id"]
-	Log.Infof("Call-ID: %s", callId)
-	if msg.Body != "" {
-		Log.Infof("响应体长度: %d 字节", len(msg.Body))
-		Log.Infof("响应体内容:\n%s", msg.Body)
-	}
-	Log.Infof("========================================")
-
-	// 处理200 OK响应
-	if msg.StatusCode == 200 {
-		// 检查响应体中是否包含 Catalog XML（某些设备可能在 200 OK 响应中返回 Catalog）
-		body := msg.Body
-		if len(body) > 0 && strings.Contains(body, "<?xml") {
-			bodyLower := strings.ToLower(body)
-			if strings.Contains(bodyLower, "<cmdtype>catalog</cmdtype>") {
-				deviceId := ExtractDeviceId(msg.Headers["from"])
-				if deviceId != "" {
-					Log.Infof("在 200 OK 响应中检测到 Catalog XML，开始解析. device_id=%s", deviceId)
-					s.parseCatalogResponse(deviceId, body)
-				} else {
-					Log.Warnf("在 200 OK 响应中检测到 Catalog XML，但无法提取设备ID. from=%s", msg.Headers["from"])
-				}
-			} else if strings.Contains(bodyLower, "<cmdtype>recordinfo</cmdtype>") {
-				// 录像列表查询的 200 OK 响应（参考 lalmax RecordInfo）
-				deviceId := ExtractDeviceId(msg.Headers["from"])
-				s.parseRecordInfoResponse(deviceId, body)
-			}
-		}
-
-		// 从To头中提取Call-ID对应的流信息
-		callId := msg.Headers["call-id"]
-
-		// 查找对应的流
-		s.mutex.RLock()
-		var targetStream *Stream
-		for _, stream := range s.streams {
-			if stream.CallId == callId {
-				targetStream = stream
-				break
-			}
-		}
-		s.mutex.RUnlock()
-
-		if targetStream != nil {
-			// 解析SDP获取RTP信息
-			sdp := msg.Body
-			Log.Infof("receive INVITE 200 OK response. call_id=%s, stream_name=%s, sdp_len=%d", callId, targetStream.StreamName, len(sdp))
-
-			// 检查设备是否存在
-			s.mutex.RLock()
-			_, deviceExists := s.devices[targetStream.DeviceId]
-			s.mutex.RUnlock()
-
-			if deviceExists {
-				// 发送ACK请求，完成INVITE三次握手
-				// ACK的Request-URI使用200 OK响应中的Contact头，如果没有则使用INVITE请求中的To头
-				contact := msg.Headers["contact"]
-				var requestUri string
-				if contact != "" {
-					// 从Contact头提取URI
-					// Contact: <sip:34020000001310000001@192.168.1.100:5060>
-					re := regexp.MustCompile(`<([^>]+)>`)
-					matches := re.FindStringSubmatch(contact)
-					if len(matches) > 1 {
-						requestUri = matches[1]
-					} else {
-						requestUri = contact
-					}
-				} else {
-					// 使用To头构建Request-URI
-					toHeader := msg.Headers["to"]
-					// To: <sip:34020000001310000001@192.168.1.100:5060>;tag=xxx
-					re := regexp.MustCompile(`<([^>]+)>`)
-					matches := re.FindStringSubmatch(toHeader)
-					if len(matches) > 1 {
-						requestUri = matches[1]
-					} else {
-						// 使用域格式构建Request-URI（符合GB28181标准）
-						deviceDomain := getDeviceDomain(targetStream.DeviceId)
-						requestUri = fmt.Sprintf("sip:%s@%s", targetStream.ChannelId, deviceDomain)
-					}
-				}
-
-				// 构建ACK请求（From头使用域格式，符合GB28181标准）
-				from := fmt.Sprintf("<sip:%s@%s>", s.config.LocalSipId, s.config.LocalSipDomain)
-				toHeader := msg.Headers["to"] // 使用200 OK响应中的To头（包含tag）
-				cseq := msg.Headers["cseq"]
-				// CSeq可能包含方法名，ACK只需要数字
-				cseqNum := cseq
-				if strings.Contains(cseq, " ") {
-					cseqNum = strings.Split(cseq, " ")[0]
-				}
-				via := msg.Headers["via"]
-
-				ackHeaders := map[string]string{
-					"Via":            via,
-					"From":           from,
-					"To":             toHeader, // 使用200 OK响应中的To头（包含tag）
-					"Call-ID":        callId,
-					"CSeq":           cseqNum + " ACK",
-					"Content-Length": "0",
-				}
-
-				ackRequest := BuildSipRequest(SipMethodAck, requestUri, ackHeaders, "")
-
-				// ACK 发往 Contact 的 host:port，便于 NAT/部分设备正确收包；若无法解析则用 200 OK 来源地址
-				ackDest := raddr
-				if contact != "" {
-					if host, port := ExtractContactAddr(contact); host != "" && port > 0 {
-						if a, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", host, port)); err == nil {
-							ackDest = a
-							Log.Infof("send ACK to Contact address. contact=%s, ack_dest=%s:%d", contact, host, port)
-						}
-					}
-				}
-				s.sendRaw(ackRequest, ackDest)
-
-				// 同一 Call-ID 只触发一次 onInvite（设备可能多次重传 200 OK）
-				s.mutex.Lock()
-				firstAck := true
-				if _, ok := s.inviteAckedCallIds[callId]; ok {
-					firstAck = false
-				} else {
-					s.inviteAckedCallIds[callId] = struct{}{}
-					if len(s.inviteAckedCallIds) > 500 {
-						s.inviteAckedCallIds = make(map[string]struct{})
-					}
-				}
-				s.mutex.Unlock()
-
-				Log.Infof("send ACK to device. device_id=%s, channel_id=%s, stream_name=%s, first_ack=%v", targetStream.DeviceId, targetStream.ChannelId, targetStream.StreamName, firstAck)
-
-				// 仅首次 200 OK 时调用 onInvite，避免重传导致重复处理
-				if firstAck && s.onInvite != nil {
-					if err := s.onInvite(targetStream.DeviceId, targetStream.ChannelId, targetStream.StreamName, targetStream.Port, targetStream.IsTcp); err != nil {
-						Log.Warnf("onInvite callback failed. err=%+v", err)
-					}
-				}
-			}
-		}
-	}
-}
-
-// sendResponse 发送响应
-func (s *Gb28181Server) sendResponse(req *SipMessage, statusCode int, statusText string, raddr *net.UDPAddr) {
-	s.sendResponseWithBody(req, statusCode, statusText, "", raddr)
-}
-
-// sendResponseWithBody 发送带 body 的 SIP 响应（如 Alarm 的 200 OK 需返回 XML）
-func (s *Gb28181Server) sendResponseWithBody(req *SipMessage, statusCode int, statusText string, body string, raddr *net.UDPAddr) {
-	callId := req.Headers["call-id"]
-	from := req.Headers["from"]
-	to := req.Headers["to"]
-	cseq := req.Headers["cseq"]
-	via := req.Headers["via"]
-
-	contentLength := "0"
-	if body != "" {
-		contentLength = strconv.Itoa(len(body))
-	}
-	headers := map[string]string{
-		"Via":            via,
-		"From":           from,
-		"To":             to + ";tag=" + GenerateTag(),
-		"Call-ID":        callId,
-		"CSeq":           cseq,
-		"Content-Length": contentLength,
-	}
-
-	response := BuildSipResponse(statusCode, statusText, headers, body)
-	s.sendRaw(response, raddr)
-}
-
-// sendRaw 发送原始消息
-func (s *Gb28181Server) sendRaw(data string, raddr *net.UDPAddr) {
-	if s.udpConn == nil {
-		Log.Warnf("udp connection not initialized")
-		return
-	}
-	_, err := s.udpConn.WriteToUDP([]byte(data), raddr)
-	if err != nil {
-		Log.Warnf("send sip message failed. err=%+v", err)
-	}
-}
-
-// Invite 主动邀请设备推流
-// streamType: 0=主码流，1=辅码流
-func (s *Gb28181Server) Invite(deviceId, channelId, streamName string, port int, isTcp bool, streamType int) error {
-	s.mutex.RLock()
-	device, exists := s.devices[deviceId]
-	s.mutex.RUnlock()
-
-	if !exists {
-		return fmt.Errorf("device not found: %s", deviceId)
-	}
-
-	// 生成Call-ID和Tag
-	callId := GenerateCallId()
-	branch := GenerateBranch()
-
-	// 构建INVITE请求（使用设备注册时的域，兼容 domain 为 3402000000.spvmn.cn 等场景）
-	deviceDomain := getDeviceDomain(deviceId)
-	if device.RegisteredServerDomain != "" {
-		deviceDomain = device.RegisteredServerDomain
-	}
-	requestUri := fmt.Sprintf("sip:%s@%s", channelId, deviceDomain)
-	serverId := s.getServerIdForDevice(deviceId)
-	from := fmt.Sprintf("<sip:%s@%s>", serverId, s.config.LocalSipDomain)
-	to := fmt.Sprintf("<sip:%s@%s>", channelId, deviceDomain)
-
-	// SSRC 与 lalmax 一致：10 位数字，Subject 为 channelId:ssrc,serverId:0
-	ssrc := fmt.Sprintf("%010d", time.Now().UnixNano()%1e10)
-	sdp := s.buildSdp(port, isTcp, channelId, ssrc)
-
-	headers := map[string]string{
-		"Via":            fmt.Sprintf("SIP/2.0/UDP %s:%d;branch=%s;rport", s.config.LocalSipIp, s.config.LocalSipPort, branch),
-		"From":           from + ";tag=" + GenerateTag(),
-		"To":             to,
-		"Call-ID":        callId,
-		"CSeq":           "1 INVITE",
-		"Contact":        fmt.Sprintf("<sip:%s@%s>", serverId, s.config.LocalSipDomain),
-		"Content-Type":   "application/sdp",
-		"Content-Length": fmt.Sprintf("%d", len(sdp)),
-		"Subject":        fmt.Sprintf("%s:%s,%s:0", channelId, ssrc, serverId),
-		"Max-Forwards":   "70",
-	}
-
-	request := BuildSipRequest(SipMethodInvite, requestUri, headers, sdp)
-
-	// 发送请求：优先使用最后一次收到的源地址(raddr)记录，避免Contact是内网IP导致INVITE发错
-	targetIP := device.Ip
-	targetPort := device.Port
-	if device.RemoteIP != "" && device.RemotePort != 0 {
-		targetIP = device.RemoteIP
-		targetPort = device.RemotePort
-	}
-	addr := &net.UDPAddr{
-		IP:   net.ParseIP(targetIP),
-		Port: targetPort,
-	}
-	s.sendRaw(request, addr)
-
-	// 记录流信息
-	s.mutex.Lock()
-	stream := &Stream{
-		DeviceId:   deviceId,
-		ChannelId:  channelId,
-		StreamName: streamName,
-		CallId:     callId,
-		Port:       port,
-		IsTcp:      isTcp,
-		StartTime:  time.Now(),
-	}
-	s.streams[streamName] = stream
-	// 更新设备流索引
-	if s.deviceStreams[deviceId] == nil {
-		s.deviceStreams[deviceId] = make(map[string]*Stream)
-	}
-	s.deviceStreams[deviceId][streamName] = stream
-	s.mutex.Unlock()
-
-	Log.Infof("send INVITE to device. device_id=%s, channel_id=%s, stream_name=%s, port=%d", deviceId, channelId, streamName, port)
-
-	return nil
-}
-
-// Bye 停止设备推流
-func (s *Gb28181Server) Bye(deviceId, channelId, streamName string) error {
-	s.mutex.Lock()
-	stream, exists := s.streams[streamName]
-	if !exists {
-		s.mutex.Unlock()
-		return fmt.Errorf("stream not found: %s", streamName)
-	}
-	delete(s.streams, streamName)
-	// 从设备流索引中删除
-	if deviceStreams, ok := s.deviceStreams[deviceId]; ok {
-		delete(deviceStreams, streamName)
-		if len(deviceStreams) == 0 {
-			delete(s.deviceStreams, deviceId)
-		}
-	}
-	s.mutex.Unlock()
-
-	s.mutex.RLock()
-	device, exists := s.devices[deviceId]
-	s.mutex.RUnlock()
-
-	if !exists {
-		return fmt.Errorf("device not found: %s", deviceId)
-	}
-
-	// 构建BYE请求（使用域格式，符合GB28181标准）
-	deviceDomain := getDeviceDomain(deviceId)
-	requestUri := fmt.Sprintf("sip:%s@%s", channelId, deviceDomain)
-	from := fmt.Sprintf("<sip:%s@%s>", s.config.LocalSipId, s.config.LocalSipDomain)
-	to := fmt.Sprintf("<sip:%s@%s>", channelId, deviceDomain)
-
-	branch := GenerateBranch()
-	headers := map[string]string{
-		"Via":            fmt.Sprintf("SIP/2.0/UDP %s:%d;branch=%s;rport", s.config.LocalSipIp, s.config.LocalSipPort, branch),
-		"From":           from + ";tag=" + GenerateTag(),
-		"To":             to,
-		"Call-ID":        stream.CallId,
-		"CSeq":           "1 BYE",
-		"Content-Length": "0",
-		"Max-Forwards":   "70",
-	}
-
-	request := BuildSipRequest(SipMethodBye, requestUri, headers, "")
-
-	// 发送请求
-	addr := &net.UDPAddr{
-		IP:   net.ParseIP(device.Ip),
-		Port: device.Port,
-	}
-	s.sendRaw(request, addr)
-
-	Log.Infof("send BYE to device. device_id=%s, channel_id=%s, stream_name=%s", deviceId, channelId, streamName)
-
-	return nil
-}
-
-// buildSdp 构建SDP消息（对齐 lalmax 可播放实现：o=channelId、y=ssrc、无 f=）
-func (s *Gb28181Server) buildSdp(port int, isTcp bool, channelId string, ssrc string) string {
-	protocol := "RTP/AVP"
-	if isTcp {
-		protocol = "TCP/RTP/AVP"
-	}
-
-	mediaIp := s.config.MediaIp
-	if mediaIp == "" {
-		mediaIp = s.config.LocalSipIp
-	}
-
-	// 确定视频编码格式和RTP payload type
-	videoCodec := s.config.VideoCodec
-	if videoCodec == "" {
-		videoCodec = "H264" // 默认H264
-	}
-
-	// GB28181标准RTP payload type映射
-	// 96: PS (Program Stream)
-	// 98: H264
-	// 97: MPEG4
-	// 99: H265 (如果支持)
-	var payloadTypes []string
-	var rtpmapLines []string
-
-	// 根据配置的编码格式添加对应的payload type
-	switch strings.ToUpper(videoCodec) {
-	case "H265", "HEVC":
-		payloadTypes = []string{"96", "99"} // PS和H265
-		rtpmapLines = []string{
-			"a=rtpmap:96 PS/90000",
-			"a=rtpmap:99 H265/90000",
-		}
-		// H265的fmtp参数
-		if s.config.VideoWidth > 0 && s.config.VideoHeight > 0 {
-			rtpmapLines = append(rtpmapLines, fmt.Sprintf("a=fmtp:99 profile-id=1;level-id=93;sprop-sps=;sprop-pps="))
-		}
-	case "H264":
-		fallthrough
-	default:
-		payloadTypes = []string{"96", "98"} // PS和H264
-		rtpmapLines = []string{
-			"a=rtpmap:96 PS/90000",
-			"a=rtpmap:98 H264/90000",
-		}
-		// H264的fmtp参数
-		// 构建H264的fmtp参数（即使没有指定分辨率也添加基本参数）
-		fmtpParams := "a=fmtp:98 "
-		params := []string{}
-
-		// profile-level-id参数
-		profileLevelId := "42E028" // 默认baseline profile level 3.1
-		if s.config.VideoProfile != "" {
-			// 根据profile设置profile-level-id的前4位
-			// baseline: 42E0, main: 4D00, high: 6400
-			profileMap := map[string]string{
-				"baseline": "42E0",
-				"main":     "4D00",
-				"high":     "6400",
-			}
-			if profilePrefix, ok := profileMap[strings.ToLower(s.config.VideoProfile)]; ok {
-				// 根据level设置后2位
-				levelMap := map[string]string{
-					"3.0": "1F", "3.1": "28", "3.2": "2A",
-					"4.0": "33", "4.1": "29", "4.2": "2A",
-				}
-				if levelId, ok := levelMap[s.config.VideoLevel]; ok {
-					profileLevelId = profilePrefix + levelId
-				} else {
-					profileLevelId = profilePrefix + "28" // 默认level 3.1
-				}
-			}
-		} else if s.config.VideoLevel != "" {
-			// 只指定了level，使用默认baseline profile
-			levelMap := map[string]string{
-				"3.0": "1F", "3.1": "28", "3.2": "2A",
-				"4.0": "33", "4.1": "29", "4.2": "2A",
-			}
-			if levelId, ok := levelMap[s.config.VideoLevel]; ok {
-				profileLevelId = "42E0" + levelId
-			}
-		}
-		params = append(params, "profile-level-id="+profileLevelId)
-
-		// packetization-mode参数（1表示非交错模式，0表示交错模式）
-		params = append(params, "packetization-mode=1")
-
-		// 如果指定了分辨率，可以添加sprop-parameter-sets（可选）
-		// 注意：实际使用时，sprop-parameter-sets应该从SPS/PPS中提取
-
-		fmtpParams += strings.Join(params, ";")
-		rtpmapLines = append(rtpmapLines, fmtpParams)
-	}
-
-	// 兼容性优先：与 lalmax 一致，只声明 PS/96，无 f= 字段
-	payloadTypes = []string{"96"}
-	rtpmapLines = []string{"a=rtpmap:96 PS/90000"}
-
-	// 构建SDP主体（o=channelId、s=Play、t=0 0、y=ssrc，无 f=）
-	sdp := fmt.Sprintf(`v=0
-o=%s 0 0 IN IP4 %s
-s=Play
-c=IN IP4 %s
-t=0 0
-m=video %d %s %s
-a=recvonly
-y=%s
-`, channelId, mediaIp, mediaIp, port, protocol, strings.Join(payloadTypes, " "), ssrc)
-
-	// 海康等设备的TCP媒体兼容：必须带 setup/connection，平台通常作为被动端(passive)监听等待设备连接
-	if isTcp {
-		sdp += "a=setup:passive\n"
-		sdp += "a=connection:new\n"
-	}
-
-	// 添加rtpmap行
-	for _, line := range rtpmapLines {
-		sdp += line + "\n"
-	}
-
-	// 添加视频参数（如果指定了）
-	if s.config.VideoWidth > 0 && s.config.VideoHeight > 0 {
-		sdp += fmt.Sprintf("a=resolution:%dx%d\n", s.config.VideoWidth, s.config.VideoHeight)
-	}
-
-	if s.config.VideoFramerate > 0 {
-		sdp += fmt.Sprintf("a=framerate:%.2f\n", float64(s.config.VideoFramerate))
-	}
-
-	if s.config.VideoBitrate > 0 {
-		// 码率通常通过fmtp参数传递，但也可以单独指定
-		sdp += fmt.Sprintf("a=bitrate:%d\n", s.config.VideoBitrate)
-	}
-
-	return sdp
-}
-
-// buildPlaybackSdp 构建回放SDP消息（对齐 lalmax 可播放实现：o=channelId、s=Play、t=NTP、无 u/f 字段）
-func (s *Gb28181Server) buildPlaybackSdp(port int, isTcp bool, channelId string, startTime, endTime time.Time, scale float64, ssrc string) string {
-	protocol := "RTP/AVP"
-	if isTcp {
-		protocol = "TCP/RTP/AVP"
-	}
-
-	mediaIp := s.config.MediaIp
-	if mediaIp == "" {
-		mediaIp = s.config.LocalSipIp
-	}
-
-	// 兼容性优先：回放与 lalmax 一致，只声明 PS/96
-	payloadTypes := []string{"96"}
-	rtpmapLines := []string{"a=rtpmap:96 PS/90000"}
-
-	// 将时间转换为NTP时间戳（秒，与 lalmax InviteOptions.String() 的 t= 一致）
-	ntpStart := uint64(startTime.Unix()) + 2208988800
-	ntpEnd := uint64(endTime.Unix()) + 2208988800
-
-	// SDP 格式对齐 lalmax channel.Invite：o=channelId、s=Play、t=start end、无 u= 和 f=
-	sdp := fmt.Sprintf(`v=0
-o=%s 0 0 IN IP4 %s
-s=Play
-c=IN IP4 %s
-t=%d %d
-m=video %d %s %s
-a=recvonly
-y=%s
-`, channelId, mediaIp, mediaIp, ntpStart, ntpEnd, port, protocol, strings.Join(payloadTypes, " "), ssrc)
-
-	if isTcp {
-		sdp += "a=setup:passive\n"
-		sdp += "a=connection:new\n"
-	}
-
-	// 添加rtpmap行
-	for _, line := range rtpmapLines {
-		sdp += line + "\n"
-	}
-
-	// 添加倍速参数（GB28181标准：通过SDP的a字段携带倍速参数）
-	// 格式：a=scale:<value>，value为倍速值（1.0=正常速度，2.0=2倍速等）
-	if scale > 0 && scale != 1.0 {
-		sdp += fmt.Sprintf("a=scale:%.2f\n", scale)
+	deviceIp := req.Source()
+	servIp := req.Recipient().Host()
+	sipIp := s.conf.SipIP
+	mediaIp := sipIp
+	d.Status = DeviceRegisterStatus
+	d.sipIP = sipIp
+	d.mediaIP = mediaIp
+	d.NetAddr = deviceIp
+	d.network = strings.ToLower(req.Transport())
+	if d.network == "udp" {
+		d.sipSvr = s.sipUdpSvr
 	} else {
-		// 默认1倍速（GB28181标准：不携带倍速参数时默认为1倍速）
-		sdp += "a=scale:1.0\n"
+		d.sipSvr = s.sipTcpSvr
 	}
+	d.UpdateTime = time.Now()
 
-	// 添加视频参数（如果指定了）
-	if s.config.VideoWidth > 0 && s.config.VideoHeight > 0 {
-		sdp += fmt.Sprintf("a=resolution:%dx%d\n", s.config.VideoWidth, s.config.VideoHeight)
-	}
-	if s.config.VideoFramerate > 0 {
-		sdp += fmt.Sprintf("a=framerate:%.2f\n", float64(s.config.VideoFramerate))
-	}
-	if s.config.VideoBitrate > 0 {
-		sdp += fmt.Sprintf("a=bitrate:%d\n", s.config.VideoBitrate)
-	}
-
-	return sdp
+	base.Log.Info("RecoverDevice, deviceIp:", deviceIp, " serverIp:", servIp, " mediaIp:", mediaIp, " sipIP:", sipIp)
 }
 
-// Playback 回放请求
-func (s *Gb28181Server) Playback(deviceId, channelId, streamName string, port int, isTcp bool, startTime, endTime time.Time, scale float64) error {
-	s.mutex.RLock()
-	device, exists := s.devices[deviceId]
-	s.mutex.RUnlock()
-
-	if !exists {
-		return fmt.Errorf("device not found: %s", deviceId)
-	}
-
-	// 验证时间范围
-	if endTime.Before(startTime) || endTime.Equal(startTime) {
-		return fmt.Errorf("invalid time range: end_time must be after start_time")
-	}
-
-	// 生成Call-ID和Tag
-	callId := GenerateCallId()
-	branch := GenerateBranch()
-
-	// 构建INVITE请求（使用域格式，符合GB28181标准）
-	deviceDomain := getDeviceDomain(deviceId)
-	requestUri := fmt.Sprintf("sip:%s@%s", channelId, deviceDomain)
-	serverId := s.getServerIdForDevice(deviceId)
-	from := fmt.Sprintf("<sip:%s@%s>", serverId, s.config.LocalSipDomain)
-	to := fmt.Sprintf("<sip:%s@%s>", channelId, deviceDomain)
-
-	// SSRC 与 lalmax 一致：10 位数字，与 SDP 的 y= 及 Subject 中的 channelId:ssrc 保持一致
-	ssrc := fmt.Sprintf("%010d", time.Now().UnixNano()%1e10)
-	sdp := s.buildPlaybackSdp(port, isTcp, channelId, startTime, endTime, scale, ssrc)
-
-	// Subject 对齐 lalmax：channelId:ssrc,serverId:0（可正常播放的实现）
-	subject := fmt.Sprintf("%s:%s,%s:0", channelId, ssrc, serverId)
-
-	headers := map[string]string{
-		"Via":            fmt.Sprintf("SIP/2.0/UDP %s:%d;branch=%s;rport", s.config.LocalSipIp, s.config.LocalSipPort, branch),
-		"From":           from + ";tag=" + GenerateTag(),
-		"To":             to,
-		"Call-ID":        callId,
-		"CSeq":           "1 INVITE",
-		"Contact":        fmt.Sprintf("<sip:%s@%s>", serverId, s.config.LocalSipDomain),
-		"Content-Type":   "application/sdp",
-		"Content-Length": fmt.Sprintf("%d", len(sdp)),
-		"Subject":        subject,
-		"Max-Forwards":   "70",
-		"User-Agent":     "LALServer",
-	}
-
-	request := BuildSipRequest(SipMethodInvite, requestUri, headers, sdp)
-
-	// 发送请求：与 Invite 一致，优先使用 RemoteIP/RemotePort（raddr），避免 NAT 下 INVITE 发到内网导致回放失败
-	targetIP := device.Ip
-	targetPort := device.Port
-	if device.RemoteIP != "" && device.RemotePort != 0 {
-		targetIP = device.RemoteIP
-		targetPort = device.RemotePort
-	}
-	addr := &net.UDPAddr{
-		IP:   net.ParseIP(targetIP),
-		Port: targetPort,
-	}
-	s.sendRaw(request, addr)
-
-	// 记录流信息（标记为回放流）
-	s.mutex.Lock()
-	stream := &Stream{
-		DeviceId:   deviceId,
-		ChannelId:  channelId,
-		StreamName: streamName,
-		CallId:     callId,
-		Port:       port,
-		IsTcp:      isTcp,
-		StartTime:  time.Now(),
-		IsPlayback: true,
-		Scale:      scale,
-	}
-	s.streams[streamName] = stream
-	// 更新设备流索引
-	if s.deviceStreams[deviceId] == nil {
-		s.deviceStreams[deviceId] = make(map[string]*Stream)
-	}
-	s.deviceStreams[deviceId][streamName] = stream
-	s.mutex.Unlock()
-
-	Log.Infof("send PLAYBACK INVITE to device. device_id=%s, channel_id=%s, stream_name=%s, port=%d, start_time=%v, end_time=%v, scale=%.2f",
-		deviceId, channelId, streamName, port, startTime, endTime, scale)
-
-	return nil
-}
-
-// GetDevices 获取所有设备
-func (s *Gb28181Server) GetDevices() []*Device {
-	s.mutex.RLock()
-	defer s.mutex.RUnlock()
-
-	devices := make([]*Device, 0, len(s.devices))
-	for _, device := range s.devices {
-		devices = append(devices, device)
-	}
-	return devices
-}
-
-// GetDevice 获取设备
-func (s *Gb28181Server) GetDevice(deviceId string) *Device {
-	s.mutex.RLock()
-	defer s.mutex.RUnlock()
-	return s.devices[deviceId]
-}
-
-// FindChannel 根据设备ID和通道ID查找通道（参考 lalmax FindChannel）
-func (s *Gb28181Server) FindChannel(deviceId, channelId string) *Channel {
-	s.mutex.RLock()
-	defer s.mutex.RUnlock()
-	device, ok := s.devices[deviceId]
-	if !ok || device.Channels == nil {
-		return nil
-	}
-	return device.Channels[channelId]
-}
-
-// GetStream 获取流信息
-func (s *Gb28181Server) GetStream(streamName string) *Stream {
-	s.mutex.RLock()
-	defer s.mutex.RUnlock()
-	return s.streams[streamName]
-}
-
-// HasStream 检查流是否存在
-func (s *Gb28181Server) HasStream(streamName string) bool {
-	s.mutex.RLock()
-	defer s.mutex.RUnlock()
-	_, exists := s.streams[streamName]
-	return exists
-}
-
-// GetStreamsByDeviceId 获取设备的所有流（使用索引优化）
-func (s *Gb28181Server) GetStreamsByDeviceId(deviceId string) []*Stream {
-	s.mutex.RLock()
-	defer s.mutex.RUnlock()
-
-	deviceStreams, exists := s.deviceStreams[deviceId]
-	if !exists || len(deviceStreams) == 0 {
-		return nil
-	}
-
-	streams := make([]*Stream, 0, len(deviceStreams))
-	for _, stream := range deviceStreams {
-		streams = append(streams, stream)
-	}
-	return streams
-}
-
-// GetAllStreams 获取所有流信息
-func (s *Gb28181Server) GetAllStreams() []*Stream {
-	s.mutex.RLock()
-	defer s.mutex.RUnlock()
-
-	streams := make([]*Stream, 0, len(s.streams))
-	for _, stream := range s.streams {
-		streams = append(streams, stream)
-	}
-	return streams
-}
-
-// QueryDeviceInfo 查询设备信息（发送查询请求）
-func (s *Gb28181Server) QueryDeviceInfo(deviceId string) error {
-	s.mutex.RLock()
-	device, exists := s.devices[deviceId]
-	s.mutex.RUnlock()
-
-	if !exists {
-		return fmt.Errorf("device not found: %s", deviceId)
-	}
-
-	// 构建设备信息查询XML
-	deviceInfoXml := BuildDeviceInfoQueryXML(deviceId, GenerateSN())
-
-	// 构建MESSAGE请求（使用域格式，符合GB28181标准）
-	deviceDomain := getDeviceDomain(deviceId)
-	requestUri := fmt.Sprintf("sip:%s@%s", deviceId, deviceDomain)
-	from := fmt.Sprintf("<sip:%s@%s>", s.config.LocalSipId, s.config.LocalSipDomain)
-	to := fmt.Sprintf("<sip:%s@%s>", deviceId, deviceDomain)
-
-	branch := GenerateBranch()
-	callId := GenerateCallId()
-	headers := map[string]string{
-		"Via":            fmt.Sprintf("SIP/2.0/UDP %s:%d;branch=%s;rport", s.config.LocalSipIp, s.config.LocalSipPort, branch),
-		"From":           from + ";tag=" + GenerateTag(),
-		"To":             to,
-		"Call-ID":        callId,
-		"CSeq":           "1 MESSAGE",
-		"Max-Forwards":   "70",
-		"Content-Type":   "Application/MANSCDP+xml",
-		"Content-Length": fmt.Sprintf("%d", len(deviceInfoXml)),
-	}
-
-	request := BuildSipRequest(SipMethodMessage, requestUri, headers, deviceInfoXml)
-
-	// 发送请求
-	addr := &net.UDPAddr{
-		IP:   net.ParseIP(device.Ip),
-		Port: device.Port,
-	}
-	s.sendRaw(request, addr)
-
-	Log.Infof("send device info query to device. device_id=%s", deviceId)
-	return nil
-}
-
-// QueryDeviceStatus 查询设备状态（发送查询请求）
-func (s *Gb28181Server) QueryDeviceStatus(deviceId string) error {
-	s.mutex.RLock()
-	device, exists := s.devices[deviceId]
-	s.mutex.RUnlock()
-
-	if !exists {
-		return fmt.Errorf("device not found: %s", deviceId)
-	}
-
-	// 构建设备状态查询XML
-	deviceStatusXml := BuildDeviceStatusQueryXML(deviceId, GenerateSN())
-
-	// 构建MESSAGE请求（使用域格式，符合GB28181标准）
-	deviceDomain := getDeviceDomain(deviceId)
-	requestUri := fmt.Sprintf("sip:%s@%s", deviceId, deviceDomain)
-	from := fmt.Sprintf("<sip:%s@%s>", s.config.LocalSipId, s.config.LocalSipDomain)
-	to := fmt.Sprintf("<sip:%s@%s>", deviceId, deviceDomain)
-
-	branch := GenerateBranch()
-	callId := GenerateCallId()
-	headers := map[string]string{
-		"Via":            fmt.Sprintf("SIP/2.0/UDP %s:%d;branch=%s;rport", s.config.LocalSipIp, s.config.LocalSipPort, branch),
-		"From":           from + ";tag=" + GenerateTag(),
-		"To":             to,
-		"Call-ID":        callId,
-		"CSeq":           "1 MESSAGE",
-		"Max-Forwards":   "70",
-		"Content-Type":   "Application/MANSCDP+xml",
-		"Content-Length": fmt.Sprintf("%d", len(deviceStatusXml)),
-	}
-
-	request := BuildSipRequest(SipMethodMessage, requestUri, headers, deviceStatusXml)
-
-	// 发送请求
-	addr := &net.UDPAddr{
-		IP:   net.ParseIP(device.Ip),
-		Port: device.Port,
-	}
-	s.sendRaw(request, addr)
-
-	Log.Infof("send device status query to device. device_id=%s", deviceId)
-	return nil
-}
-
-// QueryRecordInfo 查询录像文件列表（参考 lalmax RecordInfoXML，设备 200 OK 体可能返回录像列表）
-// startTime/endTime 格式建议：2006-01-02T15:04:05；channelId 为空时使用 deviceId
-func (s *Gb28181Server) QueryRecordInfo(deviceId, channelId string, startTime, endTime time.Time) error {
-	s.mutex.RLock()
-	device, exists := s.devices[deviceId]
-	s.mutex.RUnlock()
-
-	if !exists {
-		return fmt.Errorf("device not found: %s", deviceId)
-	}
-
-	st := startTime.Format("2006-01-02T15:04:05")
-	et := endTime.Format("2006-01-02T15:04:05")
-	recordInfoXml := BuildRecordInfoQueryXML(deviceId, channelId, GenerateSN(), st, et)
-
-	deviceDomain := getDeviceDomain(deviceId)
-	requestUri := fmt.Sprintf("sip:%s@%s", deviceId, deviceDomain)
-	from := fmt.Sprintf("<sip:%s@%s>", s.config.LocalSipId, s.config.LocalSipDomain)
-	to := fmt.Sprintf("<sip:%s@%s>", deviceId, deviceDomain)
-
-	branch := GenerateBranch()
-	callId := GenerateCallId()
-	headers := map[string]string{
-		"Via":            fmt.Sprintf("SIP/2.0/UDP %s:%d;branch=%s;rport", s.config.LocalSipIp, s.config.LocalSipPort, branch),
-		"From":           from + ";tag=" + GenerateTag(),
-		"To":             to,
-		"Call-ID":        callId,
-		"CSeq":           "1 MESSAGE",
-		"Max-Forwards":   "70",
-		"Content-Type":   "Application/MANSCDP+xml",
-		"Content-Length": fmt.Sprintf("%d", len(recordInfoXml)),
-	}
-
-	request := BuildSipRequest(SipMethodMessage, requestUri, headers, recordInfoXml)
-
-	targetIP, targetPort := device.Ip, device.Port
-	if device.RemoteIP != "" && device.RemotePort != 0 {
-		targetIP, targetPort = device.RemoteIP, device.RemotePort
-	}
-	addr := &net.UDPAddr{IP: net.ParseIP(targetIP), Port: targetPort}
-	s.sendRaw(request, addr)
-
-	Log.Infof("send record info query to device. device_id=%s, channel_id=%s, start=%s, end=%s", deviceId, channelId, st, et)
-	return nil
-}
-
-// QueryCatalog 查询通道列表（发送查询请求）
-func (s *Gb28181Server) QueryCatalog(deviceId string) error {
-	s.mutex.RLock()
-	_, exists := s.devices[deviceId]
-	s.mutex.RUnlock()
-
-	if !exists {
-		return fmt.Errorf("device not found: %s", deviceId)
-	}
-
-	// 调用内部查询方法
-	go s.queryCatalog(deviceId)
-	return nil
-}
-
-// queryCatalog 查询设备通道列表
-func (s *Gb28181Server) queryCatalog(deviceId string) {
-	time.Sleep(100 * time.Millisecond) // 等待注册完成
-
-	s.mutex.RLock()
-	device, exists := s.devices[deviceId]
-	s.mutex.RUnlock()
-
-	if !exists {
-		Log.Warnf("query catalog failed: device not found. device_id=%s", deviceId)
-		return
-	}
-
-	Log.Infof("========== 开始查询设备通道列表 ==========")
-	Log.Infof("设备ID: %s, IP: %s, Port: %d", deviceId, device.Ip, device.Port)
-
-	// 构建CATALOG查询XML（GB28181标准格式）
-	catalogXml := BuildCatalogQueryXML(deviceId, GenerateSN())
-
-	// 构建MESSAGE请求（参考 lalmax 实现）
-	// Request-URI 和 To 使用域格式（使用 LocalSipDomain，如 3402000000.spvmn.cn）
-	// From 和 Contact 使用 IP:Port 格式
-	requestUri := fmt.Sprintf("sip:%s@%s", deviceId, s.config.LocalSipDomain)
-	serverId := s.getServerIdForDevice(deviceId)
-	// From 使用 IP:Port 格式（物理地址）
-	from := fmt.Sprintf("<sip:%s@%s:%d>", serverId, s.config.LocalSipIp, s.config.LocalSipPort)
-	// To 使用域格式（逻辑地址，使用 LocalSipDomain）
-	to := fmt.Sprintf("<sip:%s@%s>", deviceId, s.config.LocalSipDomain)
-
-	branch := GenerateBranch()
-	callId := GenerateCallId()
-	tag := GenerateTag()
-
-	// 按照 lalmax 的顺序构建消息头（海康设备对顺序敏感）
-	// Via 格式：SIP/2.0/UDP <ip>:<port>;branch=<branch>（lalmax 没有 rport 参数）
-	via := fmt.Sprintf("SIP/2.0/UDP %s:%d;branch=%s", s.config.LocalSipIp, s.config.LocalSipPort, branch)
-	fromHeader := from + ";tag=" + tag
-	toHeader := to
-	callIdHeader := callId
-	userAgent := "LALServer"
-	cseq := "1 MESSAGE"
-	maxForwards := "70"
-	contact := fmt.Sprintf("<sip:%s@%s:%d>;tag=%s", serverId, s.config.LocalSipIp, s.config.LocalSipPort, tag)
-	contentType := "Application/MANSCDP+xml"
-	expires := fmt.Sprintf("%d", s.config.Expires)
-	contentLength := fmt.Sprintf("%d", len(catalogXml))
-
-	// 按照 lalmax 的顺序构建完整的 SIP MESSAGE（海康设备要求固定顺序）
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("MESSAGE %s SIP/2.0\r\n", requestUri))
-	sb.WriteString(fmt.Sprintf("Via: %s\r\n", via))
-	sb.WriteString(fmt.Sprintf("From: %s\r\n", fromHeader))
-	sb.WriteString(fmt.Sprintf("To: %s\r\n", toHeader))
-	sb.WriteString(fmt.Sprintf("Call-ID: %s\r\n", callIdHeader))
-	sb.WriteString(fmt.Sprintf("User-Agent: %s\r\n", userAgent))
-	sb.WriteString(fmt.Sprintf("CSeq: %s\r\n", cseq))
-	sb.WriteString(fmt.Sprintf("Max-Forwards: %s\r\n", maxForwards))
-	sb.WriteString(fmt.Sprintf("Contact: %s\r\n", contact))
-	sb.WriteString(fmt.Sprintf("Content-Type: %s\r\n", contentType))
-	sb.WriteString(fmt.Sprintf("Expires: %s\r\n", expires))
-	sb.WriteString(fmt.Sprintf("Content-Length: %s\r\n", contentLength))
-	sb.WriteString("\r\n")
-	sb.WriteString(catalogXml)
-
-	request := sb.String()
-
-	// 发送请求：与 Invite 一致，优先使用 RemoteIP/RemotePort（NAT）
-	targetIP, targetPort := device.Ip, device.Port
-	if device.RemoteIP != "" && device.RemotePort != 0 {
-		targetIP, targetPort = device.RemoteIP, device.RemotePort
-	}
-	addr := &net.UDPAddr{
-		IP:   net.ParseIP(targetIP),
-		Port: targetPort,
-	}
-
-	Log.Infof("========== 发送 Catalog 查询请求 ==========")
-	Log.Infof("设备ID: %s", deviceId)
-	Log.Infof("目标地址: %s:%d", device.Ip, device.Port)
-	Log.Infof("请求URI: %s", requestUri)
-	Log.Infof("From: %s (server_id=%s)", fromHeader, serverId)
-	Log.Infof("To: %s", toHeader)
-	Log.Infof("Contact: %s", contact)
-	Log.Infof("Call-ID: %s", callIdHeader)
-	Log.Infof("CSeq: %s", cseq)
-	Log.Infof("Expires: %s", expires)
-	Log.Infof("Via: %s", via)
-	Log.Infof("完整SIP消息:\n%s", request)
-	Log.Infof("==========================================")
-
-	s.sendRaw(request, addr)
-}
-
-// parseCatalogResponse 解析通道列表响应
-func (s *Gb28181Server) parseCatalogResponse(deviceId string, xmlBody string) {
-	Log.Infof("========== 开始解析 Catalog 响应 ==========")
-	Log.Infof("设备ID: %s", deviceId)
-	Log.Infof("XML 内容长度: %d 字节", len(xmlBody))
-	Log.Infof("完整 XML 内容:\n%s", xmlBody)
-	Log.Infof("==========================================")
-
-	// GB28181 XML格式解析
-	type Item struct {
-		DeviceID     string `xml:"DeviceID"`
-		Name         string `xml:"Name"`
-		Status       string `xml:"Status"`
-		ParentID     string `xml:"ParentID"`
-		Manufacturer string `xml:"Manufacturer"`
-		Model        string `xml:"Model"`
-		Owner        string `xml:"Owner"`
-		CivilCode    string `xml:"CivilCode"`
-		Address      string `xml:"Address"`
-		Parental     string `xml:"Parental"`
-		SafetyWay    string `xml:"SafetyWay"`
-		RegisterWay  string `xml:"RegisterWay"`
-		Secrecy      string `xml:"Secrecy"`
-		IPAddress    string `xml:"IPAddress"`
-		Port         string `xml:"Port"`
-		Password     string `xml:"Password"`
-	}
-
-	type CatalogResponse struct {
-		XMLName    xml.Name `xml:"Response"`
-		CmdType    string   `xml:"CmdType"`
-		SN         string   `xml:"SN"`
-		DeviceID   string   `xml:"DeviceID"`
-		SumNum     string   `xml:"SumNum"` // 总数量（可能用于分页）
-		Result     string   `xml:"Result"` // 结果：OK 表示成功
-		DeviceList struct {
-			Num   string `xml:"Num,attr"`
-			Items []Item `xml:"Item"`
-		} `xml:"DeviceList"`
-		ItemList struct {
-			Items []Item `xml:"Item"`
-		} `xml:"ItemList"`
-	}
-
-	var resp CatalogResponse
-	if err := ParseXMLResponse([]byte(xmlBody), &resp); err != nil {
-		xmlPreviewLen := 500
-		if len(xmlBody) < xmlPreviewLen {
-			xmlPreviewLen = len(xmlBody)
-		}
-		Log.Warnf("parse catalog response XML failed. device_id=%s, err=%+v, xml_preview=%s", deviceId, err, xmlBody[:xmlPreviewLen])
-		Log.Debugf("full xml body (first 1000 chars): %s", func() string {
-			if len(xmlBody) > 1000 {
-				return xmlBody[:1000]
-			}
-			return xmlBody
-		}())
-		return
-	}
-
-	// 获取Item列表（支持DeviceList和ItemList两种格式）
-	// 注意：某些设备可能使用 ItemList，某些使用 DeviceList
-	items := resp.DeviceList.Items
-	if len(items) == 0 {
-		items = resp.ItemList.Items
-	}
-
-	// 如果两种格式都没有数据，记录警告
-	if len(items) == 0 {
-		Log.Warnf("catalog response has no items. device_id=%s, sum_num=%s", deviceId, resp.SumNum)
-		// 不直接返回，继续处理，因为可能是设备没有通道
-	}
-
-	Log.Infof("========== Catalog 响应解析结果 ==========")
-	Log.Infof("设备ID: %s", deviceId)
-	Log.Infof("CmdType: %s", resp.CmdType)
-	Log.Infof("SN: %s", resp.SN)
-	Log.Infof("DeviceID: %s", resp.DeviceID)
-	Log.Infof("SumNum: %s", resp.SumNum)
-	Log.Infof("Result: %s", resp.Result)
-	Log.Infof("DeviceList Items 数量: %d", len(resp.DeviceList.Items))
-	Log.Infof("ItemList Items 数量: %d", len(resp.ItemList.Items))
-	Log.Infof("最终 Items 数量: %d", len(items))
-	Log.Infof("==========================================")
-
-	// 检查结果（某些设备可能不返回 Result 字段，所以只在有值且不为 OK 时才返回）
-	if resp.Result != "" && resp.Result != "OK" {
-		Log.Warnf("catalog query failed. device_id=%s, result=%s", deviceId, resp.Result)
-		return
-	}
-
-	// 打印所有Item的详细信息用于调试
-	for i, item := range items {
-		Log.Infof("catalog item[%d]: device_id=%s, name=%s, parent_id=%s, status=%s", i, item.DeviceID, item.Name, item.ParentID, item.Status)
-	}
-
-	// 检查 CmdType（大小写不敏感）
-	if !strings.EqualFold(resp.CmdType, "Catalog") {
-		Log.Debugf("not catalog response, cmd_type=%s, device_id=%s", resp.CmdType, deviceId)
-		return
-	}
-
-	// 解析 SumNum（期望总数，常用于分页/分片）
-	expectedSum := 0
-	if resp.SumNum != "" {
-		if sumNum, err := strconv.Atoi(strings.TrimSpace(resp.SumNum)); err == nil && sumNum > 0 {
-			expectedSum = sumNum
-			// 注意：分页/分片时，单条响应的 item 数量可能远小于 SumNum，此时不应当按“本次不等于SumNum”判失败
-			if len(items) > 0 && sumNum != len(items) {
-				Log.Warnf("catalog item count mismatch (likely paged). device_id=%s, sn=%s, sum_num=%d, this_item_count=%d, device_list_num_attr=%s",
-					deviceId, resp.SN, sumNum, len(items), resp.DeviceList.Num)
-			}
-		}
-	}
-
-	s.mutex.Lock()
-	device, exists := s.devices[deviceId]
-	if !exists {
-		s.mutex.Unlock()
-		Log.Warnf("device not found when parsing catalog. device_id=%s", deviceId)
-		return
-	}
-
-	device.mutex.Lock()
-	// Catalog 分片聚合：同一个 SN 可能会多次回包（分页），需要追加；SN 变化才开始新一轮并清空。
-	if resp.SN != "" && device.LastCatalogSN != resp.SN {
-		device.Channels = make(map[string]*Channel)
-		device.LastCatalogSN = resp.SN
-		device.CatalogExpected = expectedSum
-		device.CatalogReceived = 0
-		Log.Infof("start new catalog round. device_id=%s, sn=%s, expected_sum=%d", deviceId, resp.SN, expectedSum)
-	} else if resp.SN != "" && device.LastCatalogSN == "" {
-		// 首次收到带 SN 的 catalog
-		device.LastCatalogSN = resp.SN
-		device.CatalogExpected = expectedSum
-		device.CatalogReceived = len(device.Channels)
-		Log.Infof("init catalog round. device_id=%s, sn=%s, expected_sum=%d", deviceId, resp.SN, expectedSum)
-	} else if resp.SN != "" && expectedSum > 0 {
-		// 同一 SN 的后续分页，更新期望值（部分设备可能每页都带 SumNum，也可能只在首包带）
-		device.CatalogExpected = expectedSum
-	}
-	device.CatalogUpdateTime = time.Now()
-
-	// 更新通道列表
-	channelCount := 0
-	for _, item := range items {
-		Log.Debugf("processing catalog item. device_id=%s, item_device_id=%s, item_name=%s, parent_id=%s, status=%s", deviceId, item.DeviceID, item.Name, item.ParentID, item.Status)
-
-		// 排除设备自身
-		if item.DeviceID == deviceId {
-			Log.Debugf("skip device itself. device_id=%s", deviceId)
-			continue
-		}
-
-		// 通道判断逻辑（兼容多设备实现差异）：
-		// 1. 通道的DeviceID不等于设备ID（已排除）
-		// 2. ParentID等于设备ID（标准情况）
-		// 3. 只要DeviceID前10位（区域编码）与设备ID相同，通常也可视为该设备的通道（即使ParentID填了其它值）
-		//    说明：部分设备/级联场景会返回“非本机ID”的 ParentID，但 Item.DeviceID 仍属于本设备区域码，实际业务期望当通道处理。
-		// 4. ParentID为空或"0"时，根据DeviceID前缀判断（兼容处理）
-		isChannel := false
-
-		// 标准情况：ParentID 明确指向设备ID
-		if item.ParentID == deviceId {
-			isChannel = true
-			Log.Debugf("item is channel (parent_id matches device_id). device_id=%s, item_device_id=%s", deviceId, item.DeviceID)
-		} else if len(deviceId) >= 10 && len(item.DeviceID) >= 10 && item.DeviceID[:10] == deviceId[:10] {
-			// 兼容：只要区域码一致，也认为是通道（即便 ParentID 不匹配）
-			isChannel = true
-			Log.Debugf("item is channel (region code matches). device_id=%s, item_device_id=%s, parent_id=%s", deviceId, item.DeviceID, item.ParentID)
-		} else if item.ParentID == "" || item.ParentID == "0" {
-			// ParentID为空或"0"时，根据DeviceID前缀判断
-			if len(deviceId) >= 10 && len(item.DeviceID) >= 10 {
-				// 检查前10位（区域编码）是否相同
-				if item.DeviceID[:10] == deviceId[:10] {
-					isChannel = true
-					Log.Debugf("item is channel (region code matches, parent_id empty). device_id=%s, item_device_id=%s", deviceId, item.DeviceID)
-				}
-			} else {
-				// 如果长度不足，只要DeviceID不同就认为是通道（兼容处理）
-				isChannel = true
-				Log.Debugf("item is channel (parent_id empty, device_id different). device_id=%s, item_device_id=%s", deviceId, item.DeviceID)
-			}
-		}
-
-		if isChannel {
-			channel := &Channel{
-				ChannelId:   item.DeviceID,
-				ChannelName: item.Name,
-				Status:      item.Status,
-			}
-			if channel.ChannelName == "" {
-				channel.ChannelName = item.DeviceID
-			}
-			// upsert：分页/分片时追加，不覆盖已有字段（除非这次有值）
-			if old, ok := device.Channels[item.DeviceID]; ok {
-				if channel.ChannelName != "" {
-					old.ChannelName = channel.ChannelName
-				}
-				if channel.Status != "" {
-					old.Status = channel.Status
-				}
-			} else {
-				device.Channels[item.DeviceID] = channel
-				channelCount++
-			}
-			Log.Infof("add channel SUCCESS. device_id=%s, channel_id=%s, channel_name=%s, status=%s, parent_id=%s", deviceId, channel.ChannelId, channel.ChannelName, channel.Status, item.ParentID)
-		} else {
-			Log.Debugf("skip item (not a channel). device_id=%s, item_device_id=%s, parent_id=%s, name=%s", deviceId, item.DeviceID, item.ParentID, item.Name)
-		}
-	}
-	device.CatalogReceived = len(device.Channels)
-	if device.CatalogExpected > 0 && device.CatalogReceived >= device.CatalogExpected {
-		Log.Infof("catalog round complete. device_id=%s, sn=%s, received=%d, expected=%d",
-			deviceId, device.LastCatalogSN, device.CatalogReceived, device.CatalogExpected)
-	}
-	device.mutex.Unlock()
-	s.mutex.Unlock()
-
-	Log.Infof("parse catalog response success. device_id=%s, total_items=%d, channel_count=%d", deviceId, len(items), channelCount)
-}
-
-// parseRecordInfoResponse 解析录像列表 200 OK 响应（参考 lalmax RecordInfo）
-func (s *Gb28181Server) parseRecordInfoResponse(deviceId string, xmlBody string) {
-	type RecordItem struct {
-		DeviceID   string `xml:"DeviceID"`
-		Name       string `xml:"Name"`
-		FilePath   string `xml:"FilePath"`
-		Address    string `xml:"Address"`
-		StartTime  string `xml:"StartTime"`
-		EndTime    string `xml:"EndTime"`
-		Secrecy    string `xml:"Secrecy"`
-		Type       string `xml:"Type"`
-		RecorderID string `xml:"RecorderID"`
-	}
-	var resp struct {
-		XMLName    xml.Name `xml:"Response"`
-		CmdType    string   `xml:"CmdType"`
-		SN         string   `xml:"SN"`
-		DeviceID   string   `xml:"DeviceID"`
-		SumNum     string   `xml:"SumNum"`
-		Result     string   `xml:"Result"`
-		RecordList struct {
-			Items []RecordItem `xml:"Item"`
-		} `xml:"RecordList"`
-	}
-	if err := ParseXMLResponse([]byte(xmlBody), &resp); err != nil {
-		Log.Warnf("parse record info response failed. device_id=%s, err=%v", deviceId, err)
-		return
-	}
-	Log.Infof("record info response. device_id=%s, sum_num=%s, result=%s, item_count=%d",
-		deviceId, resp.SumNum, resp.Result, len(resp.RecordList.Items))
-	for i, it := range resp.RecordList.Items {
-		Log.Debugf("record[%d] device_id=%s name=%s start=%s end=%s", i, it.DeviceID, it.Name, it.StartTime, it.EndTime)
-	}
-}
-
-// scheduleCatalogQuery 定时查询Catalog（后台策略）
-func (s *Gb28181Server) scheduleCatalogQuery() {
-	interval := time.Duration(s.config.CatalogQueryInterval) * time.Second
-	if interval <= 0 {
-		return
-	}
-
-	// 首次延迟5秒执行，避免与设备注册时的查询冲突
-	time.Sleep(5 * time.Second)
-
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	Log.Infof("start catalog query scheduler. interval=%v", interval)
-
-	for {
-		select {
-		case <-ticker.C:
-			s.queryAllOnlineDevicesCatalog()
-		case <-s.stopChan:
-			Log.Infof("catalog query scheduler stopped")
-			return
-		}
-	}
-}
-
-// queryAllOnlineDevicesCatalog 查询所有在线设备的Catalog
-func (s *Gb28181Server) queryAllOnlineDevicesCatalog() {
-	s.mutex.RLock()
-	onlineDevices := make([]string, 0)
-	for deviceId, device := range s.devices {
-		if device.Status == "online" {
-			onlineDevices = append(onlineDevices, deviceId)
-		}
-	}
-	s.mutex.RUnlock()
-
-	if len(onlineDevices) == 0 {
-		return
-	}
-
-	Log.Debugf("scheduled catalog query. online_device_count=%d", len(onlineDevices))
-
-	// 异步查询每个设备的Catalog，避免阻塞
-	for _, deviceId := range onlineDevices {
-		go func(devId string) {
-			if err := s.QueryCatalog(devId); err != nil {
-				Log.Debugf("scheduled catalog query failed. device_id=%s, err=%+v", devId, err)
-			}
-		}(deviceId)
-	}
-}
-
-// monitorDevices 监控设备状态，检测超时设备
-func (s *Gb28181Server) monitorDevices() {
-	// 每10秒检查一次，确保能及时检测到设备离线
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			s.checkDeviceTimeout()
-		case <-s.stopChan:
-			return
-		}
-	}
-}
-
-// checkDeviceTimeout 检查设备超时
-func (s *Gb28181Server) checkDeviceTimeout() {
-	now := time.Now()
-
-	s.mutex.Lock()
-	offlineDevices := make([]*Device, 0)
-	offlineDeviceStreams := make(map[string][]*Stream) // 设备ID -> 流列表
-
-	for deviceId, device := range s.devices {
-		// 根据客户端实际心跳间隔确定超时阈值
-		var timeoutThreshold time.Duration
-		if device.KeepaliveInterval > 0 {
-			// 如果已计算出心跳间隔，使用心跳间隔的3倍作为超时阈值
-			timeoutThreshold = device.KeepaliveInterval * 3
-			// 设置最小和最大阈值，避免异常值
-			if timeoutThreshold < 60*time.Second {
-				timeoutThreshold = 60 * time.Second // 最小60秒
-			}
-			if timeoutThreshold > 600*time.Second {
-				timeoutThreshold = 600 * time.Second // 最大600秒（10分钟）
-			}
-		} else {
-			// 如果还没有计算出心跳间隔，使用过期时间作为阈值
-			timeout := time.Duration(s.config.Expires) * time.Second
-			if timeout == 0 {
-				timeout = 3600 * time.Second // 默认1小时
-			}
-			timeoutThreshold = timeout + timeout/2 // 过期时间的1.5倍
-		}
-
-		// 检查心跳超时（根据客户端实际心跳间隔确定）
-		// 注意：只更新状态为offline，不删除设备，以便API接口能查询到离线设备信息
-		timeSinceLastKeepalive := now.Sub(device.KeepaliveTime)
-		if timeSinceLastKeepalive > timeoutThreshold {
-			if device.Status != "offline" {
-				offlineDevices = append(offlineDevices, device)
-				device.Status = "offline"
-				Log.Warnf("device timeout detected. device_id=%s, last_keepalive=%v, time_since_last=%v, timeout_threshold=%v, keepalive_interval=%v",
-					deviceId, device.KeepaliveTime, timeSinceLastKeepalive, timeoutThreshold, device.KeepaliveInterval)
-
-				// 收集该设备的所有流信息，用于后续清理
-				if deviceStreams, ok := s.deviceStreams[deviceId]; ok {
-					streams := make([]*Stream, 0, len(deviceStreams))
-					for _, stream := range deviceStreams {
-						streams = append(streams, stream)
-					}
-					offlineDeviceStreams[deviceId] = streams
-				}
-			}
-		}
-	}
-	s.mutex.Unlock()
-
-	// 处理离线设备：清理流信息、更新通道状态并调用回调
-	for _, device := range offlineDevices {
-		deviceId := device.DeviceId
-		Log.Infof("device marked as offline. device_id=%s", deviceId)
-
-		// 清理该设备的所有流信息并更新通道状态
-		if streams, ok := offlineDeviceStreams[deviceId]; ok {
-			s.mutex.Lock()
-			// 更新设备通道状态
-			device.mutex.Lock()
-			for _, stream := range streams {
-				// 更新通道状态为 idle
-				if channel, exists := device.Channels[stream.ChannelId]; exists {
-					channel.Status = "idle"
-					channel.StreamName = ""
-					Log.Debugf("device offline, channel status updated to idle. device_id=%s, channel_id=%s",
-						deviceId, stream.ChannelId)
-				}
-
-				// 从流列表中删除
-				delete(s.streams, stream.StreamName)
-				// 从设备流索引中删除
-				if deviceStreams, exists := s.deviceStreams[deviceId]; exists {
-					delete(deviceStreams, stream.StreamName)
-					if len(deviceStreams) == 0 {
-						delete(s.deviceStreams, deviceId)
-					}
-				}
-			}
-			device.mutex.Unlock()
-			s.mutex.Unlock()
-
-			// 调用 onBye 回调，通知上层停止流（在锁外调用，避免死锁）
-			if s.onBye != nil {
-				for _, stream := range streams {
-					Log.Infof("device offline, stopping stream. device_id=%s, channel_id=%s, stream_name=%s",
-						deviceId, stream.ChannelId, stream.StreamName)
-					if err := s.onBye(deviceId, stream.ChannelId, stream.StreamName); err != nil {
-						Log.Warnf("onBye callback failed for offline device. device_id=%s, stream_name=%s, err=%+v",
-							deviceId, stream.StreamName, err)
-					}
-				}
-			}
-
-			Log.Infof("device offline, cleaned up %d streams and updated channel status. device_id=%s", len(streams), deviceId)
-		} else {
-			// 即使没有流，也更新所有通道状态为 idle
-			s.mutex.Lock()
-			device.mutex.Lock()
-			for _, channel := range device.Channels {
-				if channel.Status == "streaming" {
-					channel.Status = "idle"
-					channel.StreamName = ""
-				}
-			}
-			device.mutex.Unlock()
-			s.mutex.Unlock()
-			Log.Infof("device offline, updated all channel status to idle. device_id=%s", deviceId)
-		}
-	}
-}
-
-// Dispose 释放资源
-func (s *Gb28181Server) Dispose() error {
-	// 停止监控goroutine
-	if s.stopChan != nil {
-		close(s.stopChan)
-	}
-
-	if s.udpConn != nil {
-		s.udpConn.Close()
-	}
-	if s.conn != nil {
-		return s.conn.Dispose()
-	}
-	return nil
+type notifyMessage struct {
+	ChannelInfo
+
+	//状态改变事件 ON:上线,OFF:离线,VLOST:视频丢失,DEFECT:故障,ADD:增加,DEL:删除,UPDATE:更新(必选)
+	Event string
 }

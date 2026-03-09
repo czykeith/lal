@@ -9,9 +9,6 @@
 package logic
 
 import (
-	"fmt"
-
-	"github.com/q191201771/lal/pkg/gb28181"
 	"github.com/q191201771/naza/pkg/nazalog"
 	"time"
 
@@ -96,86 +93,16 @@ func (group *Group) AddRtspPubSession(session *rtsp.PubSession) error {
 	return nil
 }
 
+// StartRtpPub 已废弃：RTP 收流仅通过 GB28181 Invite（lalmax）接入，请使用 /api/ctrl/gb28181_invite
 func (group *Group) StartRtpPub(req base.ApiCtrlStartRtpPubReq) (ret base.ApiCtrlStartRtpPubResp) {
-	group.mutex.Lock()
-	defer group.mutex.Unlock()
-
-	if group.hasInSession() {
-		ret.ErrorCode = base.ErrorCodeListenUdpPortFail
-		ret.Desp = fmt.Sprintf("in stream already exist at group: %s", group.inSessionUniqueKey())
-		return
-	}
-
-	if req.DebugDumpPacket != "" {
-		group.psPubDumpFile = base.NewDumpFile()
-		if err := group.psPubDumpFile.OpenToWrite(req.DebugDumpPacket); err != nil {
-			Log.Errorf("%+v", err)
-		}
-	}
-
-	pubSession := gb28181.NewPubSession().WithStreamName(req.StreamName).WithOnAvPacket(group.OnAvPacketFromPsPubSession)
-	pubSession.WithHookReadPacket(func(b []byte) {
-		if group.psPubDumpFile != nil {
-			group.psPubDumpFile.WriteWithType(b, base.DumpTypePsRtpData)
-		}
-	})
-
-	Log.Debugf("[%s] [%s] add RTP PubSession into group.", group.UniqueKey, pubSession.UniqueKey())
-
-	group.psPubSession = pubSession
-	group.psPubTimeoutSec = uint32(req.TimeoutMs / 1000)
-	group.addIn()
-
-	group.rtsp2RtmpRemuxer = remux.NewAvPacket2RtmpRemuxer()
-	group.rtsp2RtmpRemuxer.WithOption(func(option *base.AvPacketStreamOption) {
-		option.VideoFormat = base.AvPacketStreamVideoFormatAnnexb
-		option.AudioFormat = base.AvPacketStreamAudioFormatAdtsAac
-	})
-	group.rtsp2RtmpRemuxer.WithOnRtmpMsg(group.onRtmpMsgFromRemux)
-
-	if group.shouldStartRtspRemuxer() {
-		group.rtmp2RtspRemuxer = remux.NewRtmp2RtspRemuxer(
-			group.onSdpFromRemux,
-			group.onRtpPacketFromRemux,
-		)
-	}
-
-	port, err := pubSession.Listen(req.Port, req.IsTcpFlag != 0)
-	if err != nil {
-		group.delPsPubSession(pubSession)
-
-		ret.ErrorCode = base.ErrorCodeListenUdpPortFail
-		ret.Desp = err.Error()
-		return
-	}
-
-	go func() {
-		runErr := pubSession.RunLoop()
-		nazalog.Debugf("[%s] [%s] ps PubSession run loop exit, err=%v", group.UniqueKey, pubSession.UniqueKey(), runErr)
-		group.DelPsPubSession(pubSession)
-	}()
-
-	ret.ErrorCode = base.ErrorCodeSucc
-	ret.Desp = base.DespSucc
-	ret.Data.SessionId = pubSession.UniqueKey()
-	ret.Data.StreamName = pubSession.StreamName()
-	ret.Data.Port = port
+	ret.ErrorCode = base.ErrorCodeListenUdpPortFail
+	ret.Desp = "RTP pub only supported via GB28181 invite, use /api/ctrl/gb28181_invite"
 	return
 }
 
+// StopRtpPub 已废弃：与 StartRtpPub 配套，现由 GB28181 Bye 处理
 func (group *Group) StopRtpPub(streamName string) string {
-	group.mutex.Lock()
-	defer group.mutex.Unlock()
-
-	if group.psPubSession == nil {
-		return ""
-	}
-
-	sessionId := group.psPubSession.UniqueKey()
-	group.psPubSession.Dispose()
-	group.delPsPubSession(group.psPubSession)
-
-	return sessionId
+	return ""
 }
 
 func (group *Group) AddRtmpPullSession(session *rtmp.PullSession) error {
@@ -271,12 +198,6 @@ func (group *Group) AddRtspPullSession(session *rtsp.PullSession) error {
 
 // ---------------------------------------------------------------------------------------------------------------------
 
-func (group *Group) DelPsPubSession(session *gb28181.PubSession) {
-	group.mutex.Lock()
-	defer group.mutex.Unlock()
-	group.delPsPubSession(session)
-}
-
 func (group *Group) DelCustomizePubSession(sessionCtx ICustomizePubSessionContext) {
 	group.mutex.Lock()
 	defer group.mutex.Unlock()
@@ -338,18 +259,6 @@ func (group *Group) DelRtspPullSession(session *rtsp.PullSession) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-
-func (group *Group) delPsPubSession(session *gb28181.PubSession) {
-	Log.Debugf("[%s] [%s] del ps PubSession from group.", group.UniqueKey, session.UniqueKey())
-
-	if session != group.psPubSession {
-		Log.Warnf("[%s] del ps pub session but not match. del session=%s, group session=%p",
-			group.UniqueKey, session.UniqueKey(), group.psPubSession)
-		return
-	}
-
-	group.delIn()
-}
 
 func (group *Group) delCustomizePubSession(sessionCtx ICustomizePubSessionContext) {
 	Log.Debugf("[%s] [%s] del customize PubSession from group.", group.UniqueKey, sessionCtx.UniqueKey())
@@ -466,7 +375,6 @@ func (group *Group) delIn() {
 	group.rtmpPubSession = nil
 	group.rtspPubSession = nil
 	group.customizePubSession = nil
-	group.psPubSession = nil
 	group.rtsp2RtmpRemuxer = nil
 	group.rtmp2RtspRemuxer = nil
 	group.dummyAudioFilter = nil

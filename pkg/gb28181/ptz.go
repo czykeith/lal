@@ -1,221 +1,243 @@
-// Copyright 2024, Chef.  All rights reserved.
-// https://github.com/q191201771/lal
-//
-// Use of this source code is governed by a MIT-style license
-// that can be found in the License file.
-//
-// Author: Chef (191201771@qq.com)
-
 package gb28181
 
 import (
-	"fmt"
-	"net"
+	"encoding/hex"
+	"encoding/xml"
 )
 
-// PTZCommand PTZ控制命令类型
-type PTZCommand string
+type MessagePtz struct {
+	XMLName  xml.Name `xml:"Control"`
+	CmdType  string   `xml:"CmdType"`
+	SN       int      `xml:"SN"`
+	DeviceID string   `xml:"DeviceID"`
+	PTZCmd   string   `xml:"PTZCmd"`
+}
+
+const DeviceControl = "DeviceControl"
+const PTZFirstByte = 0xA5
+const (
+	PresetSet  = 0x81
+	PresetCall = 0x82
+	PresetDel  = 0x83
+)
 
 const (
-	PTZUp          PTZCommand = "Up"          // 上
-	PTZDown        PTZCommand = "Down"        // 下
-	PTZLeft        PTZCommand = "Left"        // 左
-	PTZRight       PTZCommand = "Right"       // 右
-	PTZUpLeft      PTZCommand = "UpLeft"      // 左上
-	PTZUpRight     PTZCommand = "UpRight"     // 右上
-	PTZDownLeft    PTZCommand = "DownLeft"    // 左下
-	PTZDownRight   PTZCommand = "DownRight"   // 右下
-	PTZZoomIn      PTZCommand = "ZoomIn"      // 放大
-	PTZZoomOut     PTZCommand = "ZoomOut"     // 缩小
-	PTZFocusNear   PTZCommand = "FocusNear"   // 聚焦+
-	PTZFocusFar    PTZCommand = "FocusFar"    // 聚焦-
-	PTZIrisOpen    PTZCommand = "IrisOpen"    // 光圈+
-	PTZIrisClose   PTZCommand = "IrisClose"   // 光圈-
-	PTZStop        PTZCommand = "Stop"        // 停止
-	PTZSetPreset   PTZCommand = "SetPreset"   // 设置预置位
-	PTZCallPreset  PTZCommand = "CallPreset"  // 调用预置位
-	PTZDelPreset   PTZCommand = "DelPreset"   // 删除预置位
-	PTZStartCruise PTZCommand = "StartCruise" // 开始巡航
-	PTZStopCruise  PTZCommand = "StopCruise"  // 停止巡航
+	CruiseAdd      = 0x84
+	CruiseDel      = 0x85
+	CruiseSetSpeed = 0x86
+	CruiseStopTime = 0x87
+	CruiseStart    = 0x88
+)
+const (
+	ScanningStart = 0x89
+	ScanningSpeed = 0x8A
 )
 
-// PTZControl PTZ控制参数
-type PTZControl struct {
-	DeviceId  string
-	ChannelId string
-	Command   PTZCommand
-	Speed     int // 速度 1-8，默认5
-	Preset    int // 预置位编号（用于预置位相关命令）
+/*
+表 A.3 指令格式
+字节 字节1 字节2 字节3 字节4 字节5 字节6 字节7 字节8
+含义 A5H 组合码1 地址 指令 数据1 数据2 组合码2 校验码
+各字节定义如下:
+字节1: 指令的首字节为 A5H。
+字节2: 组合码1, 高4 位是版本信息, 低4 位是校验位。 本标准的版本号是1.0, 版本信息为0H。
+校验位= (字节1 的高4 位+ 字节1 的低4 位+ 字节2 的高4 位) %16。
+字节3: 地址的低8 位。
+字节4: 指令码。
+字节5、6: 数据1 和数据2。
+字节7: 组合码2, 高4 位是数据3, 低4 位是地址的高4 位; 在后续叙述中, 没有特别指明的高4 位,
+表示该4 位与所指定的功能无关。
+字节8: 校验码, 为前面的第1~7 字节的算术和的低8 位, 即算术和对256 取模后的结果。
+字节8= (字节1+ 字节2+ 字节3+ 字节4+ 字节5+ 字节6+ 字节7) %256。
+地址范围000H~FFFH(即0~4095) , 其中000H 地址作为广播地址。
+注: 前端设备控制中, 不使用字节3 和字节7 的低4 位地址码, 使用前端设备控制消息体中的<DeviceID> 统一编码
+标识控制的前端设备
+*/
+type PtzHead struct {
+	FirstByte    uint8
+	AssembleByte uint8
+	Addr         uint8 //低地址码0-ff
 }
 
-// ControlPTZ 发送PTZ控制命令
-func (s *Gb28181Server) ControlPTZ(control PTZControl) error {
-	s.mutex.RLock()
-	device, exists := s.devices[control.DeviceId]
-	s.mutex.RUnlock()
-
-	if !exists {
-		return fmt.Errorf("device not found: %s", control.DeviceId)
+// 获取组合码
+func getAssembleCode() uint8 {
+	return (PTZFirstByte>>4 + PTZFirstByte&0xF + 0) % 16
+}
+func getVerificationCode(ptz []byte) {
+	sum := uint8(0)
+	for i := 0; i < len(ptz)-1; i++ {
+		sum += ptz[i]
 	}
-
-	// 确定通道ID
-	channelId := control.ChannelId
-	if channelId == "" {
-		channelId = control.DeviceId
-	}
-
-	// 设置默认速度
-	speed := control.Speed
-	if speed <= 0 || speed > 8 {
-		speed = 5
-	}
-
-	// 构建PTZ控制XML
-	var xmlBody string
-	switch control.Command {
-	case PTZSetPreset, PTZCallPreset, PTZDelPreset:
-		// 预置位相关命令
-		if control.Preset <= 0 {
-			return fmt.Errorf("preset number required for command: %s", control.Command)
-		}
-		xmlBody = buildPresetXML(control.Command, channelId, control.Preset)
-	case PTZStartCruise, PTZStopCruise:
-		// 巡航相关命令
-		if control.Preset <= 0 {
-			return fmt.Errorf("cruise route number required for command: %s", control.Command)
-		}
-		xmlBody = buildCruiseXML(control.Command, channelId, control.Preset)
-	default:
-		// 方向控制命令
-		xmlBody = buildPTZControlXML(control.Command, channelId, speed)
-	}
-
-	// 构建MESSAGE请求（使用域格式，符合GB28181标准）
-	deviceDomain := getDeviceDomain(control.DeviceId)
-	requestUri := fmt.Sprintf("sip:%s@%s", channelId, deviceDomain)
-	from := fmt.Sprintf("<sip:%s@%s>", s.config.LocalSipId, s.config.LocalSipDomain)
-	to := fmt.Sprintf("<sip:%s@%s>", channelId, deviceDomain)
-
-	branch := GenerateBranch()
-	callId := GenerateCallId()
-	headers := map[string]string{
-		"Via":            fmt.Sprintf("SIP/2.0/UDP %s:%d;branch=%s;rport", s.config.LocalSipIp, s.config.LocalSipPort, branch),
-		"From":           from + ";tag=" + GenerateTag(),
-		"To":             to,
-		"Call-ID":        callId,
-		"CSeq":           "1 MESSAGE",
-		"Max-Forwards":   "70",
-		"Content-Type":   "Application/MANSCDP+xml",
-		"Content-Length": fmt.Sprintf("%d", len(xmlBody)),
-	}
-
-	request := BuildSipRequest(SipMethodMessage, requestUri, headers, xmlBody)
-
-	// 发送请求
-	addr := &net.UDPAddr{
-		IP:   net.ParseIP(device.Ip),
-		Port: device.Port,
-	}
-	s.sendRaw(request, addr)
-
-	Log.Infof("send PTZ control. device_id=%s, channel_id=%s, command=%s, speed=%d, preset=%d",
-		control.DeviceId, channelId, control.Command, speed, control.Preset)
-
-	return nil
+	ptz[len(ptz)-1] = sum
 }
 
-// buildPTZControlXML 构建PTZ控制XML
-func buildPTZControlXML(cmd PTZCommand, channelId string, speed int) string {
-	// 根据命令类型构建PTZCmd
-	var ptzCmd string
-	switch cmd {
-	case PTZUp:
-		ptzCmd = fmt.Sprintf("A50F01%02XFF", speed)
-	case PTZDown:
-		ptzCmd = fmt.Sprintf("A50F01%02XFF", speed|0x10)
-	case PTZLeft:
-		ptzCmd = fmt.Sprintf("A50F01%02XFF", speed|0x04)
-	case PTZRight:
-		ptzCmd = fmt.Sprintf("A50F01%02XFF", speed|0x08)
-	case PTZUpLeft:
-		ptzCmd = fmt.Sprintf("A50F01%02XFF", speed|0x14)
-	case PTZUpRight:
-		ptzCmd = fmt.Sprintf("A50F01%02XFF", speed|0x1C)
-	case PTZDownLeft:
-		ptzCmd = fmt.Sprintf("A50F01%02XFF", speed|0x10|0x04)
-	case PTZDownRight:
-		ptzCmd = fmt.Sprintf("A50F01%02XFF", speed|0x10|0x08)
-	case PTZZoomIn:
-		ptzCmd = fmt.Sprintf("A50F01%02XFF", speed|0x20)
-	case PTZZoomOut:
-		ptzCmd = fmt.Sprintf("A50F01%02XFF", speed|0x40)
-	case PTZFocusNear:
-		ptzCmd = "A50F0103FF"
-	case PTZFocusFar:
-		ptzCmd = "A50F0104FF"
-	case PTZIrisOpen:
-		ptzCmd = "A50F0105FF"
-	case PTZIrisClose:
-		ptzCmd = "A50F0106FF"
-	case PTZStop:
-		ptzCmd = "A50F0100FF"
-	default:
-		ptzCmd = "A50F0100FF" // 默认停止
-	}
-
-	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
-<Control>
-<CmdType>DeviceControl</CmdType>
-<SN>%d</SN>
-<DeviceID>%s</DeviceID>
-<PTZCmd>%s</PTZCmd>
-</Control>`, GenerateSN(), channelId, ptzCmd)
+/*
+注1 : 字节4 中的 Bit5、Bit4 分别控制镜头变倍的缩小和放大, 字节4 中的 Bit3、Bit2、Bit1、Bit0 位分别控制云台
+上、 下、 左、 右方向的转动, 相应 Bit 位置1 时, 启动云台向相应方向转动, 相应 Bit 位清0 时, 停止云台相应
+方向的转动。 云台的转动方向以监视器显示图像的移动方向为准。
+注2: 字节5 控制水平方向速度, 速度范围由慢到快为00H~FFH; 字节6 控制垂直方向速度, 速度范围由慢到快
+为00H-FFH。
+注3: 字节7 的高4 位为变焦速度, 速度范围由慢到快为0H~FH; 低4 位为地址的高4 位。
+*/
+type Ptz struct {
+	ZoomOut bool
+	ZoomIn  bool
+	Up      bool
+	Down    bool
+	Left    bool
+	Right   bool
+	Speed   byte //0-8
 }
 
-// buildPresetXML 构建预置位XML
-func buildPresetXML(cmd PTZCommand, channelId string, preset int) string {
-	var cmdType string
-	switch cmd {
-	case PTZSetPreset:
-		cmdType = "Preset"
-	case PTZCallPreset:
-		cmdType = "Preset"
-	case PTZDelPreset:
-		cmdType = "Preset"
-	default:
-		cmdType = "Preset"
+func (p *Ptz) Pack() string {
+	buf := make([]byte, 8)
+	buf[0] = PTZFirstByte
+	buf[1] = getAssembleCode()
+	buf[2] = 1
+	buf[4] = 0
+	buf[5] = 0
+	buf[6] = 0
+	if p.ZoomOut {
+		buf[3] |= 1 << 5
+		buf[6] = p.Speed << 4
 	}
 
-	// 构建PTZCmd（预置位命令格式：A50F01XXFF，XX为预置位编号）
-	ptzCmd := fmt.Sprintf("A50F01%02XFF", preset)
-	if cmd == PTZSetPreset {
-		ptzCmd = fmt.Sprintf("A50F01%02XFF", preset|0x80) // 设置预置位
-	} else if cmd == PTZDelPreset {
-		ptzCmd = fmt.Sprintf("A50F01%02XFF", preset|0x90) // 删除预置位
+	if p.ZoomIn {
+		buf[3] |= 1 << 4
+		buf[6] = p.Speed << 4
 	}
-
-	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
-<Control>
-<CmdType>%s</CmdType>
-<SN>%d</SN>
-<DeviceID>%s</DeviceID>
-<PTZCmd>%s</PTZCmd>
-</Control>`, cmdType, GenerateSN(), channelId, ptzCmd)
+	if p.Up {
+		buf[3] |= 1 << 3
+		buf[5] = p.Speed
+	}
+	if p.Down {
+		buf[3] |= 1 << 2
+		buf[5] = p.Speed
+	}
+	if p.Left {
+		buf[3] |= 1 << 1
+		buf[4] = p.Speed
+	}
+	if p.Right {
+		buf[3] |= 1
+		buf[4] = p.Speed
+	}
+	getVerificationCode(buf)
+	return hex.EncodeToString(buf)
 }
 
-// buildCruiseXML 构建巡航XML
-func buildCruiseXML(cmd PTZCommand, channelId string, route int) string {
-	// 巡航命令格式：A50F01XXFF，XX为巡航路线编号
-	ptzCmd := fmt.Sprintf("A50F01%02XFF", route)
-	if cmd == PTZStopCruise {
-		ptzCmd = "A50F0100FF" // 停止巡航
-	}
+func (p *Ptz) Stop() string {
+	buf := make([]byte, 8)
+	buf[0] = PTZFirstByte
+	buf[1] = getAssembleCode()
+	buf[2] = 1
+	buf[3] = 0
+	buf[4] = 0
+	buf[5] = 0
+	buf[6] = 0
+	getVerificationCode(buf)
+	return hex.EncodeToString(buf)
+}
 
-	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
-<Control>
-<CmdType>Cruise</CmdType>
-<SN>%d</SN>
-<DeviceID>%s</DeviceID>
-<PTZCmd>%s</PTZCmd>
-</Control>`, GenerateSN(), channelId, ptzCmd)
+/*
+注1 : 字节4 中的 Bit3 为1 时, 光圈缩小;Bit2 为1 时, 光圈放大。 Bit1 为1 时, 聚焦近;Bit0 为1 时, 聚焦远。 Bit3~
+Bit0 的相应位清0, 则相应控制操作停止动作。
+注2: 字节5 表示聚焦速度, 速度范围由慢到快为00H~FFH。
+注3: 字节6 表示光圈速度, 速度范围由慢到快为00H~FFH
+*/
+type Fi struct {
+	IrisIn    bool
+	IrisOut   bool
+	FocusNear bool
+	FocusFar  bool
+	Speed     byte //0-8
+}
+
+func (f *Fi) Pack() string {
+	buf := make([]byte, 8)
+	buf[0] = PTZFirstByte
+	buf[1] = getAssembleCode()
+	buf[2] = 1
+	buf[3] |= 1 << 6
+	buf[4] = 0
+	buf[5] = 0
+	buf[6] = 0
+
+	if f.IrisIn {
+		buf[3] |= 1 << 3
+		buf[5] = f.Speed
+	}
+	if f.IrisOut {
+		buf[3] |= 1 << 2
+		buf[5] = f.Speed
+	}
+	if f.FocusNear {
+		buf[3] |= 1 << 1
+		buf[4] = f.Speed
+	}
+	if f.FocusFar {
+		buf[3] |= 1
+		buf[4] = f.Speed
+	}
+	getVerificationCode(buf)
+	return hex.EncodeToString(buf)
+}
+
+type Preset struct {
+	CMD   byte
+	Point byte
+}
+
+func (p *Preset) Pack() string {
+	buf := make([]byte, 8)
+	buf[0] = PTZFirstByte
+	buf[1] = getAssembleCode()
+	buf[2] = 1
+
+	buf[3] = p.CMD
+
+	buf[4] = 0
+	buf[5] = p.Point
+	buf[6] = 0
+	getVerificationCode(buf)
+	return hex.EncodeToString(buf)
+}
+
+/*
+注1 : 字节5 表示巡航组号, 字节6 表示预置位号。
+注2: 序号2 中, 字节6 为00H 时, 删除对应的整条巡航; 序号3、4 中字节6 表示数据的低8 位, 字节7 的高4 位
+表示数据的高4 位。
+注3: 巡航停留时间的单位是秒(s) 。
+注4: 停止巡航用 PTZ 指令中的字节4 的各 Bit 位均为0 的停止指令。
+*/
+type Cruise struct {
+	CMD      byte
+	GroupNum byte
+	Value    uint16
+}
+
+func (c *Cruise) Pack() string {
+	buf := make([]byte, 8)
+	buf[0] = PTZFirstByte
+	buf[1] = getAssembleCode()
+	buf[2] = 1
+	buf[3] = c.CMD
+
+	buf[4] = c.GroupNum
+	buf[5] = byte(c.Value & 0xFF)
+	buf[6] = byte(c.Value>>8) & 0x0F
+	getVerificationCode(buf)
+	return hex.EncodeToString(buf)
+}
+
+/*
+注1 : 字节5 表示扫描组号。
+注2: 序号4 中, 字节6 表示数据的低8 位, 字节7 的高4 位表示数据的高4 位。
+注3: 停止自动扫描用 PTZ 指令中的字节4 的各 Bit 位均为0 的停止指令。
+注4: 自动扫描开始时, 整体画面从右向左移动。
+*/
+type Scanning struct {
+	CMD      byte
+	No       byte
+	Value    byte
+	HighAddr byte // 0-f 后4位高地址码 0-f
 }
