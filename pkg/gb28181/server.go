@@ -452,6 +452,66 @@ func (s *GB28181Server) FindChannel(deviceId string, channelId string) (channel 
 	}
 }
 
+// FindChannelWithStreamType 根据主/辅码流选择通道。
+//
+// streamType: 0=主码流，1=辅码流（默认仍推荐业务侧通过 ChannelId 精确指定）。
+// 为兼容部分海康等设备的使用习惯，这里做一个简单的 heuristic：
+// - 当 streamType=1 且 channelId 长度为20位时：
+//   - 认为最后3位为通道中“码流序号”，例如 ...001 主、...002 辅；
+//   - 在同一设备下查找同 base(前17位) 且后3位不同的其它通道，优先 suffix 为 002/102/202。
+//
+// 找不到匹配时，退回到原始 channelId。
+func (s *GB28181Server) FindChannelWithStreamType(deviceId, channelId string, streamType int) *Channel {
+	if streamType == 0 {
+		return s.FindChannel(deviceId, channelId)
+	}
+
+	v, ok := Devices.Load(deviceId)
+	if !ok {
+		return nil
+	}
+	d := v.(*Device)
+
+	// 仅在长度为20位的 channelId 上尝试 heuristic
+	if len(channelId) != 20 {
+		return s.FindChannel(deviceId, channelId)
+	}
+
+	baseId := channelId[:17]
+	origSuffix := channelId[17:]
+	preferSuffixes := []string{"002", "102", "202"}
+
+	var candidate *Channel
+	d.channelMap.Range(func(_, value any) bool {
+		ch := value.(*Channel)
+		if ch.ChannelId == channelId || len(ch.ChannelId) != 20 {
+			return true
+		}
+		if !strings.HasPrefix(ch.ChannelId, baseId) {
+			return true
+		}
+		suf := ch.ChannelId[17:]
+		if suf == origSuffix {
+			return true
+		}
+		for _, ps := range preferSuffixes {
+			if suf == ps {
+				candidate = ch
+				return false
+			}
+		}
+		if candidate == nil {
+			candidate = ch
+		}
+		return true
+	})
+
+	if candidate != nil {
+		return candidate
+	}
+	return s.FindChannel(deviceId, channelId)
+}
+
 // GetDevice 根据设备 ID 获取设备，供 API 使用
 func (s *GB28181Server) GetDevice(deviceId string) *Device {
 	if v, ok := Devices.Load(deviceId); ok {

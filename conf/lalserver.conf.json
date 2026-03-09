@@ -139,7 +139,14 @@
     "password": "",
     "expires": 3600,
     "catalog_query_interval": 300,
-    "sip_rtp_port_min": 40000,
-    "sip_rtp_port_max": 60000
+    "sip_rtp_port_min": 30000,
+    "sip_rtp_port_max": 60000,
+    "video_codec": "H264",
+    "video_width": 1920,
+    "video_height": 1080,
+    "video_bitrate": 1024,
+    "video_framerate": 25,
+    "video_profile": "main",
+    "video_level": "4.0"
   }
 }

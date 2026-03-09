@@ -251,7 +251,13 @@ func (sm *ServerManager) CtrlGb28181Invite(info base.ApiCtrlGb28181InviteReq) (r
 		streamName = info.DeviceId + info.ChannelId
 	}
 
-	ch := sm.gb28181Server.FindChannel(info.DeviceId, info.ChannelId)
+	// 0=主码流，1=辅码流；若传入非法值，则按主码流处理。
+	streamType := info.StreamType
+	if streamType != 0 && streamType != 1 {
+		streamType = 0
+	}
+
+	ch := sm.gb28181Server.FindChannelWithStreamType(info.DeviceId, info.ChannelId, streamType)
 	if ch == nil {
 		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
 		ret.Desp = base.DespGb28181DeviceNotFound
@@ -337,7 +343,8 @@ func (sm *ServerManager) CtrlGb28181Playback(info base.ApiCtrlGb28181PlaybackReq
 		streamName = info.DeviceId + info.ChannelId + "_playback"
 	}
 
-	ch := sm.gb28181Server.FindChannel(info.DeviceId, info.ChannelId)
+	// 回放暂时固定按主码流处理（streamType=0）；如需区分主/辅回放，可扩展 ApiCtrlGb28181PlaybackReq。
+	ch := sm.gb28181Server.FindChannelWithStreamType(info.DeviceId, info.ChannelId, 0)
 	if ch == nil {
 		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
 		ret.Desp = base.DespGb28181DeviceNotFound
