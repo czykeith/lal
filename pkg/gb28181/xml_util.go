@@ -54,6 +54,30 @@ func BuildDeviceStatusQueryXML(deviceId string, sn int) string {
 </Query>`, sn, deviceId)
 }
 
+// BuildRecordInfoQueryXML 构建录像文件列表查询XML（参考 lalmax RecordInfoXML）
+// deviceId 为设备ID，channelId 为通道ID（可与 deviceId 相同），startTime/endTime 格式：2006-01-02T15:04:05
+func BuildRecordInfoQueryXML(deviceId, channelId string, sn int, startTime, endTime string) string {
+	if channelId == "" {
+		channelId = deviceId
+	}
+	if startTime == "" {
+		startTime = "2020-01-01T00:00:00"
+	}
+	if endTime == "" {
+		endTime = "2030-12-31T23:59:59"
+	}
+	return fmt.Sprintf(`<?xml version="1.0"?>
+<Query>
+<CmdType>RecordInfo</CmdType>
+<SN>%d</SN>
+<DeviceID>%s</DeviceID>
+<StartTime>%s</StartTime>
+<EndTime>%s</EndTime>
+<Secrecy>0</Secrecy>
+<Type>all</Type>
+</Query>`, sn, channelId, startTime, endTime)
+}
+
 // BuildAlarmResponseXML 构建告警响应XML
 func BuildAlarmResponseXML(deviceId, cmdType, sn string) string {
 	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>

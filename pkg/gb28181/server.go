@@ -63,9 +63,11 @@ type ServerConfig struct {
 type Device struct {
 	DeviceId     string
 	DeviceName   string
+	Manufacturer string
+	Model        string
 	Ip           string
 	Port         int
-	Status       string // online/offline
+	Status       string // online/offline/alarmed
 	RegisterTime time.Time
 	// 设备注册时REGISTER Request-URI中携带的平台信息，例如：
 	// REGISTER sip:<serverId>@<serverDomain> SIP/2.0
@@ -102,8 +104,10 @@ func (d *Device) GetChannels() []*Channel {
 type Channel struct {
 	ChannelId   string
 	ChannelName string
-	Status      string // idle/streaming
+	Status      string // ON/OFF（GB28181）或 idle/streaming
 	StreamName  string
+	Longitude   string // 经度（NOTIFY MobilePosition 更新）
+	Latitude    string // 纬度
 }
 
 // Stream 流信息
@@ -322,6 +326,8 @@ func (s *Gb28181Server) handleMessage(data []byte, raddr *net.UDPAddr) {
 		s.handleAck(msg, raddr)
 	case SipMethodBye:
 		s.handleBye(msg, raddr)
+	case SipMethodNotify:
+		s.handleNotify(msg, raddr)
 	default:
 		if msg.StatusCode > 0 {
 			s.handleResponse(msg, raddr)
@@ -607,82 +613,70 @@ func (s *Gb28181Server) handleKeepalive(msg *SipMessage, raddr *net.UDPAddr) {
 		go s.queryCatalog(deviceId)
 	}
 
-	// 检查是否是通道列表响应（Body中包含XML）
+	// 检查消息体并按 CmdType 分发（与 lalmax 一致：Keepalive/Catalog/DeviceInfo/Alarm）
 	body := msg.Body
+	var messageResponseBody string
 	if len(body) > 0 {
-		// 记录收到的完整消息内容用于调试
-		Log.Infof("========== 收到 MESSAGE 响应 ==========")
-		Log.Infof("设备ID: %s", deviceId)
-		Log.Infof("来源地址: %s:%d", raddr.IP.String(), raddr.Port)
-		Log.Infof("消息体长度: %d 字节", len(body))
-		Log.Infof("完整消息体内容:\n%s", body)
-		Log.Infof("========================================")
+		Log.Infof("========== 收到 MESSAGE ==========")
+		Log.Infof("设备ID: %s, 来源: %s:%d, 体长: %d", deviceId, raddr.IP.String(), raddr.Port, len(body))
 
-		// 检查是否是Catalog响应（大小写不敏感）
-		// GB28181标准：设备返回的Catalog响应使用<Response>标签，包含<CmdType>Catalog</CmdType>
-		// 某些设备可能返回 <CmdType>Catalog</CmdType> 或 <CmdType>catalog</CmdType>
 		bodyLower := strings.ToLower(body)
-		// 检查是否是Response格式的Catalog响应（检查Response标签和CmdType）
 		isCatalogResponse := strings.Contains(body, "<?xml") &&
 			(strings.Contains(bodyLower, "<response>") || strings.Contains(body, "<Response>")) &&
 			strings.Contains(bodyLower, "<cmdtype>catalog</cmdtype>")
-
-		// 如果上面没匹配到，再检查是否直接包含Catalog（某些设备可能格式不同）
 		if !isCatalogResponse {
-			isCatalogResponse = strings.Contains(body, "<?xml") &&
-				strings.Contains(bodyLower, "<cmdtype>catalog</cmdtype>")
+			isCatalogResponse = strings.Contains(body, "<?xml") && strings.Contains(bodyLower, "<cmdtype>catalog</cmdtype>")
 		}
 
-		Log.Infof("检查 Catalog 响应: is_xml=%v, contains_response=%v, contains_catalog=%v, body_preview=%s",
-			strings.Contains(body, "<?xml"),
-			strings.Contains(bodyLower, "<response>") || strings.Contains(body, "<Response>"),
-			strings.Contains(bodyLower, "<cmdtype>catalog</cmdtype>"),
-			func() string {
-				previewLen := 300
-				if len(body) < previewLen {
-					previewLen = len(body)
-				}
-				return body[:previewLen]
-			}())
-
 		if isCatalogResponse {
-			// 这是通道列表响应，解析XML
 			Log.Infof("检测到 Catalog 响应，开始解析. device_id=%s", deviceId)
 			s.parseCatalogResponse(deviceId, body)
 		} else if strings.Contains(body, "<?xml") {
-			// 其他XML消息（如Notify心跳），不需要解析通道列表
-			Log.Infof("收到其他 XML 消息（非 Catalog）. device_id=%s, body_preview=%s", deviceId, func() string {
-				previewLen := 200
-				if len(body) < previewLen {
-					previewLen = len(body)
+			// 解析 CmdType，处理 DeviceInfo / Alarm（参考 lalmax OnMessage）
+			var msgBody struct {
+				CmdType      string `xml:"CmdType"`
+				SN           string `xml:"SN"`
+				DeviceName   string `xml:"DeviceName"`
+				Manufacturer string `xml:"Manufacturer"`
+				Model        string `xml:"Model"`
+			}
+			if err := ParseXMLResponse([]byte(body), &msgBody); err == nil {
+				switch strings.TrimSpace(msgBody.CmdType) {
+				case "DeviceInfo":
+					s.mutex.Lock()
+					if d, ok := s.devices[deviceId]; ok {
+						if msgBody.DeviceName != "" {
+							d.DeviceName = msgBody.DeviceName
+						}
+						if msgBody.Manufacturer != "" {
+							d.Manufacturer = msgBody.Manufacturer
+						}
+						if msgBody.Model != "" {
+							d.Model = msgBody.Model
+						}
+					}
+					s.mutex.Unlock()
+				case "Alarm":
+					s.mutex.Lock()
+					if d, ok := s.devices[deviceId]; ok {
+						d.Status = "alarmed"
+					}
+					s.mutex.Unlock()
+					sn := msgBody.SN
+					if sn == "" {
+						sn = strconv.Itoa(GenerateSN())
+					}
+					messageResponseBody = BuildAlarmResponseXML(deviceId, "Alarm", sn)
 				}
-				return body[:previewLen]
-			}())
-		} else {
-			Log.Debugf("收到非 XML 消息体. device_id=%s, body_len=%d", deviceId, len(body))
+			}
 		}
+	}
+
+	if messageResponseBody != "" {
+		s.sendResponseWithBody(msg, 200, "OK", messageResponseBody, raddr)
 	} else {
-		Log.Debugf("收到空消息体. device_id=%s", deviceId)
+		s.sendResponse(msg, 200, "OK", raddr)
 	}
-
-	// 发送200 OK响应
-	callId := msg.Headers["call-id"]
-	from := msg.Headers["from"]
-	to := msg.Headers["to"]
-	cseq := msg.Headers["cseq"]
-	via := msg.Headers["via"]
-
-	headers := map[string]string{
-		"Via":            via,
-		"From":           from,
-		"To":             to + ";tag=" + GenerateTag(),
-		"Call-ID":        callId,
-		"CSeq":           cseq,
-		"Content-Length": "0",
-	}
-
-	response := BuildSipResponse(200, "OK", headers, "")
-	s.sendRaw(response, raddr)
 }
 
 // handleInvite 处理INVITE请求（设备主动推流）
@@ -778,10 +772,9 @@ func (s *Gb28181Server) handleInvite(msg *SipMessage, raddr *net.UDPAddr) {
 		"Content-Length": "0", // 先设置为0，后面会更新
 	}
 
-	// 构建SDP响应（使用服务器要接收RTP的端口）
-	// 注意：实际端口会在收到ACK后创建RTP Pub Session时确定，这里先使用占位符
-	// 但为了兼容，我们先构建一个基本的SDP响应
-	responseSdp := s.buildSdp(targetStream.Port, targetStream.IsTcp)
+	// 构建SDP响应（对齐 lalmax：o=channelId、y=ssrc、无 f=）
+	ssrc := fmt.Sprintf("%010d", time.Now().UnixNano()%1e10)
+	responseSdp := s.buildSdp(targetStream.Port, targetStream.IsTcp, targetStream.ChannelId, ssrc)
 	headers["Content-Length"] = fmt.Sprintf("%d", len(responseSdp))
 	response := BuildSipResponse(200, "OK", headers, responseSdp)
 	s.sendRaw(response, raddr)
@@ -873,6 +866,137 @@ func (s *Gb28181Server) handleBye(msg *SipMessage, raddr *net.UDPAddr) {
 	s.sendRaw(response, raddr)
 }
 
+// handleNotify 处理 NOTIFY 请求（参考 lalmax OnNotify：目录状态、MobilePosition）
+func (s *Gb28181Server) handleNotify(msg *SipMessage, raddr *net.UDPAddr) {
+	deviceId := ExtractDeviceId(msg.Headers["from"])
+	if deviceId == "" {
+		s.sendResponse(msg, 400, "Bad Request", raddr)
+		return
+	}
+
+	s.mutex.RLock()
+	_, exists := s.devices[deviceId]
+	s.mutex.RUnlock()
+	if !exists {
+		Log.Warnf("receive NOTIFY from unknown device. device_id=%s", deviceId)
+		s.sendResponse(msg, 404, "Not Found", raddr)
+		return
+	}
+
+	body := msg.Body
+	if body == "" || !strings.Contains(body, "<?xml") {
+		s.sendResponse(msg, 200, "OK", raddr)
+		return
+	}
+
+	// 解析 NOTIFY 体：CmdType + Catalog(DeviceList) 或 MobilePosition
+	type NotifyItem struct {
+		DeviceID  string `xml:"DeviceID"`
+		Name      string `xml:"Name"`
+		Event     string `xml:"Event"` // ON,OFF,VLOST,DEFECT,ADD,DEL,UPDATE
+		Status    string `xml:"Status"`
+		ParentID  string `xml:"ParentID"`
+		Longitude string `xml:"Longitude"`
+		Latitude  string `xml:"Latitude"`
+	}
+	var notifyStruct struct {
+		CmdType    string `xml:"CmdType"`
+		DeviceID   string `xml:"DeviceID"`
+		Time       string `xml:"Time"`
+		Longitude  string `xml:"Longitude"`
+		Latitude   string `xml:"Latitude"`
+		DeviceList struct {
+			Items []NotifyItem `xml:"Item"`
+		} `xml:"DeviceList"`
+	}
+	if err := ParseXMLResponse([]byte(body), &notifyStruct); err != nil {
+		Log.Warnf("parse NOTIFY body failed. device_id=%s, err=%v", deviceId, err)
+		s.sendResponse(msg, 200, "OK", raddr)
+		return
+	}
+
+	switch notifyStruct.CmdType {
+	case "Catalog":
+		for _, item := range notifyStruct.DeviceList.Items {
+			s.updateChannelStatus(deviceId, item.DeviceID, item.Event, item.Name, item.Status)
+		}
+	case "MobilePosition":
+		chId := notifyStruct.DeviceID
+		if chId == "" {
+			chId = deviceId
+		}
+		s.updateChannelPosition(deviceId, chId, notifyStruct.Longitude, notifyStruct.Latitude)
+	default:
+		Log.Debugf("NOTIFY CmdType not handled. device_id=%s, cmd_type=%s", deviceId, notifyStruct.CmdType)
+	}
+
+	s.sendResponse(msg, 200, "OK", raddr)
+}
+
+// updateChannelStatus 根据 NOTIFY Catalog 事件更新通道状态（ON/OFF/ADD/DEL/UPDATE）
+func (s *Gb28181Server) updateChannelStatus(deviceId, channelId, event, name, status string) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	device, ok := s.devices[deviceId]
+	if !ok {
+		return
+	}
+	if device.Channels == nil {
+		device.Channels = make(map[string]*Channel)
+	}
+	switch event {
+	case "ON":
+		if ch, ok := device.Channels[channelId]; ok {
+			ch.Status = "ON"
+		}
+	case "OFF", "VLOST", "DEFECT":
+		if ch, ok := device.Channels[channelId]; ok {
+			ch.Status = "OFF"
+		}
+	case "ADD":
+		device.Channels[channelId] = &Channel{ChannelId: channelId, ChannelName: name, Status: status}
+		if status == "" {
+			device.Channels[channelId].Status = "ON"
+		}
+	case "DEL":
+		delete(device.Channels, channelId)
+	case "UPDATE":
+		if ch, ok := device.Channels[channelId]; ok {
+			if name != "" {
+				ch.ChannelName = name
+			}
+			if status != "" {
+				ch.Status = status
+			}
+		} else {
+			device.Channels[channelId] = &Channel{ChannelId: channelId, ChannelName: name, Status: status}
+		}
+	}
+}
+
+// updateChannelPosition 更新通道或设备经纬度（NOTIFY MobilePosition）
+func (s *Gb28181Server) updateChannelPosition(deviceId, channelId, longitude, latitude string) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	device, ok := s.devices[deviceId]
+	if !ok {
+		return
+	}
+	if ch, ok := device.Channels[channelId]; ok {
+		ch.Longitude = longitude
+		ch.Latitude = latitude
+	} else if channelId == deviceId {
+		// 设备级位置可存到第一个通道或扩展 Device，此处仅更新已有通道
+		if len(device.Channels) > 0 {
+			for _, ch := range device.Channels {
+				ch.Longitude = longitude
+				ch.Latitude = latitude
+				break
+			}
+		}
+	}
+}
+
 // handleResponse 处理响应消息
 func (s *Gb28181Server) handleResponse(msg *SipMessage, raddr *net.UDPAddr) {
 	Log.Infof("========== 收到 SIP 响应 ==========")
@@ -893,7 +1017,6 @@ func (s *Gb28181Server) handleResponse(msg *SipMessage, raddr *net.UDPAddr) {
 		if len(body) > 0 && strings.Contains(body, "<?xml") {
 			bodyLower := strings.ToLower(body)
 			if strings.Contains(bodyLower, "<cmdtype>catalog</cmdtype>") {
-				// 从 From 头提取设备ID（响应中的 From 头是设备）
 				deviceId := ExtractDeviceId(msg.Headers["from"])
 				if deviceId != "" {
 					Log.Infof("在 200 OK 响应中检测到 Catalog XML，开始解析. device_id=%s", deviceId)
@@ -901,6 +1024,10 @@ func (s *Gb28181Server) handleResponse(msg *SipMessage, raddr *net.UDPAddr) {
 				} else {
 					Log.Warnf("在 200 OK 响应中检测到 Catalog XML，但无法提取设备ID. from=%s", msg.Headers["from"])
 				}
+			} else if strings.Contains(bodyLower, "<cmdtype>recordinfo</cmdtype>") {
+				// 录像列表查询的 200 OK 响应（参考 lalmax RecordInfo）
+				deviceId := ExtractDeviceId(msg.Headers["from"])
+				s.parseRecordInfoResponse(deviceId, body)
 			}
 		}
 
@@ -997,22 +1124,31 @@ func (s *Gb28181Server) handleResponse(msg *SipMessage, raddr *net.UDPAddr) {
 
 // sendResponse 发送响应
 func (s *Gb28181Server) sendResponse(req *SipMessage, statusCode int, statusText string, raddr *net.UDPAddr) {
+	s.sendResponseWithBody(req, statusCode, statusText, "", raddr)
+}
+
+// sendResponseWithBody 发送带 body 的 SIP 响应（如 Alarm 的 200 OK 需返回 XML）
+func (s *Gb28181Server) sendResponseWithBody(req *SipMessage, statusCode int, statusText string, body string, raddr *net.UDPAddr) {
 	callId := req.Headers["call-id"]
 	from := req.Headers["from"]
 	to := req.Headers["to"]
 	cseq := req.Headers["cseq"]
 	via := req.Headers["via"]
 
+	contentLength := "0"
+	if body != "" {
+		contentLength = strconv.Itoa(len(body))
+	}
 	headers := map[string]string{
 		"Via":            via,
 		"From":           from,
 		"To":             to + ";tag=" + GenerateTag(),
 		"Call-ID":        callId,
 		"CSeq":           cseq,
-		"Content-Length": "0",
+		"Content-Length": contentLength,
 	}
 
-	response := BuildSipResponse(statusCode, statusText, headers, "")
+	response := BuildSipResponse(statusCode, statusText, headers, body)
 	s.sendRaw(response, raddr)
 }
 
@@ -1053,8 +1189,9 @@ func (s *Gb28181Server) Invite(deviceId, channelId, streamName string, port int,
 	from := fmt.Sprintf("<sip:%s@%s>", serverId, s.config.LocalSipDomain)
 	to := fmt.Sprintf("<sip:%s@%s>", channelId, deviceDomain)
 
-	// 构建SDP
-	sdp := s.buildSdp(port, isTcp)
+	// SSRC 与 lalmax 一致：10 位数字，Subject 为 channelId:ssrc,serverId:0
+	ssrc := fmt.Sprintf("%010d", time.Now().UnixNano()%1e10)
+	sdp := s.buildSdp(port, isTcp, channelId, ssrc)
 
 	headers := map[string]string{
 		"Via":            fmt.Sprintf("SIP/2.0/UDP %s:%d;branch=%s;rport", s.config.LocalSipIp, s.config.LocalSipPort, branch),
@@ -1065,7 +1202,7 @@ func (s *Gb28181Server) Invite(deviceId, channelId, streamName string, port int,
 		"Contact":        fmt.Sprintf("<sip:%s@%s>", serverId, s.config.LocalSipDomain),
 		"Content-Type":   "application/sdp",
 		"Content-Length": fmt.Sprintf("%d", len(sdp)),
-		"Subject":        fmt.Sprintf("%s:0,%s:0:%d", channelId, serverId, streamType),
+		"Subject":        fmt.Sprintf("%s:%s,%s:0", channelId, ssrc, serverId),
 		"Max-Forwards":   "70",
 	}
 
@@ -1165,8 +1302,8 @@ func (s *Gb28181Server) Bye(deviceId, channelId, streamName string) error {
 	return nil
 }
 
-// buildSdp 构建SDP消息（包含视频参数）
-func (s *Gb28181Server) buildSdp(port int, isTcp bool) string {
+// buildSdp 构建SDP消息（对齐 lalmax 可播放实现：o=channelId、y=ssrc、无 f=）
+func (s *Gb28181Server) buildSdp(port int, isTcp bool, channelId string, ssrc string) string {
 	protocol := "RTP/AVP"
 	if isTcp {
 		protocol = "TCP/RTP/AVP"
@@ -1260,14 +1397,11 @@ func (s *Gb28181Server) buildSdp(port int, isTcp bool) string {
 		rtpmapLines = append(rtpmapLines, fmtpParams)
 	}
 
-	// 兼容性优先：多数GB28181设备只认PS封装（payload=96），并且对多payload声明较敏感。
-	// 这里强制只声明PS，提升“收到INVITE但不发流 / RTP不来”的设备兼容性。
+	// 兼容性优先：与 lalmax 一致，只声明 PS/96，无 f= 字段
 	payloadTypes = []string{"96"}
 	rtpmapLines = []string{"a=rtpmap:96 PS/90000"}
-	// y= SSRC：10位数字字符串是常见兼容写法
-	ssrc := fmt.Sprintf("%010d", time.Now().UnixNano()%1e10)
 
-	// 构建SDP主体
+	// 构建SDP主体（o=channelId、s=Play、t=0 0、y=ssrc，无 f=）
 	sdp := fmt.Sprintf(`v=0
 o=%s 0 0 IN IP4 %s
 s=Play
@@ -1276,8 +1410,13 @@ t=0 0
 m=video %d %s %s
 a=recvonly
 y=%s
-f=v/2/5/1
-`, s.config.LocalSipId, mediaIp, mediaIp, port, protocol, strings.Join(payloadTypes, " "), ssrc)
+`, channelId, mediaIp, mediaIp, port, protocol, strings.Join(payloadTypes, " "), ssrc)
+
+	// 海康等设备的TCP媒体兼容：必须带 setup/connection，平台通常作为被动端(passive)监听等待设备连接
+	if isTcp {
+		sdp += "a=setup:passive\n"
+		sdp += "a=connection:new\n"
+	}
 
 	// 添加rtpmap行
 	for _, line := range rtpmapLines {
@@ -1301,8 +1440,8 @@ f=v/2/5/1
 	return sdp
 }
 
-// buildPlaybackSdp 构建回放SDP消息（符合GB28181标准，包含时间范围和倍速）
-func (s *Gb28181Server) buildPlaybackSdp(port int, isTcp bool, channelId string, startTime, endTime time.Time, scale float64) string {
+// buildPlaybackSdp 构建回放SDP消息（对齐 lalmax 可播放实现：o=channelId、s=Play、t=NTP、无 u/f 字段）
+func (s *Gb28181Server) buildPlaybackSdp(port int, isTcp bool, channelId string, startTime, endTime time.Time, scale float64, ssrc string) string {
 	protocol := "RTP/AVP"
 	if isTcp {
 		protocol = "TCP/RTP/AVP"
@@ -1313,83 +1452,29 @@ func (s *Gb28181Server) buildPlaybackSdp(port int, isTcp bool, channelId string,
 		mediaIp = s.config.LocalSipIp
 	}
 
-	// 确定视频编码格式和RTP payload type（复用buildSdp的逻辑）
-	videoCodec := s.config.VideoCodec
-	if videoCodec == "" {
-		videoCodec = "H264"
-	}
+	// 兼容性优先：回放与 lalmax 一致，只声明 PS/96
+	payloadTypes := []string{"96"}
+	rtpmapLines := []string{"a=rtpmap:96 PS/90000"}
 
-	var payloadTypes []string
-	var rtpmapLines []string
-
-	switch strings.ToUpper(videoCodec) {
-	case "H265", "HEVC":
-		payloadTypes = []string{"96", "99"}
-		rtpmapLines = []string{
-			"a=rtpmap:96 PS/90000",
-			"a=rtpmap:99 H265/90000",
-		}
-	case "H264":
-		fallthrough
-	default:
-		payloadTypes = []string{"96", "98"}
-		rtpmapLines = []string{
-			"a=rtpmap:96 PS/90000",
-			"a=rtpmap:98 H264/90000",
-		}
-		// H264的fmtp参数
-		fmtpParams := "a=fmtp:98 "
-		params := []string{}
-		profileLevelId := "42E028"
-		if s.config.VideoProfile != "" {
-			profileMap := map[string]string{
-				"baseline": "42E0",
-				"main":     "4D00",
-				"high":     "6400",
-			}
-			if profilePrefix, ok := profileMap[strings.ToLower(s.config.VideoProfile)]; ok {
-				levelMap := map[string]string{
-					"3.0": "1F", "3.1": "28", "3.2": "2A",
-					"4.0": "33", "4.1": "29", "4.2": "2A",
-				}
-				if levelId, ok := levelMap[s.config.VideoLevel]; ok {
-					profileLevelId = profilePrefix + levelId
-				} else {
-					profileLevelId = profilePrefix + "28"
-				}
-			}
-		}
-		params = append(params, "profile-level-id="+profileLevelId)
-		params = append(params, "packetization-mode=1")
-		fmtpParams += strings.Join(params, ";")
-		rtpmapLines = append(rtpmapLines, fmtpParams)
-	}
-
-	// 兼容性优先：回放同样强制只声明PS（payload=96）
-	payloadTypes = []string{"96"}
-	rtpmapLines = []string{"a=rtpmap:96 PS/90000"}
-	ssrc := fmt.Sprintf("%010d", time.Now().UnixNano()%1e10)
-
-	// 将时间转换为NTP时间戳（秒，符合GB28181标准）
-	// NTP时间戳 = Unix时间戳 + 2208988800（1900-01-01到1970-01-01的秒数）
+	// 将时间转换为NTP时间戳（秒，与 lalmax InviteOptions.String() 的 t= 一致）
 	ntpStart := uint64(startTime.Unix()) + 2208988800
 	ntpEnd := uint64(endTime.Unix()) + 2208988800
 
-	// 构建SDP主体（回放模式，符合GB28181标准）
-	// s=Playback 标识回放操作（GB28181标准要求）
-	// u=<channelId>:<playbackType> 指定回放通道和类型（GB28181标准）
-	// t=<start> <end> 指定回放时间段（NTP时间戳格式，GB28181标准要求）
+	// SDP 格式对齐 lalmax channel.Invite：o=channelId、s=Play、t=start end、无 u= 和 f=
 	sdp := fmt.Sprintf(`v=0
 o=%s 0 0 IN IP4 %s
-s=Playback
-u=%s:0
+s=Play
 c=IN IP4 %s
 t=%d %d
 m=video %d %s %s
 a=recvonly
 y=%s
-f=v/2/5/1
-`, s.config.LocalSipId, mediaIp, channelId, mediaIp, ntpStart, ntpEnd, port, protocol, strings.Join(payloadTypes, " "), ssrc)
+`, channelId, mediaIp, mediaIp, ntpStart, ntpEnd, port, protocol, strings.Join(payloadTypes, " "), ssrc)
+
+	if isTcp {
+		sdp += "a=setup:passive\n"
+		sdp += "a=connection:new\n"
+	}
 
 	// 添加rtpmap行
 	for _, line := range rtpmapLines {
@@ -1445,13 +1530,12 @@ func (s *Gb28181Server) Playback(deviceId, channelId, streamName string, port in
 	from := fmt.Sprintf("<sip:%s@%s>", serverId, s.config.LocalSipDomain)
 	to := fmt.Sprintf("<sip:%s@%s>", channelId, deviceDomain)
 
-	// 构建回放SDP（符合GB28181标准）
-	sdp := s.buildPlaybackSdp(port, isTcp, channelId, startTime, endTime, scale)
+	// SSRC 与 lalmax 一致：10 位数字，与 SDP 的 y= 及 Subject 中的 channelId:ssrc 保持一致
+	ssrc := fmt.Sprintf("%010d", time.Now().UnixNano()%1e10)
+	sdp := s.buildPlaybackSdp(port, isTcp, channelId, startTime, endTime, scale, ssrc)
 
-	// Subject头格式：GB28181标准格式
-	// 格式：<channelId>:<streamType>,<serverId>:<streamType>
-	// 注意：回放模式通过SDP中的s=Playback标识，Subject头使用标准格式即可
-	subject := fmt.Sprintf("%s:0,%s:0", channelId, serverId)
+	// Subject 对齐 lalmax：channelId:ssrc,serverId:0（可正常播放的实现）
+	subject := fmt.Sprintf("%s:%s,%s:0", channelId, ssrc, serverId)
 
 	headers := map[string]string{
 		"Via":            fmt.Sprintf("SIP/2.0/UDP %s:%d;branch=%s;rport", s.config.LocalSipIp, s.config.LocalSipPort, branch),
@@ -1469,10 +1553,16 @@ func (s *Gb28181Server) Playback(deviceId, channelId, streamName string, port in
 
 	request := BuildSipRequest(SipMethodInvite, requestUri, headers, sdp)
 
-	// 发送请求
+	// 发送请求：与 Invite 一致，优先使用 RemoteIP/RemotePort（raddr），避免 NAT 下 INVITE 发到内网导致回放失败
+	targetIP := device.Ip
+	targetPort := device.Port
+	if device.RemoteIP != "" && device.RemotePort != 0 {
+		targetIP = device.RemoteIP
+		targetPort = device.RemotePort
+	}
 	addr := &net.UDPAddr{
-		IP:   net.ParseIP(device.Ip),
-		Port: device.Port,
+		IP:   net.ParseIP(targetIP),
+		Port: targetPort,
 	}
 	s.sendRaw(request, addr)
 
@@ -1520,6 +1610,17 @@ func (s *Gb28181Server) GetDevice(deviceId string) *Device {
 	s.mutex.RLock()
 	defer s.mutex.RUnlock()
 	return s.devices[deviceId]
+}
+
+// FindChannel 根据设备ID和通道ID查找通道（参考 lalmax FindChannel）
+func (s *Gb28181Server) FindChannel(deviceId, channelId string) *Channel {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+	device, ok := s.devices[deviceId]
+	if !ok || device.Channels == nil {
+		return nil
+	}
+	return device.Channels[channelId]
 }
 
 // GetStream 获取流信息
@@ -1656,6 +1757,52 @@ func (s *Gb28181Server) QueryDeviceStatus(deviceId string) error {
 	return nil
 }
 
+// QueryRecordInfo 查询录像文件列表（参考 lalmax RecordInfoXML，设备 200 OK 体可能返回录像列表）
+// startTime/endTime 格式建议：2006-01-02T15:04:05；channelId 为空时使用 deviceId
+func (s *Gb28181Server) QueryRecordInfo(deviceId, channelId string, startTime, endTime time.Time) error {
+	s.mutex.RLock()
+	device, exists := s.devices[deviceId]
+	s.mutex.RUnlock()
+
+	if !exists {
+		return fmt.Errorf("device not found: %s", deviceId)
+	}
+
+	st := startTime.Format("2006-01-02T15:04:05")
+	et := endTime.Format("2006-01-02T15:04:05")
+	recordInfoXml := BuildRecordInfoQueryXML(deviceId, channelId, GenerateSN(), st, et)
+
+	deviceDomain := getDeviceDomain(deviceId)
+	requestUri := fmt.Sprintf("sip:%s@%s", deviceId, deviceDomain)
+	from := fmt.Sprintf("<sip:%s@%s>", s.config.LocalSipId, s.config.LocalSipDomain)
+	to := fmt.Sprintf("<sip:%s@%s>", deviceId, deviceDomain)
+
+	branch := GenerateBranch()
+	callId := GenerateCallId()
+	headers := map[string]string{
+		"Via":            fmt.Sprintf("SIP/2.0/UDP %s:%d;branch=%s;rport", s.config.LocalSipIp, s.config.LocalSipPort, branch),
+		"From":           from + ";tag=" + GenerateTag(),
+		"To":             to,
+		"Call-ID":        callId,
+		"CSeq":           "1 MESSAGE",
+		"Max-Forwards":   "70",
+		"Content-Type":   "Application/MANSCDP+xml",
+		"Content-Length": fmt.Sprintf("%d", len(recordInfoXml)),
+	}
+
+	request := BuildSipRequest(SipMethodMessage, requestUri, headers, recordInfoXml)
+
+	targetIP, targetPort := device.Ip, device.Port
+	if device.RemoteIP != "" && device.RemotePort != 0 {
+		targetIP, targetPort = device.RemoteIP, device.RemotePort
+	}
+	addr := &net.UDPAddr{IP: net.ParseIP(targetIP), Port: targetPort}
+	s.sendRaw(request, addr)
+
+	Log.Infof("send record info query to device. device_id=%s, channel_id=%s, start=%s, end=%s", deviceId, channelId, st, et)
+	return nil
+}
+
 // QueryCatalog 查询通道列表（发送查询请求）
 func (s *Gb28181Server) QueryCatalog(deviceId string) error {
 	s.mutex.RLock()
@@ -1737,10 +1884,14 @@ func (s *Gb28181Server) queryCatalog(deviceId string) {
 
 	request := sb.String()
 
-	// 发送请求
+	// 发送请求：与 Invite 一致，优先使用 RemoteIP/RemotePort（NAT）
+	targetIP, targetPort := device.Ip, device.Port
+	if device.RemoteIP != "" && device.RemotePort != 0 {
+		targetIP, targetPort = device.RemoteIP, device.RemotePort
+	}
 	addr := &net.UDPAddr{
-		IP:   net.ParseIP(device.Ip),
-		Port: device.Port,
+		IP:   net.ParseIP(targetIP),
+		Port: targetPort,
 	}
 
 	Log.Infof("========== 发送 Catalog 查询请求 ==========")
@@ -1980,6 +2131,41 @@ func (s *Gb28181Server) parseCatalogResponse(deviceId string, xmlBody string) {
 	s.mutex.Unlock()
 
 	Log.Infof("parse catalog response success. device_id=%s, total_items=%d, channel_count=%d", deviceId, len(items), channelCount)
+}
+
+// parseRecordInfoResponse 解析录像列表 200 OK 响应（参考 lalmax RecordInfo）
+func (s *Gb28181Server) parseRecordInfoResponse(deviceId string, xmlBody string) {
+	type RecordItem struct {
+		DeviceID   string `xml:"DeviceID"`
+		Name       string `xml:"Name"`
+		FilePath   string `xml:"FilePath"`
+		Address    string `xml:"Address"`
+		StartTime  string `xml:"StartTime"`
+		EndTime    string `xml:"EndTime"`
+		Secrecy    string `xml:"Secrecy"`
+		Type       string `xml:"Type"`
+		RecorderID string `xml:"RecorderID"`
+	}
+	var resp struct {
+		XMLName    xml.Name `xml:"Response"`
+		CmdType    string   `xml:"CmdType"`
+		SN         string   `xml:"SN"`
+		DeviceID   string   `xml:"DeviceID"`
+		SumNum     string   `xml:"SumNum"`
+		Result     string   `xml:"Result"`
+		RecordList struct {
+			Items []RecordItem `xml:"Item"`
+		} `xml:"RecordList"`
+	}
+	if err := ParseXMLResponse([]byte(xmlBody), &resp); err != nil {
+		Log.Warnf("parse record info response failed. device_id=%s, err=%v", deviceId, err)
+		return
+	}
+	Log.Infof("record info response. device_id=%s, sum_num=%s, result=%s, item_count=%d",
+		deviceId, resp.SumNum, resp.Result, len(resp.RecordList.Items))
+	for i, it := range resp.RecordList.Items {
+		Log.Debugf("record[%d] device_id=%s name=%s start=%s end=%s", i, it.DeviceID, it.Name, it.StartTime, it.EndTime)
+	}
 }
 
 // scheduleCatalogQuery 定时查询Catalog（后台策略）

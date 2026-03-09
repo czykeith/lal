@@ -23,6 +23,7 @@ const (
 	SipMethodAck      = "ACK"
 	SipMethodBye      = "BYE"
 	SipMethodMessage  = "MESSAGE"
+	SipMethodNotify   = "NOTIFY"
 	SipMethodCancel   = "CANCEL"
 )
 
