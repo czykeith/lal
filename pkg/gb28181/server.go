@@ -23,19 +23,20 @@ import (
 
 // Gb28181Server GB28181信令服务器
 type Gb28181Server struct {
-	addr          string
-	conn          *nazanet.UdpConnection
-	udpConn       *net.UDPConn // 底层UDP连接，用于发送数据
-	config        *ServerConfig
-	devices       map[string]*Device            // 设备ID -> 设备信息
-	streams       map[string]*Stream            // stream_name -> 流信息
-	deviceStreams map[string]map[string]*Stream // 设备ID -> stream_name -> 流信息（索引优化）
-	nonces        map[string]string             // 设备ID -> nonce（用于认证）
-	mutex         sync.RWMutex
-	stopChan      chan struct{} // 停止信号
-	onInvite      func(deviceId, channelId, streamName string, port int, isTcp bool) error
-	onBye         func(deviceId, channelId, streamName string) error
-	onReconnect   func(deviceId string) error
+	addr               string
+	conn               *nazanet.UdpConnection
+	udpConn            *net.UDPConn // 底层UDP连接，用于发送数据
+	config             *ServerConfig
+	devices            map[string]*Device            // 设备ID -> 设备信息
+	streams            map[string]*Stream            // stream_name -> 流信息
+	deviceStreams      map[string]map[string]*Stream // 设备ID -> stream_name -> 流信息（索引优化）
+	nonces             map[string]string             // 设备ID -> nonce（用于认证）
+	mutex              sync.RWMutex
+	stopChan           chan struct{} // 停止信号
+	onInvite           func(deviceId, channelId, streamName string, port int, isTcp bool) error
+	onBye              func(deviceId, channelId, streamName string) error
+	onReconnect        func(deviceId string) error
+	inviteAckedCallIds map[string]struct{} // 已对 INVITE 200 OK 发过 ACK 的 Call-ID，同一会话只触发一次 onInvite
 }
 
 // ServerConfig GB28181服务器配置
@@ -134,12 +135,13 @@ func NewGb28181Server(config *ServerConfig) *Gb28181Server {
 	}
 
 	server := &Gb28181Server{
-		config:        config,
-		devices:       make(map[string]*Device),
-		streams:       make(map[string]*Stream),
-		deviceStreams: make(map[string]map[string]*Stream),
-		nonces:        make(map[string]string),
-		stopChan:      make(chan struct{}),
+		config:             config,
+		devices:            make(map[string]*Device),
+		streams:            make(map[string]*Stream),
+		deviceStreams:      make(map[string]map[string]*Stream),
+		nonces:             make(map[string]string),
+		stopChan:           make(chan struct{}),
+		inviteAckedCallIds: make(map[string]struct{}),
 	}
 
 	// 启动设备状态监控
@@ -1072,10 +1074,10 @@ func (s *Gb28181Server) handleResponse(msg *SipMessage, raddr *net.UDPAddr) {
 					}
 				} else {
 					// 使用To头构建Request-URI
-					to := msg.Headers["to"]
+					toHeader := msg.Headers["to"]
 					// To: <sip:34020000001310000001@192.168.1.100:5060>;tag=xxx
 					re := regexp.MustCompile(`<([^>]+)>`)
-					matches := re.FindStringSubmatch(to)
+					matches := re.FindStringSubmatch(toHeader)
 					if len(matches) > 1 {
 						requestUri = matches[1]
 					} else {
@@ -1087,7 +1089,7 @@ func (s *Gb28181Server) handleResponse(msg *SipMessage, raddr *net.UDPAddr) {
 
 				// 构建ACK请求（From头使用域格式，符合GB28181标准）
 				from := fmt.Sprintf("<sip:%s@%s>", s.config.LocalSipId, s.config.LocalSipDomain)
-				to := msg.Headers["to"] // 使用200 OK响应中的To头（包含tag）
+				toHeader := msg.Headers["to"] // 使用200 OK响应中的To头（包含tag）
 				cseq := msg.Headers["cseq"]
 				// CSeq可能包含方法名，ACK只需要数字
 				cseqNum := cseq
@@ -1099,23 +1101,46 @@ func (s *Gb28181Server) handleResponse(msg *SipMessage, raddr *net.UDPAddr) {
 				ackHeaders := map[string]string{
 					"Via":            via,
 					"From":           from,
-					"To":             to, // 使用200 OK响应中的To头（包含tag）
+					"To":             toHeader, // 使用200 OK响应中的To头（包含tag）
 					"Call-ID":        callId,
 					"CSeq":           cseqNum + " ACK",
 					"Content-Length": "0",
 				}
 
 				ackRequest := BuildSipRequest(SipMethodAck, requestUri, ackHeaders, "")
-				s.sendRaw(ackRequest, raddr)
-				Log.Infof("send ACK to device. device_id=%s, channel_id=%s, stream_name=%s", targetStream.DeviceId, targetStream.ChannelId, targetStream.StreamName)
-			}
 
-			// 如果设置了回调，调用回调处理
-			if s.onInvite != nil {
-				// 从SDP中提取RTP端口（简化处理，实际应该解析SDP）
-				// 这里使用之前设置的端口
-				if err := s.onInvite(targetStream.DeviceId, targetStream.ChannelId, targetStream.StreamName, targetStream.Port, targetStream.IsTcp); err != nil {
-					Log.Warnf("onInvite callback failed. err=%+v", err)
+				// ACK 发往 Contact 的 host:port，便于 NAT/部分设备正确收包；若无法解析则用 200 OK 来源地址
+				ackDest := raddr
+				if contact != "" {
+					if host, port := ExtractContactAddr(contact); host != "" && port > 0 {
+						if a, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", host, port)); err == nil {
+							ackDest = a
+							Log.Infof("send ACK to Contact address. contact=%s, ack_dest=%s:%d", contact, host, port)
+						}
+					}
+				}
+				s.sendRaw(ackRequest, ackDest)
+
+				// 同一 Call-ID 只触发一次 onInvite（设备可能多次重传 200 OK）
+				s.mutex.Lock()
+				firstAck := true
+				if _, ok := s.inviteAckedCallIds[callId]; ok {
+					firstAck = false
+				} else {
+					s.inviteAckedCallIds[callId] = struct{}{}
+					if len(s.inviteAckedCallIds) > 500 {
+						s.inviteAckedCallIds = make(map[string]struct{})
+					}
+				}
+				s.mutex.Unlock()
+
+				Log.Infof("send ACK to device. device_id=%s, channel_id=%s, stream_name=%s, first_ack=%v", targetStream.DeviceId, targetStream.ChannelId, targetStream.StreamName, firstAck)
+
+				// 仅首次 200 OK 时调用 onInvite，避免重传导致重复处理
+				if firstAck && s.onInvite != nil {
+					if err := s.onInvite(targetStream.DeviceId, targetStream.ChannelId, targetStream.StreamName, targetStream.Port, targetStream.IsTcp); err != nil {
+						Log.Warnf("onInvite callback failed. err=%+v", err)
+					}
 				}
 			}
 		}
