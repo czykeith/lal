@@ -235,14 +235,12 @@ func (s *GB28181Server) OnStopMediaServer(netWork string, singlePort bool, devic
 			value, ok := s.MediaServerMap.Load(key)
 			if ok {
 				mediasvr = value.(*mediaserver.GB28181MediaServer)
-				s.MediaServerMap.Delete(key)
 			}
 		} else {
 			key := fmt.Sprintf("%s%d", "udp", s.conf.MediaConfig.ListenPort)
 			value, ok := s.MediaServerMap.Load(key)
 			if ok {
 				mediasvr = value.(*mediaserver.GB28181MediaServer)
-				s.MediaServerMap.Delete(key)
 			}
 		}
 	} else {

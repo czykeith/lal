@@ -269,6 +269,24 @@ func (sm *ServerManager) CtrlGb28181Invite(info base.ApiCtrlGb28181InviteReq) (r
 		return
 	}
 
+	// 防止重复拉流：
+	// - 如果该通道已经在拉流，且 stream_name 相同，则幂等返回成功（不重复发送 INVITE）。
+	// - 如果 stream_name 不同，则拒绝，避免一个通道被重复点播导致资源泄漏或状态错乱。
+	if ch.MediaInfo.IsInvite && ch.MediaInfo.StreamName != "" {
+		if ch.MediaInfo.StreamName == streamName {
+			ret.ErrorCode = base.ErrorCodeSucc
+			ret.Desp = base.DespSucc
+			ret.Data.StreamName = streamName
+			if port := parseGb28181MediaPort(ch.MediaInfo.MediaKey); port > 0 {
+				ret.Data.Port = port
+			}
+			return
+		}
+		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
+		ret.Desp = fmt.Sprintf("gb28181 already inviting. current_stream_name=%s", ch.MediaInfo.StreamName)
+		return
+	}
+
 	network := "udp"
 	if info.IsTcpFlag == 1 {
 		network = "tcp"
