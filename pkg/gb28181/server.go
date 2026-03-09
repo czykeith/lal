@@ -45,6 +45,13 @@ type GB28181Server struct {
 
 const MaxRegisterCount = 3
 
+func sipMaybeStringTrim(v sip.MaybeString) string {
+	if v == nil {
+		return ""
+	}
+	return strings.TrimSpace(v.String())
+}
+
 var (
 	logger log.Logger
 	sipsvr gosip.Server
@@ -263,7 +270,7 @@ func (s *GB28181Server) CheckSsrc(ssrc uint32) (*mediaserver.MediaInfo, bool) {
 		d := value.(*Device)
 		d.channelMap.Range(func(key, value any) bool {
 			ch := value.(*Channel)
-			if ch.MediaInfo.Ssrc == ssrc {
+			if ch.MediaInfo.IsInvite && ch.MediaInfo.Ssrc == ssrc {
 				isValidSsrc = true
 				mediaInfo = &ch.MediaInfo
 				return false
@@ -290,7 +297,7 @@ func (s *GB28181Server) GetMediaInfoByKey(key string) (*mediaserver.MediaInfo, b
 		d := value.(*Device)
 		d.channelMap.Range(func(_, value any) bool {
 			ch := value.(*Channel)
-			if ch.MediaInfo.MediaKey == key {
+			if ch.MediaInfo.IsInvite && ch.MediaInfo.MediaKey == key {
 				isValidMediaInfo = true
 				mediaInfo = &ch.MediaInfo
 				return false
@@ -847,14 +854,20 @@ func (s *GB28181Server) StoreDevice(id string, req sip.Request) (d *Device) {
 		} else {
 			d.sipSvr = s.sipTcpSvr
 		}
+		// REGISTER 的 From DisplayName 作为设备名（未收过 DeviceInfo 时优先显示）
+		if dn := sipMaybeStringTrim(from.DisplayName); dn != "" && d.Name == "" {
+			d.Name = dn
+		}
 		base.Log.Info("UpdateDevice, netaddr:", d.NetAddr)
 	} else {
 		servIp := req.Recipient().Host()
 
 		sipIp := s.conf.SipIP
 		mediaIp := s.conf.MediaConfig.MediaIp
+		name := sipMaybeStringTrim(from.DisplayName)
 		d = &Device{
 			ID:           id,
+			Name:         name,
 			RegisterTime: time.Now(),
 			UpdateTime:   time.Now(),
 			Status:       DeviceRegisterStatus,
@@ -883,6 +896,9 @@ func (s *GB28181Server) RecoverDevice(d *Device, req sip.Request) {
 	d.addr = sip.Address{
 		DisplayName: from.DisplayName,
 		Uri:         from.Address,
+	}
+	if dn := sipMaybeStringTrim(from.DisplayName); dn != "" && d.Name == "" {
+		d.Name = dn
 	}
 	deviceIp := req.Source()
 	servIp := req.Recipient().Host()

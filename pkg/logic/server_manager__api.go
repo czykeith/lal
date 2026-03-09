@@ -251,12 +251,17 @@ func (sm *ServerManager) CtrlGb28181Invite(info base.ApiCtrlGb28181InviteReq) (r
 		streamName = info.DeviceId + info.ChannelId
 	}
 
-	// 0=主码流，1=辅码流；若传入非法值，则按主码流处理。
-	streamType := info.StreamType
-	if streamType != 0 && streamType != 1 {
-		streamType = 0
+	// 统一使用码流索引 stream_index：0=主，1=子，2=第三...
+	streamIndex := info.StreamIndex
+	if streamIndex < 0 {
+		streamIndex = 0
 	}
 
+	// 内部通道选择目前仅区分主/子（heuristic），因此将 index 映射为主(0) / 子(1)。
+	streamType := 0
+	if streamIndex != 0 {
+		streamType = 1
+	}
 	ch := sm.gb28181Server.FindChannelWithStreamType(info.DeviceId, info.ChannelId, streamType)
 	if ch == nil {
 		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
@@ -269,12 +274,12 @@ func (sm *ServerManager) CtrlGb28181Invite(info base.ApiCtrlGb28181InviteReq) (r
 		network = "tcp"
 	}
 	playInfo := &gb28181.PlayInfo{
-		NetWork:    network,
-		DeviceId:   info.DeviceId,
-		ChannelId:  info.ChannelId,
-		StreamName: streamName,
-		SinglePort: false,
-		StreamType: streamType,
+		NetWork:     network,
+		DeviceId:    info.DeviceId,
+		ChannelId:   info.ChannelId,
+		StreamName:  streamName,
+		SinglePort:  false,
+		StreamIndex: streamIndex,
 	}
 	code, err := ch.Invite(&gb28181.InviteOptions{}, streamName, playInfo)
 	if err != nil || code != 200 {

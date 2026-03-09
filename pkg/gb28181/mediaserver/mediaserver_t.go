@@ -15,6 +15,7 @@ func (m *MediaInfo) Clear() (err error) {
 	m.StreamName = ""
 	m.SinglePort = false
 	m.DumpFileName = ""
+	m.MediaKey = ""
 
 	return
 }

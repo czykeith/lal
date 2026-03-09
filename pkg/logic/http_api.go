@@ -319,8 +319,9 @@ func (h *HttpApiServer) ctrlGb28181InviteHandler(w http.ResponseWriter, req *htt
 	if !j.Exist("is_tcp_flag") {
 		info.IsTcpFlag = 0
 	}
-	if !j.Exist("stream_type") {
-		info.StreamType = 1 // 默认辅码流
+	// 统一使用 stream_index；未传时默认使用子码流索引 1（保持历史默认行为）
+	if !j.Exist("stream_index") {
+		info.StreamIndex = 1
 	}
 
 	Log.Infof("http api gb28181 invite. req info=%+v", info)

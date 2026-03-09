@@ -74,7 +74,8 @@ type ApiCtrlGb28181InviteReq struct {
 	StreamName string `json:"stream_name"` // 流名称（可选，默认使用 device_id_channel_id）
 	Port       int    `json:"port"`        // RTP接收端口（可选，0表示自动分配）
 	IsTcpFlag  int    `json:"is_tcp_flag"` // 是否使用TCP传输（0=UDP，1=TCP，默认0）
-	StreamType int    `json:"stream_type"` // 码流类型（0=主码流，1=辅码流，默认0）
+	// StreamIndex 码流索引（可选；海康等设备常用 0=主，1=子，2=第三...）
+	StreamIndex int `json:"stream_index"`
 }
 
 // ApiCtrlGb28181ByeReq GB28181停止拉流请求

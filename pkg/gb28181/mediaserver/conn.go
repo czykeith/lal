@@ -17,6 +17,7 @@ import (
 
 var (
 	ErrInvalidPsData = errors.New("invalid mpegps data")
+	ErrInvalidSsrc   = errors.New("invalid ssrc")
 )
 
 type Frame struct {
@@ -87,11 +88,18 @@ func (c *Conn) SetKey(key string) {
 }
 func (c *Conn) Serve() (err error) {
 	defer func() {
-		base.Log.Info("conn close, err:", err)
+		// 频繁的无效 SSRC 多数来自端口扫描或非预期设备推流，降噪避免刷屏。
+		if err != nil && errors.Is(err, ErrInvalidSsrc) {
+			base.Log.Debug("conn close, err:", err)
+		} else {
+			base.Log.Info("conn close, err:", err)
+		}
 		c.Close()
 
 		if c.observer != nil {
-			c.observer.NotifyClose(c.streamName)
+			if c.streamName != "" {
+				c.observer.NotifyClose(c.streamName)
+			}
 		}
 		if c.psDumpFile != nil {
 			c.psDumpFile.Close()
@@ -101,7 +109,8 @@ func (c *Conn) Serve() (err error) {
 		}
 	}()
 
-	base.Log.Info("gb28181 conn, remoteaddr:", c.conn.RemoteAddr().String(), " localaddr:", c.conn.LocalAddr().String())
+	// 单端口模式下 UDP 端口可能会被外部探测，连接建立日志容易刷屏；改为 Debug。
+	base.Log.Debug("gb28181 conn, remoteaddr:", c.conn.RemoteAddr().String(), " localaddr:", c.conn.LocalAddr().String())
 
 	for {
 		c.conn.SetReadDeadline(time.Now().Add(10 * time.Second))
@@ -144,8 +153,9 @@ func (c *Conn) Serve() (err error) {
 			if pkt.SSRC != 0 {
 				mediaInfo, ok = c.observer.CheckSsrc(pkt.SSRC)
 				if !ok {
-					base.Log.Error("invalid ssrc:", pkt.SSRC)
-					return fmt.Errorf("invalid ssrc:%d", pkt.SSRC)
+					// 降噪：未知 SSRC 直接关闭连接（多为扫描或非预期推流）
+					base.Log.Debug("invalid ssrc:", pkt.SSRC, " remoteaddr:", c.conn.RemoteAddr().String(), " localaddr:", c.conn.LocalAddr().String())
+					return fmt.Errorf("%w:%d", ErrInvalidSsrc, pkt.SSRC)
 				}
 			} else {
 				mediaInfo, ok = c.observer.GetMediaInfoByKey(c.key)

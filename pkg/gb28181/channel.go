@@ -171,6 +171,15 @@ func (channel *Channel) Invite(opt *InviteOptions, streamName string, playInfo *
 		opt.MediaPort = mediaserver.GetListenerPort()
 	}
 
+	// 提前写入 MediaInfo（避免设备在 200 OK 后立刻推流导致 SSRC 校验竞态）
+	// 注意：GB28181Server.CheckSsrc/GetMediaInfoByKey 会要求 IsInvite=true 才视为有效。
+	channel.MediaInfo.IsInvite = true
+	channel.MediaInfo.Ssrc = opt.SSRC
+	channel.MediaInfo.StreamName = streamName
+	channel.MediaInfo.SinglePort = playInfo.SinglePort
+	channel.MediaInfo.DumpFileName = playInfo.DumpFileName
+	channel.MediaInfo.MediaKey = fmt.Sprintf("%s%d", playInfo.NetWork, mediaserver.GetListenerPort())
+
 	sdpInfo := []string{
 		"v=0",
 		fmt.Sprintf("o=%s 0 0 IN IP4 %s", channel.ChannelId, d.mediaIP),
@@ -183,13 +192,18 @@ func (channel *Channel) Invite(opt *InviteOptions, streamName string, playInfo *
 		"y=" + opt.ssrc,
 	}
 
-	// 主/子码流标识（常用扩展，海康等设备支持）
-	// Subject 末尾 :1=主、:2=子（见下方）；SDP 中 streamprofile 与 streamid 二选一或同时携带
-	if playInfo.StreamType == 1 {
-		sdpInfo = append(sdpInfo, "a=streamprofile=sub", "a=streamid:2")
-	} else {
-		sdpInfo = append(sdpInfo, "a=streamprofile=main", "a=streamid:1")
+	// 码流索引（常用扩展，海康等设备支持，0=主，1=子，2=第三...）
+	// 说明：
+	// - 海康常见写法：Subject 为 "通道ID:索引,平台ID:索引"（示例：3402..:0,1001:0）
+	// - SDP 扩展常见写法：a=streamprofile:<index> / a=streamid:<index>
+	streamIndex := playInfo.StreamIndex
+	if streamIndex < 0 {
+		streamIndex = 0
 	}
+	sdpInfo = append(sdpInfo,
+		fmt.Sprintf("a=streamprofile:%d", streamIndex),
+		fmt.Sprintf("a=streamid:%d", streamIndex),
+	)
 
 	if playInfo.NetWork == "tcp" {
 		sdpInfo = append(sdpInfo, "a=setup:passive", "a=connection:new")
@@ -199,18 +213,15 @@ func (channel *Channel) Invite(opt *InviteOptions, streamName string, playInfo *
 	contentType := sip.ContentType("application/sdp")
 	invite.AppendHeader(&contentType)
 
-	contentLength := sip.ContentLength(len(sdpInfo))
+	body := strings.Join(sdpInfo, "\r\n") + "\r\n"
+	contentLength := sip.ContentLength(len(body))
 	invite.AppendHeader(&contentLength)
 
-	invite.SetBody(strings.Join(sdpInfo, "\r\n")+"\r\n", true)
+	invite.SetBody(body, true)
 
-	// Subject 末尾为主/子码流标识（海康等常用）：:1=主码流，:2=子码流
-	streamTag := 1
-	if playInfo.StreamType == 1 {
-		streamTag = 2
-	}
+	// Subject（海康等常用）：通道ID:索引,平台ID:索引
 	subject := sip.GenericHeader{
-		HeaderName: "Subject", Contents: fmt.Sprintf("%s:%s,%s:%d", channel.ChannelId, opt.ssrc, channel.conf.Serial, streamTag),
+		HeaderName: "Subject", Contents: fmt.Sprintf("%s:%d,%s:%d", channel.ChannelId, streamIndex, channel.conf.Serial, streamIndex),
 	}
 	invite.AppendHeader(&subject)
 	inviteRes, err := d.SipRequestForResponse(invite)
@@ -223,6 +234,7 @@ func (channel *Channel) Invite(opt *InviteOptions, streamName string, playInfo *
 				base.Log.Errorf("gb28181 MediaServer stop err:%s", err.Error())
 			}
 		}
+		channel.MediaInfo.Clear()
 
 		return http.StatusInternalServerError, err
 	}
@@ -232,8 +244,13 @@ func (channel *Channel) Invite(opt *InviteOptions, streamName string, playInfo *
 		for _, l := range ds {
 			if ls := strings.Split(l, "="); len(ls) > 1 {
 				if ls[0] == "y" && len(ls[1]) > 0 {
-					if _ssrc, err := strconv.ParseInt(ls[1], 10, 0); err == nil {
-						opt.SSRC = uint32(_ssrc)
+					yv := strings.TrimSpace(ls[1])
+					if _ssrc, err := strconv.ParseInt(yv, 10, 0); err == nil {
+						// 部分设备返回 y=0000000000 或 y=0，但 RTP 实际 SSRC 非 0。
+						// 这里仅在 y>0 时覆盖，否则保留请求侧生成的 SSRC。
+						if _ssrc > 0 {
+							opt.SSRC = uint32(_ssrc)
+						}
 					} else {
 						base.Log.Error("parse invite response y failed, err:", err)
 					}
@@ -248,10 +265,8 @@ func (channel *Channel) Invite(opt *InviteOptions, streamName string, playInfo *
 				}
 			}
 		}
-		channel.MediaInfo.IsInvite = true
+		// 这里以最终 SSRC 覆盖（通常等于请求侧生成的 SSRC；若设备返回 y>0 则以设备返回为准）
 		channel.MediaInfo.Ssrc = opt.SSRC
-		channel.MediaInfo.StreamName = streamName
-		channel.MediaInfo.MediaKey = fmt.Sprintf("%s%d", playInfo.NetWork, mediaserver.GetListenerPort())
 
 		ackReq := sip.NewAckRequest("", invite, inviteRes, "", nil)
 		//保存一下播放信息
@@ -266,6 +281,7 @@ func (channel *Channel) Invite(opt *InviteOptions, streamName string, playInfo *
 				base.Log.Errorf("gb28181 MediaServer stop err:%s", err.Error())
 			}
 		}
+		channel.MediaInfo.Clear()
 
 	}
 	return
