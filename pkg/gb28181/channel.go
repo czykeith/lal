@@ -173,6 +173,7 @@ func (channel *Channel) Invite(opt *InviteOptions, streamName string, playInfo *
 
 	// 提前写入 MediaInfo（避免设备在 200 OK 后立刻推流导致 SSRC 校验竞态）
 	// 注意：GB28181Server.CheckSsrc/GetMediaInfoByKey 会要求 IsInvite=true 才视为有效。
+	channel.playInfo = playInfo
 	channel.MediaInfo.IsInvite = true
 	channel.MediaInfo.Ssrc = opt.SSRC
 	channel.MediaInfo.StreamName = streamName
@@ -235,6 +236,7 @@ func (channel *Channel) Invite(opt *InviteOptions, streamName string, playInfo *
 			}
 		}
 		channel.MediaInfo.Clear()
+		channel.playInfo = nil
 
 		return http.StatusInternalServerError, err
 	}
@@ -282,6 +284,7 @@ func (channel *Channel) Invite(opt *InviteOptions, streamName string, playInfo *
 			}
 		}
 		channel.MediaInfo.Clear()
+		channel.playInfo = nil
 
 	}
 	return
@@ -318,10 +321,11 @@ func (channel *Channel) Bye(streamName string) (err error) {
 		seq, _ := byeReq.CSeq()
 		seq.SeqNo += 1
 		channel.device.sipSvr.Send(byeReq)
-	} else {
-		err = errors.New("channel has been closed")
 	}
 	channel.stopMediaServer()
+	// 无论是否存在 ackReq，都视为“停止动作已执行”（幂等），避免 API 层因重复 stop 或竞态导致失败。
+	channel.MediaInfo.Clear()
+	channel.playInfo = nil
 	return err
 }
 func (channel *Channel) CreateRequst(Method sip.RequestMethod, conf GB28181Config) (req sip.Request) {

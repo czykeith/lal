@@ -459,6 +459,28 @@ func (s *GB28181Server) FindChannel(deviceId string, channelId string) (channel 
 	}
 }
 
+// FindChannelByStreamName 根据当前拉流的 streamName 查找通道。
+// 主要用于 stop(BYE) 时精确定位实际在拉流的通道（例如 stream_index 导致选择了不同的 channelId）。
+func (s *GB28181Server) FindChannelByStreamName(streamName string) (channel *Channel) {
+	if streamName == "" {
+		return nil
+	}
+	var found *Channel
+	Devices.Range(func(_, value any) bool {
+		d := value.(*Device)
+		d.channelMap.Range(func(_, v any) bool {
+			ch := v.(*Channel)
+			if ch.MediaInfo.IsInvite && ch.MediaInfo.StreamName == streamName {
+				found = ch
+				return false
+			}
+			return true
+		})
+		return found == nil
+	})
+	return found
+}
+
 // FindChannelWithStreamType 根据主/辅码流选择通道。
 //
 // streamType: 0=主码流，1=辅码流（默认仍推荐业务侧通过 ChannelId 精确指定）。

@@ -425,7 +425,11 @@ func (sm *ServerManager) CtrlGb28181Bye(info base.ApiCtrlGb28181ByeReq) (ret bas
 		streamName = info.DeviceId + info.ChannelId
 	}
 
-	ch := sm.gb28181Server.FindChannel(info.DeviceId, info.ChannelId)
+	// 优先按 streamName 定位正在拉流的通道，避免因 stream_index/heuristic 选择了不同的 channelId 导致停止失败。
+	ch := sm.gb28181Server.FindChannelByStreamName(streamName)
+	if ch == nil {
+		ch = sm.gb28181Server.FindChannel(info.DeviceId, info.ChannelId)
+	}
 	if ch == nil {
 		ret.ErrorCode = base.ErrorCodeGb28181ByeFail
 		ret.Desp = base.DespGb28181DeviceNotFound
