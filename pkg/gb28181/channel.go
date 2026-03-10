@@ -3,6 +3,7 @@ package gb28181
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -15,15 +16,52 @@ import (
 	"github.com/q191201771/lal/pkg/gb28181/mediaserver"
 )
 
-// buildGb28181ScaleLine 生成回放倍速 a=scale 行；整倍速输出整数（如 a=scale:2）以兼容部分设备
+// buildGb28181ScaleLine 生成回放倍速 a=scale 行，采用 Scale=m/n 形式。
+// m：分子，表示时间跨度；n：分母，表示正常播放该时间跨度所需的秒数。
+// 约定：
+// - 对常见倍速（0.25/0.5/1/2/4/8/16）按精确分数输出（如 1/2、2/1）
+// - 其它倍速在分母集合 {1,2,4,8,16} 中选择误差最小的一组 m/n
 func buildGb28181ScaleLine(scale float64) string {
 	if scale <= 0 {
-		return "a=scale:1"
+		return "a=scale:1/1"
 	}
-	if scale == float64(int(scale)) {
-		return fmt.Sprintf("a=scale:%d", int(scale))
+
+	// 常见值直接映射
+	type pair struct {
+		s float64
+		m int
+		n int
 	}
-	return fmt.Sprintf("a=scale:%.2f", scale)
+	candidates := []pair{
+		{0.25, 1, 4},
+		{0.5, 1, 2},
+		{1.0, 1, 1},
+		{2.0, 2, 1},
+		{4.0, 4, 1},
+		{8.0, 8, 1},
+		{16.0, 16, 1},
+	}
+	for _, c := range candidates {
+		if math.Abs(scale-c.s) < 0.0001 {
+			return fmt.Sprintf("a=scale:%d/%d", c.m, c.n)
+		}
+	}
+
+	// 通用近似：在小集合分母中寻找最接近的 m/n
+	bestM, bestN := 1, 1
+	bestErr := math.MaxFloat64
+	for _, n := range []int{1, 2, 4, 8, 16} {
+		m := int(math.Round(scale * float64(n)))
+		if m <= 0 {
+			continue
+		}
+		err := math.Abs(float64(m)/float64(n) - scale)
+		if err < bestErr {
+			bestErr = err
+			bestM, bestN = m, n
+		}
+	}
+	return fmt.Sprintf("a=scale:%d/%d", bestM, bestN)
 }
 
 type Channel struct {
