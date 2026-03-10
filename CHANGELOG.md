@@ -3,11 +3,13 @@
 - [feat] GB28181: 回放会话支持 TTL，默认 3 小时自动释放，防止会话长期占用资源
 - [feat] HTTP API: 新增从已有流转推接口 `POST /api/ctrl/start_relay_from_stream`（stream_name + push_url，仅推流不额外拉流）
 - [feat] GB28181: 新增回放倍速控制接口 `POST /api/ctrl/gb28181_playback_scale`，通过 SIP INFO 发送 PlaybackControl 命令调整倍速（不改变本地拉流逻辑；回放 INVITE/SDP 不再携带倍速参数）
-- [fix] GB28181: 设备主动发 BYE 时从回放会话表正确移除，避免会话残留
+- [feat] GB28181: 回放倍速支持本地时间戳适配，倍速范围统一限制为 `[1,8]`，`scale>1` 时通过 `AvPacketQueue` 对 RTP → HLS/RTMP 等下游时间轴做倍速处理，保证倍速回放时 HLS/FLV/TS 播放速度一致
+- [fix] GB28181: 设备主动发 BYE 时从回放会话表正确移除，避免会话残留；修复 PS → AvPacket 在倍速路径下可能导致 AnnexB NALU 被破坏引发 `iterate nalu failed` 的问题
+- [feat] HTTP API: `/api/ctrl/start_relay_pull`、`/api/ctrl/start_relay` 的 RTSP 客户端倍速 `scale` 参数与 GB28181 回放倍速规则统一（默认 1，有效范围 `[1,8]`，超出返回参数错误）
 - [feat] 统计: `/api/stat/all_group` 中 GB28181 Pub 展示字节与码率（read_bytes_sum、read_bitrate_kbits、bitrate_kbits）
 - [opt] CustomizePubSessionContext: 在 FeedAvPacket/FeedRtmpMsg 入口累加收流字节，UpdateStat 中计算码率；Group 定时调用 customizePubSession.UpdateStat
 - [refactor] base: 新增 NewStatSessionForPsPub，供 logic 包初始化 PS Pub 统计，解决 StatSession.typ 未导出无法赋值的问题
-- [doc] README: 补全所有 HTTP 接口索引与说明（stat/lal_info、all_group/group 响应结构、拉流/停止拉流/踢会话/添加 IP 黑名单、start_rtp_pub 废弃说明）；gb28181_bye 响应示例补充 session_id
+- [doc] README: 补全所有 HTTP 接口索引与说明（stat/lal_info、all_group/group 响应结构、拉流/停止拉流/踢会话/添加 IP 黑名单、start_rtp_pub 废弃说明）；start_relay/GB28181 回放倍速 `scale` 参数文档与实现统一（默认 1，有效范围 `[1,8]`）；gb28181_bye 响应示例补充 session_id
 
 #### v0.37.4 (2024-04)
 
