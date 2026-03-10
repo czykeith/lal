@@ -151,23 +151,31 @@ func (d *Device) CreateRequest(Method sip.RequestMethod, conf GB28181Config) (re
 		SeqNo:      uint32(d.sn),
 		MethodName: Method,
 	}
-	port := sip.Port(conf.SipPort)
+	// From/Contact: 使用本平台 SIP ID + 域（不带端口）
 	serverAddr := sip.Address{
 		Uri: &sip.SipUri{
 			FUser: sip.String{Str: conf.Serial},
-			FHost: d.sipIP,
-			FPort: &port,
+			FHost: conf.Realm,
+			FPort: nil,
 		},
 		Params: sip.NewParams().Add("tag", sip.String{Str: RandNumString(9)}),
 	}
+	// To/Request-URI: 使用设备 ID + 域（不带端口），即 sip:<device_id>@<realm>
+	toUri := &sip.SipUri{
+		FUser: sip.String{Str: d.ID},
+		FHost: conf.Realm,
+		FPort: nil,
+	}
+	toAddr := sip.Address{Uri: toUri}
+
 	req = sip.NewRequest(
 		"",
 		Method,
-		d.addr.Uri,
+		toUri,
 		"SIP/2.0",
 		[]sip.Header{
 			serverAddr.AsFromHeader(),
-			d.addr.AsToHeader(),
+			toAddr.AsToHeader(),
 			&callId,
 			&userAgent,
 			&cseq,

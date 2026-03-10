@@ -521,7 +521,6 @@ func (channel *Channel) PlaybackScale(scale float64) error {
 		seq.SeqNo = nextSeq
 		seq.MethodName = sip.INFO
 	}
-
 	// 按你的要求，将 CSeq 也放入 MANSRTSP body 中：
 	// SIP Header: CSeq: <n> INFO
 	// Body(MANSRTSP):
@@ -546,8 +545,8 @@ func (channel *Channel) PlaybackScale(scale float64) error {
 			contactAddr := sip.Address{
 				Uri: &sip.SipUri{
 					FUser: sip.String{Str: channel.ChannelId}, // 使用 channel_id
-					FHost: uri.FHost,                          // 复用设备注册时的域/主机
-					FPort: uri.FPort,                          // 复用端口
+					FHost: uri.FHost,                          // 使用域信息（如 3402000000）
+					FPort: nil,                                // 不携带端口，保持 sip:xxx@domain 形式
 				},
 				Params: channel.device.addr.Params,
 			}
@@ -584,12 +583,12 @@ func (channel *Channel) CreateRequst(Method sip.RequestMethod, conf GB28181Confi
 		SeqNo:      uint32(d.sn),
 		MethodName: Method,
 	}
-	port := sip.Port(conf.SipPort)
 	serverAddr := sip.Address{
 		Uri: &sip.SipUri{
 			FUser: sip.String{Str: conf.Serial},
-			FHost: d.sipIP,
-			FPort: &port,
+			// From/Contact host 统一使用域信息（如 3402000000），不带端口
+			FHost: conf.Realm,
+			FPort: nil,
 		},
 		Params: sip.NewParams().Add("tag", sip.String{Str: RandNumString(9)}),
 	}
