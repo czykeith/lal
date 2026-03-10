@@ -540,11 +540,21 @@ func (channel *Channel) PlaybackScale(scale float64) error {
 	contentLength := sip.ContentLength(len(body))
 	infoReq.RemoveHeader("Content-Length")
 	infoReq.AppendHeader(&contentLength)
-	// 按你的要求，让 Contact 出现在 Content-Length 之后，使用设备注册时的地址（client channel_id@domain）。
+	// 按你的要求，让 Contact 出现在 Content-Length 之后，并使用通道ID作为 user 部分（channel_id@domain）。
 	if channel.device != nil {
-		contact := channel.device.addr.AsContactHeader()
-		infoReq.RemoveHeader("Contact")
-		infoReq.AppendHeader(contact)
+		if uri, ok := channel.device.addr.Uri.(*sip.SipUri); ok {
+			contactAddr := sip.Address{
+				Uri: &sip.SipUri{
+					FUser: sip.String{Str: channel.ChannelId}, // 使用 channel_id
+					FHost: uri.FHost,                          // 复用设备注册时的域/主机
+					FPort: uri.FPort,                          // 复用端口
+				},
+				Params: channel.device.addr.Params,
+			}
+			contact := contactAddr.AsContactHeader()
+			infoReq.RemoveHeader("Contact")
+			infoReq.AppendHeader(contact)
+		}
 	}
 	infoReq.SetBody(body, true)
 
