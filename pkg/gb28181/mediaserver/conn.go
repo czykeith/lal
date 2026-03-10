@@ -329,7 +329,7 @@ func (c *Conn) feedAvPacketWithScale(pkt base.AvPacket) {
 	}
 
 	// 未启用倍速或缺少音视频其一时，直接透传，避免 AvPacketQueue 在单流场景下导致长时延。
-	if scale <= 1.0 || !(c.hasAudio && c.hasVideo) {
+	if scale <= 1.0 {
 		_ = c.lalSession.FeedAvPacket(pkt)
 		return
 	}
