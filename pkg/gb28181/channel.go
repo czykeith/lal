@@ -524,7 +524,7 @@ func (channel *Channel) PlaybackScale(scale float64) error {
 
 	// GB28181 常见实现：SIP INFO + Application/MANSRTSP
 	// body 为类 RTSP 文本（不需要外包一层 XML），并直接使用换行分隔。
-	body := fmt.Sprintf("PLAY RTSP/1.0\nCSeq: %d\nScale: %.6f\n", nextSeq, scale)
+	body := fmt.Sprintf("PLAY RTSP/1.0\r\nCSeq: %d\r\nScale: %.1f\r\n", nextSeq, scale)
 	ua := sip.UserAgentHeader(SipUserAgent)
 	infoReq.RemoveHeader("User-Agent")
 	infoReq.AppendHeader(&ua)
