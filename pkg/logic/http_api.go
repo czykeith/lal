@@ -65,6 +65,7 @@ func (h *HttpApiServer) RunLoop() error {
 	mux.HandleFunc("/api/ctrl/add_ip_blacklist", h.ctrlAddIpBlacklistHandler)
 	mux.HandleFunc("/api/ctrl/start_relay", h.ctrlStartRelayHandler)
 	mux.HandleFunc("/api/ctrl/stop_relay", h.ctrlStopRelayHandler)
+	mux.HandleFunc("/api/ctrl/start_relay_from_stream", h.ctrlStartRelayFromStreamHandler)
 
 	mux.HandleFunc("/api/ctrl/gb28181_invite", h.ctrlGb28181InviteHandler)
 	mux.HandleFunc("/api/ctrl/gb28181_bye", h.ctrlGb28181ByeHandler)
@@ -279,6 +280,35 @@ func (h *HttpApiServer) ctrlStartRelayHandler(w http.ResponseWriter, req *http.R
 	Log.Infof("http api start relay. req info=%+v", info)
 
 	resp := h.sm.CtrlStartRelay(info)
+	feedback(resp, w)
+}
+
+// /api/ctrl/start_relay_from_stream
+// 从已有的内部流（stream_name）发起转推，仅做推流，不再额外拉流。
+func (h *HttpApiServer) ctrlStartRelayFromStreamHandler(w http.ResponseWriter, req *http.Request) {
+	var v base.ApiCtrlStartRelayFromStreamResp
+	var info base.ApiCtrlStartRelayFromStreamReq
+
+	j, err := unmarshalRequestJsonBody(req, &info, "stream_name", "push_url")
+	if err != nil {
+		Log.Warnf("http api start relay from stream error. err=%+v", err)
+		v.ErrorCode = base.ErrorCodeParamMissing
+		v.Desp = base.DespParamMissing
+		feedback(v, w)
+		return
+	}
+
+	// 默认值
+	if !j.Exist("timeout_ms") {
+		info.TimeoutMs = DefaultApiCtrlStartRelayPullReqPullTimeoutMs
+	}
+	if !j.Exist("retry_num") {
+		info.RetryNum = base.PullRetryNumNever
+	}
+
+	Log.Infof("http api start relay from stream. req info=%+v", info)
+
+	resp := h.sm.CtrlStartRelayFromStream(info)
 	feedback(resp, w)
 }
 

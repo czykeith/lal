@@ -67,6 +67,15 @@ type ApiCtrlStartRelayReq struct {
 	Scale                    float64 `json:"scale"`                          // RTSP拉流时的播放速度倍数，例如1.0表示正常速度，2.0表示2倍速
 }
 
+// ApiCtrlStartRelayFromStreamReq 从已有流转推到其他协议（仅推流，不再额外拉流）
+// 支持将当前 lal 内部已有的 stream_name 直接推送到 RTMP/RTSP 目标。
+type ApiCtrlStartRelayFromStreamReq struct {
+	StreamName string `json:"stream_name"` // 已存在的内部流名称（必填）
+	PushUrl    string `json:"push_url"`    // 推流地址，支持 rtmp:// 或 rtsp://
+	TimeoutMs  int    `json:"timeout_ms"`  // 推流超时时间（毫秒），默认 10000
+	RetryNum   int    `json:"retry_num"`   // 推流重试次数，-1表示永远重试，大于0表示重试次数，0表示不重试
+}
+
 // ApiCtrlGb28181InviteReq GB28181拉流请求
 type ApiCtrlGb28181InviteReq struct {
 	DeviceId   string `json:"device_id"`   // 设备ID（国标编码）
@@ -222,6 +231,15 @@ type ApiCtrlStartRelayResp struct {
 	Data struct {
 		StreamName    string `json:"stream_name"`
 		PullSessionId string `json:"pull_session_id"`
+		PushSessionId string `json:"push_session_id"`
+	} `json:"data"`
+}
+
+// ApiCtrlStartRelayFromStreamResp 从已有流转推响应
+type ApiCtrlStartRelayFromStreamResp struct {
+	ApiRespBasic
+	Data struct {
+		StreamName    string `json:"stream_name"`
 		PushSessionId string `json:"push_session_id"`
 	} `json:"data"`
 }

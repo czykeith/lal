@@ -207,6 +207,56 @@ func (sm *ServerManager) CtrlStartRelay(info base.ApiCtrlStartRelayReq) (ret bas
 	return
 }
 
+// CtrlStartRelayFromStream 从已有流启动转推（仅推流，不再额外拉流）
+// 调用方需要保证 stream_name 已经在本机存在（例如通过 RTMP/RTSP/GB28181/自定义接入）。
+func (sm *ServerManager) CtrlStartRelayFromStream(info base.ApiCtrlStartRelayFromStreamReq) (ret base.ApiCtrlStartRelayFromStreamResp) {
+	sm.mutex.Lock()
+	defer sm.mutex.Unlock()
+
+	streamName := info.StreamName
+	if streamName == "" {
+		ret.ErrorCode = base.ErrorCodeParamMissing
+		ret.Desp = base.DespParamMissing
+		return
+	}
+
+	// 检查 group 是否存在
+	g := sm.getGroup("", streamName)
+	if g == nil {
+		ret.ErrorCode = base.ErrorCodeGroupNotFound
+		ret.Desp = base.DespGroupNotFound
+		return
+	}
+
+	// 复用现有 startPush 逻辑，仅做推流：
+	// - 不改动现有拉流配置，不新增额外拉流。
+	timeoutMs := info.TimeoutMs
+	if timeoutMs == 0 {
+		timeoutMs = DefaultApiCtrlStartRelayPullReqPullTimeoutMs
+	}
+
+	pushUrl := info.PushUrl
+	if pushUrl == "" {
+		ret.ErrorCode = base.ErrorCodeParamMissing
+		ret.Desp = base.DespParamMissing
+		return
+	}
+
+	// 内部通过 group.startPushLocked 完成 RTMP/RTSP 推流
+	pushSessionId, err := g.StartPushOnly(pushUrl, timeoutMs, info.RetryNum)
+	if err != nil {
+		ret.ErrorCode = base.ErrorCodeStartRelayFail
+		ret.Desp = err.Error()
+		return
+	}
+
+	ret.ErrorCode = base.ErrorCodeSucc
+	ret.Desp = base.DespSucc
+	ret.Data.StreamName = streamName
+	ret.Data.PushSessionId = pushSessionId
+	return
+}
+
 // CtrlStopRelay 停止转推
 func (sm *ServerManager) CtrlStopRelay(streamName string) (ret base.ApiCtrlStopRelayResp) {
 	sm.mutex.Lock()

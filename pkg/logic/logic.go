@@ -51,6 +51,9 @@ type ILalServer interface {
 	CtrlStartRelayPull(info base.ApiCtrlStartRelayPullReq) base.ApiCtrlStartRelayPullResp
 	CtrlStopRelayPull(streamName string) base.ApiCtrlStopRelayPullResp
 	CtrlKickSession(info base.ApiCtrlKickSessionReq) base.ApiCtrlKickSessionResp
+
+	// 从已有流发起转推（仅推，不另外拉）
+	CtrlStartRelayFromStream(info base.ApiCtrlStartRelayFromStreamReq) base.ApiCtrlStartRelayFromStreamResp
 }
 
 // NewLalServer 创建一个lal server

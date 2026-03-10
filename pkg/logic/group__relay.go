@@ -139,6 +139,44 @@ func (group *Group) StartRelay(info base.ApiCtrlStartRelayReq) (string, string, 
 	return pullSessionId, pushSessionId, nil
 }
 
+// StartPushOnly 从已有流启动推流（不再额外拉流）
+// 注意：该方法假定 group 内已经有发布者（或将要有），仅复用转推逻辑里的 push 部分。
+func (group *Group) StartPushOnly(pushUrl string, timeoutMs int, retryNum int) (string, error) {
+	group.mutex.Lock()
+	defer group.mutex.Unlock()
+
+	// 如果已经有 relayProxy 且正在转推，并且 pushUrl 相同，则直接返回已有推流 session
+	if group.relayProxy != nil && group.relayProxy.isRelaying && group.relayProxy.pushUrl == pushUrl {
+		Log.Infof("[%s] push-only relay already exists for streamName. push_url=%s, push_session_id=%s",
+			group.UniqueKey, group.relayProxy.pushUrl, group.relayProxy.pushSessionId)
+		return group.relayProxy.pushSessionId, nil
+	}
+
+	// 如果还没有 relayProxy，则初始化一个仅用于推流的 relayProxy
+	if group.relayProxy == nil {
+		group.relayProxy = &relayProxy{}
+	}
+	group.relayProxy.pushUrl = pushUrl
+	group.relayProxy.timeoutMs = timeoutMs
+	group.relayProxy.retryNum = retryNum
+	group.relayProxy.pushStartCount = 0
+	group.relayProxy.pushBackoffMs = 0
+
+	// 启动推流（内部会根据协议自动选择 RTMP/RTSP）
+	sessionId, err := group.startPushLocked(pushUrl, timeoutMs)
+	if err != nil {
+		return "", fmt.Errorf("start push-only relay failed: %w", err)
+	}
+
+	group.relayProxy.pushSessionId = sessionId
+	group.relayProxy.isRelaying = true
+
+	Log.Infof("[%s] start push-only relay. push_url=%s, push_session_id=%s",
+		group.UniqueKey, pushUrl, sessionId)
+
+	return sessionId, nil
+}
+
 // StopRelay 停止转推
 func (group *Group) StopRelay() (string, string) {
 	group.mutex.Lock()
