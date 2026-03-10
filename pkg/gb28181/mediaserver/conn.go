@@ -340,6 +340,15 @@ func (c *Conn) feedAvPacketWithScale(pkt base.AvPacket) {
 			_ = c.lalSession.FeedAvPacket(out)
 		})
 	}
+
+	// 注意：PsDemuxer.OnFrame 中传入的 frame 可能复用底层缓冲区。
+	// 为避免在 AvPacketQueue 中排队期间底层数据被覆盖，这里对负载做一次深拷贝。
+	if len(pkt.Payload) > 0 {
+		buf := make([]byte, len(pkt.Payload))
+		copy(buf, pkt.Payload)
+		pkt.Payload = buf
+	}
+
 	c.scaleQueue.SetScale(scale)
 	c.scaleQueue.Feed(pkt)
 }
