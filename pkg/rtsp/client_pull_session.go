@@ -265,12 +265,18 @@ func (session *PullSession) EnableClientSideScale(scale float64) {
 		}
 	}()
 
-	// 健壮性：验证scale范围
-	const minScale = 0.1
-	const maxScale = 10.0
+	// 健壮性：验证scale范围，统一限制在 [1,8]
+	const (
+		minScale = 1.0
+		maxScale = 8.0
+	)
 	if scale < minScale || scale > maxScale {
-		Log.Warnf("invalid scale value: %.1f, using default 1.0", scale)
-		scale = 1.0
+		Log.Warnf("invalid scale value: %.1f, clamped to [%.1f, %.1f]", scale, minScale, maxScale)
+		if scale < minScale {
+			scale = minScale
+		} else {
+			scale = maxScale
+		}
 	}
 
 	if scale > 0 && session.baseInSession != nil {

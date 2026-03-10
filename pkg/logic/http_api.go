@@ -158,6 +158,17 @@ func (h *HttpApiServer) ctrlStartRelayPullHandler(w http.ResponseWriter, req *ht
 	if !j.Exist("rtsp_mode") {
 		info.RtspMode = base.RtspModeTcp
 	}
+	// scale 可选，默认 1，合法范围 [1,8]，超出则视为参数错误
+	if !j.Exist("scale") {
+		info.Scale = 1
+	}
+	if info.Scale < 1 || info.Scale > 8 {
+		Log.Warnf("http api start pull invalid scale. scale=%v", info.Scale)
+		v.ErrorCode = base.ErrorCodeParamMissing
+		v.Desp = "scale must be in [1,8]"
+		feedback(v, w)
+		return
+	}
 
 	Log.Infof("http api start pull. req info=%+v", info)
 
@@ -276,6 +287,17 @@ func (h *HttpApiServer) ctrlStartRelayHandler(w http.ResponseWriter, req *http.R
 	}
 	if !j.Exist("rtsp_mode") {
 		info.RtspMode = base.RtspModeTcp
+	}
+	// scale 可选，默认 1，合法范围 [1,8]，超出则视为参数错误
+	if !j.Exist("scale") {
+		info.Scale = 1
+	}
+	if info.Scale < 1 || info.Scale > 8 {
+		Log.Warnf("http api start relay invalid scale. scale=%v", info.Scale)
+		v.ErrorCode = base.ErrorCodeParamMissing
+		v.Desp = "scale must be in [1,8]"
+		feedback(v, w)
+		return
 	}
 
 	Log.Infof("http api start relay. req info=%+v", info)
@@ -413,11 +435,24 @@ func (h *HttpApiServer) ctrlGb28181PlaybackScaleHandler(w http.ResponseWriter, r
 	var v base.ApiCtrlGb28181PlaybackScaleResp
 	var info base.ApiCtrlGb28181PlaybackScaleReq
 
-	_, err := unmarshalRequestJsonBody(req, &info, "stream_name", "scale")
+	j, err := unmarshalRequestJsonBody(req, &info, "stream_name")
 	if err != nil {
 		Log.Warnf("http api gb28181 playback scale error. err=%+v", err)
 		v.ErrorCode = base.ErrorCodeParamMissing
 		v.Desp = base.DespParamMissing
+		feedback(v, w)
+		return
+	}
+
+	// 默认 scale=1（正常速度），如果调用方未显式传入则按 1 处理。
+	if !j.Exist("scale") {
+		info.Scale = 1
+	}
+	// 接口层校验：合法范围 [1,8]
+	if info.Scale < 1 || info.Scale > 8 {
+		Log.Warnf("http api gb28181 playback scale invalid param. scale=%v", info.Scale)
+		v.ErrorCode = base.ErrorCodeParamMissing
+		v.Desp = "scale must be in [1,8]"
 		feedback(v, w)
 		return
 	}

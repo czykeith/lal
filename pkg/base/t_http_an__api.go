@@ -31,7 +31,7 @@ type ApiCtrlStartRelayPullReq struct {
 	AutoStopPullAfterNoOutMs int     `json:"auto_stop_pull_after_no_out_ms"`
 	RtspMode                 int     `json:"rtsp_mode"`
 	DebugDumpPacket          string  `json:"debug_dump_packet"`
-	Scale                    float64 `json:"scale"` // RTSP拉流时的播放速度倍数，例如1.0表示正常速度，2.0表示2倍速。统一使用代码实现倍速，不依赖RTSP协议支持
+	Scale                    float64 `json:"scale"` // RTSP拉流时的播放速度倍数，合法范围 [1,8]，1 表示正常速度，>1 表示加速
 }
 
 type ApiCtrlKickSessionReq struct {
@@ -64,7 +64,7 @@ type ApiCtrlStartRelayReq struct {
 	AutoStopPullAfterNoOutMs int     `json:"auto_stop_pull_after_no_out_ms"` // 转推模式下此参数会被忽略，始终为 -1（不自动停止）
 	RtspMode                 int     `json:"rtsp_mode"`                      // RTSP 模式，0=TCP，1=UDP，默认 0
 	DebugDumpPacket          string  `json:"debug_dump_packet"`              // 转推模式下此参数会被忽略，数据不会落盘，直接转发
-	Scale                    float64 `json:"scale"`                          // RTSP拉流时的播放速度倍数，例如1.0表示正常速度，2.0表示2倍速
+	Scale                    float64 `json:"scale"`                          // RTSP拉流时的播放速度倍数，合法范围 [1,8]，1 表示正常速度，>1 表示加速
 }
 
 // ApiCtrlStartRelayFromStreamReq 从已有流转推到其他协议（仅推流，不再额外拉流）
@@ -108,10 +108,12 @@ type ApiCtrlGb28181PlaybackReq struct {
 
 // ApiCtrlGb28181PlaybackScaleReq GB28181回放倍速控制请求（通过控制指令调整设备端推流速率，不改变本地拉流逻辑）
 //
-// 注意：该接口要求对应 stream_name 已经处于回放会话中（已建立 INVITE/ACK 对话），否则会返回失败。
+// 注意：
+// - 该接口要求对应 stream_name 已经处于回放会话中（已建立 INVITE/ACK 对话），否则会返回失败。
+// - 有效倍速范围为 [1,8]，1 表示正常速度，>1 表示加速播放。
 type ApiCtrlGb28181PlaybackScaleReq struct {
 	StreamName string  `json:"stream_name"` // 回放会话对应的流名称（必填）
-	Scale      float64 `json:"scale"`       // 倍速（必填），例如 0.5/1/2/4/8
+	Scale      float64 `json:"scale"`       // 倍速（必填），合法值区间 [1,8]，例如 1/2/4/8
 }
 
 // ApiCtrlGb28181PtzReq GB28181 PTZ控制请求

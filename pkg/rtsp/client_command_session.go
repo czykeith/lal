@@ -571,12 +571,19 @@ func (session *ClientCommandSession) writePlay() error {
 
 	// 如果设置了Scale参数，启用客户端侧变速播放（统一使用代码实现）
 	if session.option.Scale > 0 {
-		// 健壮性：验证scale范围
-		const maxScale = 10.0
+		// 健壮性：验证scale范围，统一限制在 [1,8]
+		const (
+			minScale = 1.0
+			maxScale = 8.0
+		)
 		scale := session.option.Scale
-		if scale > maxScale {
-			Log.Warnf("[%s] scale too large, clamped to %.1f", session.uniqueKey, maxScale)
-			scale = maxScale
+		if scale < minScale || scale > maxScale {
+			Log.Warnf("[%s] invalid scale=%.2f, clamped to [%.1f, %.1f]", session.uniqueKey, scale, minScale, maxScale)
+			if scale < minScale {
+				scale = minScale
+			} else {
+				scale = maxScale
+			}
 		}
 		// 通过类型断言检查 observer 是否是 PullSession
 		// 健壮性：添加错误处理
