@@ -513,8 +513,6 @@ func (channel *Channel) PlaybackScale(scale float64) error {
 		return errors.New("gb28181 playback control: invalid scale")
 	}
 
-	// GB28181 常见实现：SIP INFO + Application/MANSCDP+xml
-	// XML 的 <Info> 字段内携带类 RTSP 的 PLAY 命令与 Scale 参数。
 	infoReq := channel.ackReq
 	infoReq.SetMethod(sip.INFO)
 	var nextSeq uint32 = 1
@@ -524,29 +522,20 @@ func (channel *Channel) PlaybackScale(scale float64) error {
 		seq.MethodName = sip.INFO
 	}
 
-	// XML 中 SN 与 <Info> 中的 CSeq 与 SIP 的 CSeq 使用同一个序号，提升兼容性（部分设备校验严格）
-	// 注意：<Info> 中直接使用换行分隔即可，避免部分设备对 CRLF（\r\n）解析异常/显示乱码
-	infoText := fmt.Sprintf("PLAY RTSP/1.0\nCSeq: %d\nScale: %.6f\n", nextSeq, scale)
-	msg := &MessagePlaybackControl{
-		CmdType:  PlaybackControl,
-		SN:       int(nextSeq),
-		DeviceID: channel.ChannelId,
-		Info:     CDataText{Text: infoText},
-	}
-	xmlBody, err := XmlEncode(msg)
-	if err != nil {
-		return err
-	}
+	// GB28181 常见实现：SIP INFO + Application/MANSRTSP
+	// body 为类 RTSP 文本（不需要外包一层 XML），并直接使用换行分隔。
+	body := fmt.Sprintf("PLAY RTSP/1.0\nCSeq: %d\nScale: %.6f\n", nextSeq, scale)
 	ua := sip.UserAgentHeader(SipUserAgent)
 	infoReq.RemoveHeader("User-Agent")
 	infoReq.AppendHeader(&ua)
-	contentType := sip.ContentType("Application/MANSCDP+xml")
+	contentType := sip.ContentType("Application/MANSRTSP")
+	infoReq.RemoveHeader("Content-Type")
 	infoReq.AppendHeader(&contentType)
 	// 复用对话请求时，确保 Content-Length 与最新 body 一致（部分设备严格校验）
-	contentLength := sip.ContentLength(len(xmlBody))
+	contentLength := sip.ContentLength(len(body))
 	infoReq.RemoveHeader("Content-Length")
 	infoReq.AppendHeader(&contentLength)
-	infoReq.SetBody(xmlBody, true)
+	infoReq.SetBody(body, true)
 
 	base.Log.Info("GB28181 INFO(PlaybackControl) >>>", "\n", infoReq.String())
 
