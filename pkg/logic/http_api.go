@@ -369,7 +369,10 @@ func (h *HttpApiServer) ctrlGb28181PlaybackHandler(w http.ResponseWriter, req *h
 		info.IsTcpFlag = 0
 	}
 	if !j.Exist("scale") {
-		info.Scale = 1.0 // 默认正常速度
+		info.Scale = 1.0
+	}
+	if !j.Exist("stream_index") {
+		info.StreamIndex = 0
 	}
 
 	Log.Infof("http api gb28181 playback. req info=%+v", info)

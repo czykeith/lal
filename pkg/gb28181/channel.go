@@ -15,6 +15,17 @@ import (
 	"github.com/q191201771/lal/pkg/gb28181/mediaserver"
 )
 
+// buildGb28181ScaleLine 生成回放倍速 a=scale 行；整倍速输出整数（如 a=scale:2）以兼容部分设备
+func buildGb28181ScaleLine(scale float64) string {
+	if scale <= 0 {
+		return "a=scale:1"
+	}
+	if scale == float64(int(scale)) {
+		return fmt.Sprintf("a=scale:%d", int(scale))
+	}
+	return fmt.Sprintf("a=scale:%.2f", scale)
+}
+
 type Channel struct {
 	device *Device // 所属设备
 	//status  atomic.Int32 // 通道状态,0:空闲,1:正在invite,2:正在播放
@@ -202,9 +213,17 @@ func (channel *Channel) Invite(opt *InviteOptions, streamName string, playInfo *
 	sdpInfo = append(sdpInfo,
 		"c=IN IP4 "+d.mediaIP,
 		opt.String(),
-		fmt.Sprintf("m=video %d %sRTP/AVP 96", opt.MediaPort, protocol),
+	)
+	// 回放倍速：放在会话级（t= 之后），部分设备仅解析此处；整倍速输出整数（如 2 而非 2.00）
+	if opt != nil && !opt.IsLive() && opt.Scale > 0 {
+		sdpInfo = append(sdpInfo, buildGb28181ScaleLine(opt.Scale))
+	}
+	sdpInfo = append(sdpInfo,
+		fmt.Sprintf("m=video %d %sRTP/AVP 96 97 98", opt.MediaPort, protocol),
 		"a=recvonly",
 		"a=rtpmap:96 PS/90000",
+		"a=rtpmap:97 MPEG4/90000",
+		"a=rtpmap:98 H264/90000",
 		"y="+opt.ssrc,
 	)
 
@@ -235,9 +254,9 @@ func (channel *Channel) Invite(opt *InviteOptions, streamName string, playInfo *
 	if playInfo.NetWork == "tcp" {
 		sdpInfo = append(sdpInfo, "a=setup:passive", "a=connection:new")
 	}
-	// 回放倍速（国标常见 a=scale 或 downloadspeed；部分设备用 a=scale:1.0）
+	// 回放倍速在媒体级再带一份，兼容只解析 m= 后 a= 的设备
 	if opt != nil && !opt.IsLive() && opt.Scale > 0 {
-		sdpInfo = append(sdpInfo, fmt.Sprintf("a=scale:%.2f", opt.Scale))
+		sdpInfo = append(sdpInfo, buildGb28181ScaleLine(opt.Scale))
 	}
 
 	invite := channel.CreateRequst(sip.INVITE, channel.conf)

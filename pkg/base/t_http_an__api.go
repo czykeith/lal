@@ -87,14 +87,15 @@ type ApiCtrlGb28181ByeReq struct {
 
 // ApiCtrlGb28181PlaybackReq GB28181回放请求
 type ApiCtrlGb28181PlaybackReq struct {
-	DeviceId   string  `json:"device_id"`   // 设备ID（国标编码）
-	ChannelId  string  `json:"channel_id"`  // 通道ID（国标编码）
-	StreamName string  `json:"stream_name"` // 流名称（必填，全局唯一）
-	Port       int     `json:"port"`        // RTP接收端口（可选，0表示自动分配）
-	IsTcpFlag  int     `json:"is_tcp_flag"` // 是否使用TCP传输（0=UDP，1=TCP，默认0）
-	StartTime  string  `json:"start_time"`  // 开始时间（格式：2006-01-02T15:04:05，必填）
-	EndTime    string  `json:"end_time"`    // 结束时间（格式：2006-01-02T15:04:05，必填）
-	Scale      float64 `json:"scale"`       // 倍速播放（1.0=正常速度，2.0=2倍速，0.5=0.5倍速，默认1.0）
+	DeviceId    string  `json:"device_id"`    // 设备ID（国标编码，20位，必填）
+	ChannelId   string  `json:"channel_id"`   // 通道ID（国标编码，20位，必填）
+	StreamName  string  `json:"stream_name"`  // 流名称（必填，全局唯一，用于拉流与停止时标识）
+	StartTime   string  `json:"start_time"`   // 开始时间（必填）。格式：2006-01-02T15:04:05 或 2006-01-02 15:04:05；无时区按服务器本地时区解析（如东八区）
+	EndTime     string  `json:"end_time"`     // 结束时间（必填）。格式同上，须晚于 start_time
+	Port        int     `json:"port"`         // RTP接收端口（可选，0=自动分配）
+	IsTcpFlag   int     `json:"is_tcp_flag"`  // 传输方式：0=UDP（默认），1=TCP
+	Scale       float64 `json:"scale"`        // 倍速：1.0=正常，2.0=2倍速，0.5=0.5倍速等（默认1.0）
+	StreamIndex int     `json:"stream_index"` // 码流索引：0=主码流，1=子码流，2=第三码流…（默认0）
 }
 
 // ApiCtrlGb28181PtzReq GB28181 PTZ控制请求
@@ -251,12 +252,13 @@ type ApiCtrlGb28181ByeResp struct {
 	} `json:"data"`
 }
 
+// ApiCtrlGb28181PlaybackResp GB28181回放响应
 type ApiCtrlGb28181PlaybackResp struct {
 	ApiRespBasic
 	Data struct {
-		StreamName string `json:"stream_name"`
-		SessionId  string `json:"session_id"`
-		Port       int    `json:"port"`
+		StreamName string `json:"stream_name"` // 与请求一致，用于后续 bye 或拉流
+		Port       int    `json:"port"`        // RTP 接收端口，可用于拉流地址
+		SessionId  string `json:"session_id"`  // 预留，兼容字段
 	} `json:"data"`
 }
 

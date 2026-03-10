@@ -381,16 +381,37 @@ curl -X POST http://127.0.0.1:8083/api/ctrl/gb28181_invite \
 
 **请求参数：**
 
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| device_id | string | 是 | 设备ID（国标 20 位编码） |
+| channel_id | string | 是 | 通道ID（国标 20 位编码） |
+| stream_name | string | 是 | 流名称（全局唯一，用于拉流/停止标识） |
+| start_time | string | 是 | 开始时间，见下方时间格式说明 |
+| end_time | string | 是 | 结束时间，须晚于 start_time |
+| port | int | 否 | RTP 接收端口，0 表示自动分配（默认 0） |
+| is_tcp_flag | int | 否 | 0=UDP，1=TCP（默认 0） |
+| scale | number | 否 | 倍速：1.0=正常，2.0=2 倍速，0.5=0.5 倍速（默认 1.0） |
+| stream_index | int | 否 | 码流索引：0=主码流，1=子码流，2=第三码流…（默认 0） |
+
+**时间格式：** `2006-01-02T15:04:05` 或 `2006-01-02 15:04:05`。无时区时按**服务器本地时区**解析（如东八区），避免与北京时间差 8 小时；也可使用带时区的 RFC3339（如 `2024-01-01T10:00:00+08:00`）。
+
+**请求示例：**
+
 ```json
 {
-  "device_id": "34020000001320000001",    // 设备ID（国标编码，必填）
-  "channel_id": "34020000001320000001",   // 通道ID（国标编码，必填）
-  "stream_name": "playback_stream",       // 流名称（必填，全局唯一）
-  "is_tcp_flag": 0,                       // 是否使用TCP传输（0=UDP，1=TCP，默认0）
-  "start_time": "2024-01-01T10:00:00",    // 开始时间（格式：2006-01-02T15:04:05 或 2006-01-02 15:04:05，必填）
-  "end_time": "2024-01-01T11:00:00"       // 结束时间（格式：2006-01-02T15:04:05 或 2006-01-02 15:04:05，必填）
+  "device_id": "34020000001320000001",
+  "channel_id": "34020000001320000001",
+  "stream_name": "playback_stream",
+  "start_time": "2024-01-01T10:00:00",
+  "end_time": "2024-01-01T11:00:00",
+  "port": 0,
+  "is_tcp_flag": 0,
+  "scale": 1.0,
+  "stream_index": 0
 }
 ```
+
+**响应参数：** `data.stream_name`（与请求一致）、`data.port`（RTP 接收端口，可用于拉流）。
 
 **响应示例：**
 
@@ -400,7 +421,6 @@ curl -X POST http://127.0.0.1:8083/api/ctrl/gb28181_invite \
   "desp": "succ",
   "data": {
     "stream_name": "playback_stream",
-    "session_id": "PSPUB...",
     "port": 30000
   }
 }
@@ -409,7 +429,7 @@ curl -X POST http://127.0.0.1:8083/api/ctrl/gb28181_invite \
 **使用示例：**
 
 ```bash
-# 使用 curl 启动GB28181回放（必须指定 stream_name）
+# 最小必填参数
 curl -X POST http://127.0.0.1:8083/api/ctrl/gb28181_playback \
   -H "Content-Type: application/json" \
   -d '{
@@ -420,25 +440,32 @@ curl -X POST http://127.0.0.1:8083/api/ctrl/gb28181_playback \
     "end_time": "2024-01-01T11:00:00"
   }'
 
+# 带倍速、子码流、TCP
+curl -X POST http://127.0.0.1:8083/api/ctrl/gb28181_playback \
+  -H "Content-Type: application/json" \
+  -d '{
+    "device_id": "34020000001320000001",
+    "channel_id": "34020000001320000001",
+    "stream_name": "playback_stream",
+    "start_time": "2024-01-01T10:00:00",
+    "end_time": "2024-01-01T11:00:00",
+    "scale": 2.0,
+    "stream_index": 1,
+    "is_tcp_flag": 1
+  }'
 ```
 
-**工作流程（符合GB28181标准）：**
-1. 服务器向设备发送 SIP INVITE 请求（回放模式）
-2. SDP 与 Subject 对齐主流可播放实现，以提升设备兼容性：
-   - **Subject**：`<channelId>:<ssrc>,<serverId>:0`
-   - **SDP**：`o=<channelId>`、`s=Play`、`t=<start> <end>`（NTP 时间戳）、`y=<ssrc>`，无 `u=`/`f=` 字段
-3. 设备响应 200 OK，开始推送回放 RTP 流
-4. 服务器在指定端口接收 RTP 流并解析为音视频数据
-5. 流可以通过 RTMP、RTSP、HLS、HTTP-FLV 等协议播放
+**工作流程（符合 GB28181）：**
+1. 服务器向设备发送 SIP INVITE（回放模式）
+2. SDP：`s=Playback`、`u=<channelId>:0`、`t=<start> <end>`（Unix 时间）、`a=scale:<倍速>`（可选）；Subject 带码流索引
+3. 设备 200 OK 后推送回放 RTP 流
+4. 服务器在端口接收并解析，可通过 RTMP/RTSP/HLS/HTTP-FLV 等播放
 
 **注意事项：**
-- **协议与兼容**：实时拉流与回放在 SDP（o=channelId、s=Play、y=ssrc、无 f=）和 Subject（channelId:ssrc,serverId:0）上与主流可播放实现对齐，便于各类设备接入
-- **时间格式**：支持 `2006-01-02T15:04:05` 或 `2006-01-02 15:04:05` 格式
-- **时间范围**：`end_time` 必须晚于 `start_time`，时间在 SDP 中使用 NTP 时间戳格式（从 1900-01-01 开始的秒数）
-- **流名称**：`stream_name` 参数可选，未指定时自动生成 `device_id_channel_id_playback` 格式
-- **流冲突**：若指定的 `stream_name` 已存在，接口返回错误
-- **自动停止**：回放结束后设备会发送 BYE 停止流
-- **NAT**：回放 INVITE 优先发往设备 RemoteIP/RemotePort，与实时拉流一致
+- **时间**：无时区字符串按服务器本地时区解析；`end_time` 须晚于 `start_time`
+- **stream_name**：必填且全局唯一，停止回放时用同一 `stream_name` 调用 `gb28181_bye`
+- **幂等**：同一 `stream_name` 已存在回放时，直接返回成功
+- **NAT**：INVITE 优先发往设备 RemoteIP/RemotePort
 
 #### 停止GB28181拉流
 

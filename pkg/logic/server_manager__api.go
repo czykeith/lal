@@ -323,11 +323,17 @@ func (sm *ServerManager) CtrlGb28181Playback(info base.ApiCtrlGb28181PlaybackReq
 		return
 	}
 
+	// 无时区格式按本地时区解析，避免 "2006-01-02T15:04:05" 被当成 UTC 导致与北京时间差 8 小时
 	timeLayouts := []string{"2006-01-02T15:04:05", "2006-01-02 15:04:05", time.RFC3339, time.RFC3339Nano}
+	naiveLayouts := map[string]bool{"2006-01-02T15:04:05": true, "2006-01-02 15:04:05": true}
 	var startTime, endTime time.Time
 	var err error
 	for _, layout := range timeLayouts {
-		startTime, err = time.Parse(layout, info.StartTime)
+		if naiveLayouts[layout] {
+			startTime, err = time.ParseInLocation(layout, info.StartTime, time.Local)
+		} else {
+			startTime, err = time.Parse(layout, info.StartTime)
+		}
 		if err == nil {
 			break
 		}
@@ -338,7 +344,11 @@ func (sm *ServerManager) CtrlGb28181Playback(info base.ApiCtrlGb28181PlaybackReq
 		return
 	}
 	for _, layout := range timeLayouts {
-		endTime, err = time.Parse(layout, info.EndTime)
+		if naiveLayouts[layout] {
+			endTime, err = time.ParseInLocation(layout, info.EndTime, time.Local)
+		} else {
+			endTime, err = time.Parse(layout, info.EndTime)
+		}
 		if err == nil {
 			break
 		}
@@ -368,7 +378,7 @@ func (sm *ServerManager) CtrlGb28181Playback(info base.ApiCtrlGb28181PlaybackReq
 		return
 	}
 
-	// 回放暂时固定按主码流处理（streamType=0）；如需区分主/辅回放，可扩展 ApiCtrlGb28181PlaybackReq。
+	// 按设备+通道查找；码流由 stream_index 在 SDP/Subject 中指定
 	ch := sm.gb28181Server.FindChannelWithStreamType(info.DeviceId, info.ChannelId, 0)
 	if ch == nil {
 		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
@@ -376,16 +386,21 @@ func (sm *ServerManager) CtrlGb28181Playback(info base.ApiCtrlGb28181PlaybackReq
 		return
 	}
 
+	streamIndex := info.StreamIndex
+	if streamIndex < 0 {
+		streamIndex = 0
+	}
 	network := "udp"
 	if info.IsTcpFlag == 1 {
 		network = "tcp"
 	}
 	playInfo := &gb28181.PlayInfo{
-		NetWork:    network,
-		DeviceId:   info.DeviceId,
-		ChannelId:  info.ChannelId,
-		StreamName: streamName,
-		SinglePort: false,
+		NetWork:     network,
+		DeviceId:    info.DeviceId,
+		ChannelId:   info.ChannelId,
+		StreamName:  streamName,
+		SinglePort:  false,
+		StreamIndex: streamIndex,
 	}
 	scale := info.Scale
 	if scale <= 0 {
