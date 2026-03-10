@@ -13,6 +13,8 @@ type IGbObserver interface {
 	CheckSsrc(ssrc uint32) (*MediaInfo, bool)
 	GetMediaInfoByKey(key string) (*MediaInfo, bool)
 	NotifyClose(streamName string)
+	// GetPlaybackScale 返回指定回放流当前配置的倍速，未配置时返回 1.0。
+	GetPlaybackScale(streamName string) float64
 }
 
 type GB28181MediaServer struct {

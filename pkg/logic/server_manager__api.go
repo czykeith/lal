@@ -567,6 +567,11 @@ func (sm *ServerManager) CtrlGb28181PlaybackScale(info base.ApiCtrlGb28181Playba
 		return
 	}
 
+	// 记录本地倍速配置，供 GB28181 RTP 收流侧进行时间戳适配。
+	if gb != nil {
+		gb.SetPlaybackScale(streamName, info.Scale)
+	}
+
 	ret.ErrorCode = base.ErrorCodeSucc
 	ret.Desp = base.DespSucc
 	ret.Data.StreamName = streamName

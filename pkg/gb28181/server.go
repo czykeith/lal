@@ -46,6 +46,8 @@ type GB28181Server struct {
 
 	// playbackSessions 记录回放会话的过期时间，key 为 streamName
 	playbackSessions sync.Map
+	// playbackScales 记录回放会话的倍速配置，key 为 streamName，value 为 float64 倍速（>0，1 表示正常速度）
+	playbackScales sync.Map
 }
 
 const MaxRegisterCount = 3
@@ -395,6 +397,33 @@ func (s *GB28181Server) UnregisterPlaybackSession(streamName string) {
 		return
 	}
 	s.playbackSessions.Delete(streamName)
+	s.playbackScales.Delete(streamName)
+}
+
+// SetPlaybackScale 记录指定回放会话的倍速配置。
+// scale<=0 或 scale==1.0 时视为关闭自定义倍速，恢复正常速度。
+func (s *GB28181Server) SetPlaybackScale(streamName string, scale float64) {
+	if streamName == "" {
+		return
+	}
+	if scale <= 0 || scale == 1.0 {
+		s.playbackScales.Delete(streamName)
+		return
+	}
+	s.playbackScales.Store(streamName, scale)
+}
+
+// GetPlaybackScale 获取指定回放会话当前配置的倍速，默认返回 1.0。
+func (s *GB28181Server) GetPlaybackScale(streamName string) float64 {
+	if streamName == "" {
+		return 1.0
+	}
+	if v, ok := s.playbackScales.Load(streamName); ok {
+		if f, ok2 := v.(float64); ok2 && f > 0 {
+			return f
+		}
+	}
+	return 1.0
 }
 
 // clearExpiredPlaybackSessions 清理已超过有效期的回放会话。
@@ -417,6 +446,7 @@ func (s *GB28181Server) clearExpiredPlaybackSessions() {
 				streamName, expireAt.Format("2006-01-02 15:04:05"))
 			// 删除会话记录
 			s.playbackSessions.Delete(key)
+			s.playbackScales.Delete(streamName)
 			// 找到对应通道并发送 BYE
 			if ch := s.FindChannelByStreamName(streamName); ch != nil {
 				if err := ch.Bye(streamName); err != nil {

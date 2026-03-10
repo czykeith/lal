@@ -13,6 +13,7 @@ import (
 	"github.com/pion/rtp"
 	"github.com/q191201771/lal/pkg/base"
 	"github.com/q191201771/lal/pkg/gb28181/mpegps"
+	"github.com/q191201771/lal/pkg/rtsp"
 )
 
 var (
@@ -65,6 +66,11 @@ type Conn struct {
 	mediaServer *GB28181MediaServer
 	one         sync.Once
 	oneSaveConn sync.Once
+
+	// scaleQueue 复用 RTSP 侧的 AvPacketQueue 变速算法，根据回放倍速对时间戳进行适配。
+	scaleQueue *rtsp.AvPacketQueue
+	hasAudio   bool
+	hasVideo   bool
 }
 
 func NewConn(conn net.Conn, observer IGbObserver, lal ILalServer) *Conn {
@@ -270,6 +276,7 @@ func (c *Conn) OnFrame(frame []byte, cid mpegps.PsStreamType, pts uint64, dts ui
 		c.psPtsZeroTimes = -1
 	}
 	if payloadType == base.AvPacketPtAac || payloadType == base.AvPacketPtG711A || payloadType == base.AvPacketPtG711U {
+		c.hasAudio = true
 		if c.audioFrame.initDts == 0 {
 			c.audioFrame.initDts = dts
 		}
@@ -283,9 +290,10 @@ func (c *Conn) OnFrame(frame []byte, cid mpegps.PsStreamType, pts uint64, dts ui
 		pkt.Timestamp = int64(dts - c.audioFrame.initDts)
 		pkt.Pts = int64(pts - c.audioFrame.initPts)
 		pkt.Payload = append(pkt.Payload, frame...)
-		c.lalSession.FeedAvPacket(pkt)
+		c.feedAvPacketWithScale(pkt)
 
 	} else {
+		c.hasVideo = true
 		if c.videoFrame.initPts == 0 {
 			c.videoFrame.initPts = pts
 		}
@@ -302,8 +310,38 @@ func (c *Conn) OnFrame(frame []byte, cid mpegps.PsStreamType, pts uint64, dts ui
 		pkt.Timestamp = int64(c.videoFrame.dts)
 		pkt.Pts = int64(c.videoFrame.pts)
 		pkt.Payload = frame
-		c.lalSession.FeedAvPacket(pkt)
+		c.feedAvPacketWithScale(pkt)
 	}
+}
+
+// feedAvPacketWithScale 根据当前回放倍速（若有）选择是否走变速过滤器。
+// - 当未配置倍速或倍速<=1 时，直接透传到 lalSession。
+// - 当倍速>1 且同时存在音频和视频时，使用 RTSP 侧的 AvPacketQueue 做时间戳适配与音视频对齐。
+func (c *Conn) feedAvPacketWithScale(pkt base.AvPacket) {
+	if c.lalSession == nil {
+		return
+	}
+
+	// 默认正常速度
+	scale := 1.0
+	if c.observer != nil && c.streamName != "" {
+		scale = c.observer.GetPlaybackScale(c.streamName)
+	}
+
+	// 未启用倍速或缺少音视频其一时，直接透传，避免 AvPacketQueue 在单流场景下导致长时延。
+	if scale <= 1.0 || !(c.hasAudio && c.hasVideo) {
+		_ = c.lalSession.FeedAvPacket(pkt)
+		return
+	}
+
+	// 按需懒加载变速队列
+	if c.scaleQueue == nil {
+		c.scaleQueue = rtsp.NewAvPacketQueue(func(out base.AvPacket) {
+			_ = c.lalSession.FeedAvPacket(out)
+		})
+	}
+	c.scaleQueue.SetScale(scale)
+	c.scaleQueue.Feed(pkt)
 }
 func (c *Conn) Close() {
 	c.one.Do(func() {
