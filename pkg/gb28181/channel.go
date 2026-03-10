@@ -522,14 +522,23 @@ func (channel *Channel) PlaybackScale(scale float64) error {
 		seq.MethodName = sip.INFO
 	}
 
-	// 按抓包到的“兼容实现”格式发送：
-	// SIP Header 内已有 `CSeq: <n> INFO`，body 不再重复写 `CSeq:`，否则部分实现不响应或不生效。
-	// body 为类 RTSP 文本（MANSRTSP），Scale 保留两位小数（例如 4.00）。
-	body := fmt.Sprintf("PLAY RTSP/1.0\r\nScale: %.2f\r\n", scale)
+	// 按你的要求，将 CSeq 也放入 MANSRTSP body 中：
+	// SIP Header: CSeq: <n> INFO
+	// Body(MANSRTSP):
+	//   PLAY RTSP/1.0
+	//   CSeq: <n>.0
+	//   Scale: xx.xx
+	body := fmt.Sprintf("PLAY RTSP/1.0\r\nCSeq: %.1f\r\nScale: %.2f\r\n", float64(nextSeq), scale)
 	ua := sip.UserAgentHeader(SipUserAgent)
 	infoReq.RemoveHeader("User-Agent")
 	infoReq.AppendHeader(&ua)
-	// 部分实现不需要（甚至不接受）INFO 携带 Content-Type，避免重复/不兼容，统一移除。
+	// Contact 使用设备注册时的地址（client channel_id@domain），与对端期望保持一致。
+	if channel.device != nil {
+		contact := channel.device.addr.AsContactHeader()
+		infoReq.RemoveHeader("Contact")
+		infoReq.AppendHeader(contact)
+	}
+	// 部分实现不需要（甚至不接受）INFO 携带 Content-Type，这里仍保持移除，和正常抓包对齐。
 	infoReq.RemoveHeader("Content-Type")
 	// 复用对话请求时，确保 Content-Length 与最新 body 一致（部分设备严格校验）
 	contentLength := sip.ContentLength(len(body))
