@@ -129,6 +129,32 @@ $ffplay http://127.0.0.1:8080/live/test110.ts
 
 LAL 提供了丰富的 HTTP API 接口，用于控制和管理流媒体服务。默认 API 地址为 `http://127.0.0.1:8083`（可在配置文件中修改）。
 
+### 接口索引
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/lal.html` | Web 控制台页面 |
+| GET | `/api/stat/lal_info` | 查询 LAL 服务信息（版本、启动时间等） |
+| GET | `/api/stat/all_group` | 查询所有流分组统计（含 pub/sub/pull 等） |
+| GET | `/api/stat/group` | 查询指定流分组统计（query: stream_name） |
+| POST | `/api/ctrl/start_relay_pull` | 启动拉流（仅拉流到本地，可多协议播放） |
+| GET | `/api/ctrl/stop_relay_pull` | 停止拉流（query: stream_name） |
+| POST | `/api/ctrl/kick_session` | 踢出指定会话（stream_name + session_id） |
+| POST | `/api/ctrl/start_rtp_pub` | 启动 RTP 收流（已废弃，请用 gb28181_invite） |
+| POST | `/api/ctrl/add_ip_blacklist` | 添加 IP 黑名单（ip + duration_sec） |
+| POST | `/api/ctrl/start_relay` | 启动转推（拉流+推流） |
+| GET | `/api/ctrl/stop_relay` | 停止转推（query: stream_name） |
+| POST | `/api/ctrl/start_relay_from_stream` | 从已有流转推（仅推流，不额外拉流） |
+| POST | `/api/ctrl/gb28181_invite` | GB28181 拉流 |
+| POST | `/api/ctrl/gb28181_bye` | GB28181 停止拉流/回放 |
+| POST | `/api/ctrl/gb28181_playback` | GB28181 回放 |
+| POST | `/api/ctrl/gb28181_ptz` | GB28181 云台控制 |
+| GET | `/api/ctrl/gb28181_devices` | 查询 GB28181 设备列表 |
+| GET | `/api/ctrl/gb28181_streams` | 查询 GB28181 流列表 |
+| POST | `/api/ctrl/gb28181_device_info` | 查询 GB28181 设备信息 |
+| POST | `/api/ctrl/gb28181_device_status` | 查询 GB28181 设备状态 |
+| POST | `/api/ctrl/gb28181_channels` | 查询 GB28181 通道列表 |
+
 ### 转推 API
 
 转推功能支持从 RTSP 或 RTMP 拉流，然后转推到 RTMP 或 RTSP。
@@ -530,7 +556,8 @@ curl -X POST http://127.0.0.1:8083/api/ctrl/gb28181_playback \
   "error_code": 0,
   "desp": "succ",
   "data": {
-    "stream_name": "test_stream"
+    "stream_name": "test_stream",
+    "session_id": "PSPUB..."
   }
 }
 ```
@@ -848,11 +875,74 @@ ffplay http://127.0.0.1:8080/live/test_stream.flv
 ffplay http://127.0.0.1:8080/hls/test_stream/playlist.m3u8
 ```
 
-### 其他常用 API
+### 统计与查询 API
+
+#### 查询 LAL 服务信息
+
+**接口地址：** `GET /api/stat/lal_info`
+
+**说明：** 返回服务版本、二进制信息、API 版本、启动时间等。
+
+**响应示例：**
+
+```json
+{
+  "error_code": 0,
+  "desp": "succ",
+  "data": {
+    "server_id": "...",
+    "bin_info": "...",
+    "lal_version": "vx.x.x",
+    "api_version": "...",
+    "notify_version": "...",
+    "start_time": "2024-01-01 10:00:00"
+  }
+}
+```
+
+**使用示例：**
+
+```bash
+curl http://127.0.0.1:8083/api/stat/lal_info
+```
 
 #### 查询所有流信息
 
 **接口地址：** `GET /api/stat/all_group`
+
+**说明：** 返回当前所有流分组统计。每个分组包含 `stream_name`、`app_name`、音视频编码/分辨率、`pub`（推流端会话，含 RTMP/RTSP/GB28181 等）、`subs`（拉流/播放会话）、`pull`（拉流会话）、`in_frame_per_sec` 等。GB28181 拉流会在 `pub` 中展示，含 `read_bytes_sum`、`read_bitrate_kbits`、`bitrate_kbits` 等。
+
+**响应示例：**
+
+```json
+{
+  "error_code": 0,
+  "desp": "succ",
+  "data": {
+    "groups": [
+      {
+        "stream_name": "test_stream",
+        "app_name": "live",
+        "audio_codec": "AAC",
+        "video_codec": "H264",
+        "video_width": 1920,
+        "video_height": 1080,
+        "pub": {
+          "session_id": "PSPUB...",
+          "protocol": "PS",
+          "base_type": "pub",
+          "read_bytes_sum": 1234567,
+          "read_bitrate_kbits": 1024,
+          "bitrate_kbits": 1024,
+          "start_time": "..."
+        },
+        "subs": [],
+        "pull": { ... }
+      }
+    ]
+  }
+}
+```
 
 **使用示例：**
 
@@ -864,46 +954,159 @@ curl http://127.0.0.1:8083/api/stat/all_group
 
 **接口地址：** `GET /api/stat/group?stream_name=test_stream`
 
+**请求参数：**
+- `stream_name`（必填）：流名称
+
+**说明：** 返回指定流的分组统计，结构同单条 `all_group` 中的元素。若流不存在则 `error_code` 为 1001（group not found）。
+
+**响应示例：** 与 `all_group` 中单个 group 结构一致，外层为 `{"error_code":0,"desp":"succ","data":{ ... }}`。
+
 **使用示例：**
 
 ```bash
 curl "http://127.0.0.1:8083/api/stat/group?stream_name=test_stream"
 ```
 
+### 拉流与会话控制 API
+
 #### 启动拉流
 
 **接口地址：** `POST /api/ctrl/start_relay_pull`
+
+**说明：** 从指定 URL（RTMP 或 RTSP）拉流到本地，拉流成功后可通过 RTMP/RTSP/HLS/HTTP-FLV 等协议播放。与转推不同，不向其他地址推流。
 
 **请求参数：**
 
 ```json
 {
-  "url": "rtmp://example.com/live/stream",
-  "stream_name": "test_stream",
-  "pull_timeout_ms": 10000,
-  "pull_retry_num": -1,
-  "auto_stop_pull_after_no_out_ms": -1,             // 无观众自动停止拉流时间（毫秒），-1=永不自动停止，0=立即停止，>0=持续指定毫秒后自动停止
-  "rtsp_mode": 0,                                   // RTSP 模式，0=TCP，1=UDP（仅当 url 为 rtsp:// 时生效）
-  "scale": 1.0                                      // RTSP拉流时的播放速度倍数，例如1.0表示正常速度，2.0表示2倍速。统一使用代码实现倍速，不依赖RTSP协议支持
+  "url": "rtmp://example.com/live/stream",         // 拉流地址（必填），支持 rtmp:// 或 rtsp://
+  "stream_name": "test_stream",                     // 流名称（可选，不填则从 url 解析）
+  "pull_timeout_ms": 10000,                         // 拉流超时（毫秒），默认 10000
+  "pull_retry_num": -1,                             // 重试次数：-1=永远，0=不重试，>0=次数
+  "auto_stop_pull_after_no_out_ms": -1,             // 无观众自动停止拉流（毫秒），-1=不自动停止，0=立即，>0=持续该毫秒后停止
+  "rtsp_mode": 0,                                   // RTSP 模式，0=TCP，1=UDP（仅 rtsp:// 有效）
+  "debug_dump_packet": "",                           // 调试落盘路径（可选）
+  "scale": 1.0                                      // RTSP 拉流倍速，1.0=正常，2.0=2 倍速等
 }
+```
+
+**响应示例：**
+
+```json
+{
+  "error_code": 0,
+  "desp": "succ",
+  "data": {
+    "stream_name": "test_stream",
+    "session_id": "RTMPPULL..."
+  }
+}
+```
+
+**使用示例：**
+
+```bash
+curl -X POST http://127.0.0.1:8083/api/ctrl/start_relay_pull \
+  -H "Content-Type: application/json" \
+  -d '{"url":"rtmp://example.com/live/stream","stream_name":"test_stream","pull_retry_num":-1}'
 ```
 
 #### 停止拉流
 
 **接口地址：** `GET /api/ctrl/stop_relay_pull?stream_name=test_stream`
 
+**请求参数：**
+- `stream_name`（必填）：流名称
+
+**响应示例：**
+
+```json
+{
+  "error_code": 0,
+  "desp": "succ",
+  "data": {
+    "session_id": "RTMPPULL..."
+  }
+}
+```
+
+**使用示例：**
+
+```bash
+curl "http://127.0.0.1:8083/api/ctrl/stop_relay_pull?stream_name=test_stream"
+```
+
 #### 踢出会话
 
 **接口地址：** `POST /api/ctrl/kick_session`
+
+**说明：** 根据流名称和会话 ID 踢出指定会话（如某个播放端或推流端）。
 
 **请求参数：**
 
 ```json
 {
-  "stream_name": "test_stream",
-  "session_id": "RTMPPUBSUB..."
+  "stream_name": "test_stream",    // 流名称（必填）
+  "session_id": "RTMPPUBSUB..."    // 会话 ID（必填），可从 /api/stat/group 或 /api/stat/all_group 的 pub/subs 中获取
 }
 ```
+
+**响应示例：**
+
+```json
+{
+  "error_code": 0,
+  "desp": "succ"
+}
+```
+
+**使用示例：**
+
+```bash
+curl -X POST http://127.0.0.1:8083/api/ctrl/kick_session \
+  -H "Content-Type: application/json" \
+  -d '{"stream_name":"test_stream","session_id":"RTMPPUBSUB..."}'
+```
+
+#### 添加 IP 黑名单
+
+**接口地址：** `POST /api/ctrl/add_ip_blacklist`
+
+**说明：** 将指定 IP 加入黑名单，在有效期内该 IP 的请求会被拒绝。
+
+**请求参数：**
+
+```json
+{
+  "ip": "192.168.1.100",    // IP 地址（必填）
+  "duration_sec": 3600      // 生效时长（秒，必填）
+}
+```
+
+**响应示例：**
+
+```json
+{
+  "error_code": 0,
+  "desp": "succ"
+}
+```
+
+**使用示例：**
+
+```bash
+curl -X POST http://127.0.0.1:8083/api/ctrl/add_ip_blacklist \
+  -H "Content-Type: application/json" \
+  -d '{"ip":"192.168.1.100","duration_sec":3600}'
+```
+
+#### 启动 RTP 收流（已废弃）
+
+**接口地址：** `POST /api/ctrl/start_rtp_pub`
+
+**说明：** 该接口已废弃。RTP 收流请使用 GB28181 方式：在配置中启用 GB28181 后，通过 `POST /api/ctrl/gb28181_invite` 拉流。调用本接口会返回错误提示使用 `gb28181_invite`。
+
+---
 
 更多 API 文档请参考：https://pengrl.com/lal/#/HTTPAPI
 

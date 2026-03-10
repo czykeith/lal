@@ -78,6 +78,17 @@ type StatSession struct {
 	typ SessionType
 }
 
+// NewStatSessionForPsPub 返回用于 PS Pub（如 GB28181 / CustomizePub）的 StatSession 初始值，供 logic 包使用
+func NewStatSessionForPsPub(sessionId, startTime string) StatSession {
+	return StatSession{
+		SessionId: sessionId,
+		Protocol:  SessionProtocolPsStr,
+		BaseType:  SessionBaseTypePubStr,
+		StartTime: startTime,
+		typ:       SessionTypePsPub,
+	}
+}
+
 type StatPub struct {
 	StatSession
 }

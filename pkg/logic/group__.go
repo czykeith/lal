@@ -266,6 +266,9 @@ func (group *Group) GetStat(maxsub int) base.StatGroup {
 		group.stat.StatPub = base.Session2StatPub(group.rtmpPubSession)
 	} else if group.rtspPubSession != nil {
 		group.stat.StatPub = base.Session2StatPub(group.rtspPubSession)
+	} else if group.customizePubSession != nil {
+		// 用于 GB28181 / 自定义接入场景，通过 CustomizePubSessionContext 统计为 PS/CUSTOMIZE 类型的 Pub
+		group.stat.StatPub = base.Session2StatPub(group.customizePubSession)
 	} else {
 		group.stat.StatPub = base.StatPub{}
 	}
@@ -509,6 +512,9 @@ func (group *Group) updateAllSessionStat() {
 	}
 	if group.rtspPubSession != nil {
 		group.rtspPubSession.UpdateStat(calcSessionStatIntervalSec)
+	}
+	if group.customizePubSession != nil {
+		group.customizePubSession.UpdateStat(calcSessionStatIntervalSec)
 	}
 	group.updatePullSessionStat()
 
