@@ -344,6 +344,12 @@ func (d *Device) SipRequestForResponse(request sip.Request) (sip.Response, error
 	return d.sipSvr.RequestWithContext(context.Background(), request)
 }
 
+func (d *Device) SipRequestForResponseWithTimeout(request sip.Request, timeout time.Duration) (sip.Response, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return d.sipSvr.RequestWithContext(ctx, request)
+}
+
 // GetChannels 返回设备下通道列表，供 API 使用
 func (d *Device) GetChannels() (channels []*ChannelItem) {
 	channels = make([]*ChannelItem, 0)

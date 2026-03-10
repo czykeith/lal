@@ -539,17 +539,22 @@ func (sm *ServerManager) CtrlGb28181Bye(info base.ApiCtrlGb28181ByeReq) (ret bas
 
 // CtrlGb28181PlaybackScale GB28181回放倍速控制（发送控制指令，不改变本地拉流逻辑）
 func (sm *ServerManager) CtrlGb28181PlaybackScale(info base.ApiCtrlGb28181PlaybackScaleReq) (ret base.ApiCtrlGb28181PlaybackScaleResp) {
-	sm.mutex.Lock()
-	defer sm.mutex.Unlock()
+	// 注意：不要在 sm.mutex 内同步等待 SIP 响应，否则会阻塞其它 HTTP 接口。
+	streamName := info.StreamName
 
-	if sm.gb28181Server == nil {
+	sm.mutex.Lock()
+	gb := sm.gb28181Server
+	var ch *gb28181.Channel
+	if gb != nil {
+		ch = gb.FindChannelByStreamName(streamName)
+	}
+	sm.mutex.Unlock()
+
+	if gb == nil {
 		ret.ErrorCode = base.ErrorCodeGb28181PlaybackCtrlFail
 		ret.Desp = "gb28181 server not enabled"
 		return
 	}
-
-	streamName := info.StreamName
-	ch := sm.gb28181Server.FindChannelByStreamName(streamName)
 	if ch == nil {
 		ret.ErrorCode = base.ErrorCodeGb28181PlaybackCtrlFail
 		ret.Desp = "gb28181 stream not found"

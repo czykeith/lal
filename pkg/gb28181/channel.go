@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/q191201771/naza/pkg/nazaatomic"
@@ -67,9 +68,10 @@ func buildGb28181ScaleLine(scale float64) string {
 type Channel struct {
 	device *Device // 所属设备
 	//status  atomic.Int32 // 通道状态,0:空闲,1:正在invite,2:正在播放
-	GpsTime time.Time // gps时间
-	number  uint16
-	ackReq  sip.Request
+	GpsTime  time.Time // gps时间
+	number   uint16
+	ackReq   sip.Request
+	dialogMu sync.Mutex
 
 	observer IMediaOpObserver
 	playInfo *PlayInfo
@@ -474,6 +476,9 @@ func (channel *Channel) byeClear() (err error) {
 	return
 }
 func (channel *Channel) Bye(streamName string) (err error) {
+	channel.dialogMu.Lock()
+	defer channel.dialogMu.Unlock()
+
 	if channel.ackReq != nil {
 		byeReq := channel.ackReq
 		channel.ackReq = nil
@@ -498,6 +503,9 @@ func (channel *Channel) Bye(streamName string) (err error) {
 // - 本方法仅向设备端发送控制命令，不改变本地拉流/转码逻辑；
 // - 需要回放会话已建立（channel.ackReq 非空），否则返回失败。
 func (channel *Channel) PlaybackScale(scale float64) error {
+	channel.dialogMu.Lock()
+	defer channel.dialogMu.Unlock()
+
 	if channel.ackReq == nil {
 		return errors.New("gb28181 playback control: no active dialog")
 	}
@@ -507,13 +515,21 @@ func (channel *Channel) PlaybackScale(scale float64) error {
 
 	// GB28181 常见实现：SIP INFO + Application/MANSCDP+xml
 	// XML 的 <Info> 字段内携带类 RTSP 的 PLAY 命令与 Scale 参数。
-	cseq := int(channel.sn.Add(1))
-	// 兼容性：Scale 固定 6 位小数，格式参考常见实现（String.format(\"%.6f\", speed)）
+	infoReq := channel.ackReq
+	infoReq.SetMethod(sip.INFO)
+	var nextSeq uint32 = 1
+	if seq, ok := infoReq.CSeq(); ok {
+		nextSeq = seq.SeqNo + 1
+		seq.SeqNo = nextSeq
+		seq.MethodName = sip.INFO
+	}
+
+	// XML 中 SN 与 <Info> 中的 CSeq 与 SIP 的 CSeq 使用同一个序号，提升兼容性（部分设备校验严格）
 	// 注意：<Info> 中直接使用换行分隔即可，避免部分设备对 CRLF（\r\n）解析异常/显示乱码
-	infoText := fmt.Sprintf("PLAY RTSP/1.0\nCSeq: %d\nScale: %.6f\n", cseq, scale)
+	infoText := fmt.Sprintf("PLAY RTSP/1.0\nCSeq: %d\nScale: %.6f\n", nextSeq, scale)
 	msg := &MessagePlaybackControl{
 		CmdType:  PlaybackControl,
-		SN:       cseq,
+		SN:       int(nextSeq),
 		DeviceID: channel.ChannelId,
 		Info:     CDataText{Text: infoText},
 	}
@@ -521,23 +537,21 @@ func (channel *Channel) PlaybackScale(scale float64) error {
 	if err != nil {
 		return err
 	}
-
-	infoReq := channel.ackReq
-	infoReq.SetMethod(sip.INFO)
-	if seq, ok := infoReq.CSeq(); ok {
-		seq.SeqNo += 1
-		seq.MethodName = sip.INFO
-	}
 	ua := sip.UserAgentHeader(SipUserAgent)
 	infoReq.RemoveHeader("User-Agent")
 	infoReq.AppendHeader(&ua)
 	contentType := sip.ContentType("Application/MANSCDP+xml")
 	infoReq.AppendHeader(&contentType)
+	// 复用对话请求时，确保 Content-Length 与最新 body 一致（部分设备严格校验）
+	contentLength := sip.ContentLength(len(xmlBody))
+	infoReq.RemoveHeader("Content-Length")
+	infoReq.AppendHeader(&contentLength)
 	infoReq.SetBody(xmlBody, true)
 
 	base.Log.Info("GB28181 INFO(PlaybackControl) >>>", "\n", infoReq.String())
 
-	resp, err := channel.device.SipRequestForResponse(infoReq)
+	// 避免设备不回包导致 HTTP handler 长时间挂起
+	resp, err := channel.device.SipRequestForResponseWithTimeout(infoReq, 5*time.Second)
 	if err != nil {
 		return err
 	}
