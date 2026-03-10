@@ -522,15 +522,15 @@ func (channel *Channel) PlaybackScale(scale float64) error {
 		seq.MethodName = sip.INFO
 	}
 
-	// GB28181 常见实现：SIP INFO + Application/MANSRTSP
-	// body 为类 RTSP 文本（不需要外包一层 XML），并直接使用换行分隔。
-	body := fmt.Sprintf("PLAY RTSP/1.0\r\nCSeq: %d\r\nScale: %.1f\r\n", nextSeq, scale)
+	// 按抓包到的“兼容实现”格式发送：
+	// SIP Header 内已有 `CSeq: <n> INFO`，body 不再重复写 `CSeq:`，否则部分实现不响应或不生效。
+	// body 为类 RTSP 文本（MANSRTSP），Scale 保留两位小数（例如 4.00）。
+	body := fmt.Sprintf("PLAY RTSP/1.0\r\nScale: %.2f\r\n", scale)
 	ua := sip.UserAgentHeader(SipUserAgent)
 	infoReq.RemoveHeader("User-Agent")
 	infoReq.AppendHeader(&ua)
-	contentType := sip.ContentType("Application/MANSRTSP")
+	// 部分实现不需要（甚至不接受）INFO 携带 Content-Type，避免重复/不兼容，统一移除。
 	infoReq.RemoveHeader("Content-Type")
-	infoReq.AppendHeader(&contentType)
 	// 复用对话请求时，确保 Content-Length 与最新 body 一致（部分设备严格校验）
 	contentLength := sip.ContentLength(len(body))
 	infoReq.RemoveHeader("Content-Length")
