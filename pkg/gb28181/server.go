@@ -29,7 +29,9 @@ type GB28181Server struct {
 	RegisterValidity  time.Duration // 注册有效期，单位秒，默认 3600
 	HeartbeatInterval time.Duration // 心跳间隔，单位秒，默认 60
 	RemoveBanInterval time.Duration // 移除禁止设备间隔,默认600s
-	keepaliveInterval int
+	// PlaybackSessionTTL 回放会话默认有效期，超过该时间自动结束回放，防止资源长期占用
+	PlaybackSessionTTL time.Duration
+	keepaliveInterval  int
 
 	lalServer mediaserver.ILalServer
 
@@ -41,6 +43,9 @@ type GB28181Server struct {
 
 	MediaServerMap sync.Map
 	disposeOnce    sync.Once
+
+	// playbackSessions 记录回放会话的过期时间，key 为 streamName
+	playbackSessions sync.Map
 }
 
 const MaxRegisterCount = 3
@@ -90,14 +95,15 @@ func NewGB28181Server(conf GB28181Config, lal mediaserver.ILalServer) *GB28181Se
 		conf.MediaConfig.MultiPortMaxIncrement = 3000
 	}
 	gb28181Server := &GB28181Server{
-		conf:              conf,
-		RegisterValidity:  3600 * time.Second,
-		HeartbeatInterval: 60 * time.Second,
-		RemoveBanInterval: 600 * time.Second,
-		keepaliveInterval: conf.KeepaliveInterval,
-		lalServer:         lal,
-		udpAvailConnPool:  NewAvailConnPool(conf.MediaConfig.ListenPort+1, conf.MediaConfig.ListenPort+conf.MediaConfig.MultiPortMaxIncrement),
-		tcpAvailConnPool:  NewAvailConnPool(conf.MediaConfig.ListenPort+1, conf.MediaConfig.ListenPort+conf.MediaConfig.MultiPortMaxIncrement),
+		conf:               conf,
+		RegisterValidity:   3600 * time.Second,
+		HeartbeatInterval:  60 * time.Second,
+		RemoveBanInterval:  600 * time.Second,
+		PlaybackSessionTTL: 3 * time.Hour,
+		keepaliveInterval:  conf.KeepaliveInterval,
+		lalServer:          lal,
+		udpAvailConnPool:   NewAvailConnPool(conf.MediaConfig.ListenPort+1, conf.MediaConfig.ListenPort+conf.MediaConfig.MultiPortMaxIncrement),
+		tcpAvailConnPool:   NewAvailConnPool(conf.MediaConfig.ListenPort+1, conf.MediaConfig.ListenPort+conf.MediaConfig.MultiPortMaxIncrement),
 	}
 	gb28181Server.tcpAvailConnPool.onListenWithPort = func(port uint16) (net.Listener, error) {
 		return net.Listen("tcp", fmt.Sprintf(":%d", port))
@@ -332,6 +338,8 @@ func (s *GB28181Server) NotifyClose(streamName string) {
 				}
 				ch.MediaInfo.Clear()
 				ok = true
+				// 主动关闭时移除回放会话
+				s.UnregisterPlaybackSession(streamName)
 				return false
 			}
 			return true
@@ -354,6 +362,8 @@ func (s *GB28181Server) startJob() {
 			}
 		case <-statusTick.C:
 			s.statusCheck()
+			// 定期清理超时的回放会话
+			s.clearExpiredPlaybackSessions()
 		}
 	}
 }
@@ -362,6 +372,57 @@ func (s *GB28181Server) removeBanDevice() {
 	DeviceRegisterCount.Range(func(key, value interface{}) bool {
 		if value.(int) > MaxRegisterCount {
 			DeviceRegisterCount.Delete(key)
+		}
+		return true
+	})
+}
+
+// RegisterPlaybackSession 注册一次 GB28181 回放会话。
+// 目前以 streamName 作为唯一标识，超时后会自动触发 BYE 关闭回放。
+func (s *GB28181Server) RegisterPlaybackSession(streamName string) {
+	if streamName == "" {
+		return
+	}
+	expireAt := time.Now().Add(s.PlaybackSessionTTL)
+	s.playbackSessions.Store(streamName, expireAt)
+	base.Log.Infof("gb28181 playback session registered. streamName=%s expireAt=%s ttl=%s",
+		streamName, expireAt.Format("2006-01-02 15:04:05"), s.PlaybackSessionTTL.String())
+}
+
+// UnregisterPlaybackSession 主动停止回放时移除会话。
+func (s *GB28181Server) UnregisterPlaybackSession(streamName string) {
+	if streamName == "" {
+		return
+	}
+	s.playbackSessions.Delete(streamName)
+}
+
+// clearExpiredPlaybackSessions 清理已超过有效期的回放会话。
+// 通过 streamName 反查 Channel，并发送 BYE 结束会话。
+func (s *GB28181Server) clearExpiredPlaybackSessions() {
+	now := time.Now()
+	s.playbackSessions.Range(func(key, value any) bool {
+		streamName, ok := key.(string)
+		if !ok || streamName == "" {
+			return true
+		}
+		expireAt, ok := value.(time.Time)
+		if !ok {
+			// 类型异常时防御性删除，避免泄漏
+			s.playbackSessions.Delete(key)
+			return true
+		}
+		if now.After(expireAt) {
+			base.Log.Infof("gb28181 playback session expired, auto stop. streamName=%s expireAt=%s",
+				streamName, expireAt.Format("2006-01-02 15:04:05"))
+			// 删除会话记录
+			s.playbackSessions.Delete(key)
+			// 找到对应通道并发送 BYE
+			if ch := s.FindChannelByStreamName(streamName); ch != nil {
+				if err := ch.Bye(streamName); err != nil {
+					base.Log.Warnf("gb28181 auto stop playback failed. streamName=%s err=%+v", streamName, err)
+				}
+			}
 		}
 		return true
 	})
@@ -890,7 +951,12 @@ func (s *GB28181Server) OnBye(req sip.Request, tx sip.ServerTransaction) {
 		d.channelMap.Range(func(key, value any) bool {
 			ch := value.(*Channel)
 			if ch.GetCallId() == callIdStr {
+				// 记录当前流名用于同步清理回放会话（byeClear 会清空 MediaInfo）
+				streamName := ch.MediaInfo.StreamName
 				ch.byeClear()
+				if streamName != "" {
+					s.UnregisterPlaybackSession(streamName)
+				}
 				return false
 			}
 			return true

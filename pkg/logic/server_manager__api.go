@@ -423,6 +423,11 @@ func (sm *ServerManager) CtrlGb28181Playback(info base.ApiCtrlGb28181PlaybackReq
 		return
 	}
 
+	// 注册回放会话，有效期默认 3 小时（可通过 GB28181Server.PlaybackSessionTTL 调整）
+	if sm.gb28181Server != nil {
+		sm.gb28181Server.RegisterPlaybackSession(streamName)
+	}
+
 	ret.ErrorCode = base.ErrorCodeSucc
 	ret.Desp = base.DespSucc
 	ret.Data.StreamName = streamName
@@ -474,6 +479,11 @@ func (sm *ServerManager) CtrlGb28181Bye(info base.ApiCtrlGb28181ByeReq) (ret bas
 		ret.ErrorCode = base.ErrorCodeGb28181ByeFail
 		ret.Desp = err.Error()
 		return
+	}
+
+	// 主动停止时同步移除回放会话（若是回放的话）
+	if sm.gb28181Server != nil {
+		sm.gb28181Server.UnregisterPlaybackSession(streamName)
 	}
 
 	ret.ErrorCode = base.ErrorCodeSucc
