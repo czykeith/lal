@@ -1010,16 +1010,17 @@ func gb28181ConfigFromLogic(c Gb28181Config) gb28181.GB28181Config {
 		}
 	}
 	return gb28181.GB28181Config{
-		Enable:            true,
-		ListenAddr:        "0.0.0.0",
-		SipIP:             c.LocalSipIp,
-		SipPort:           sipPort,
-		Serial:            c.LocalSipId,
-		Realm:             realm,
-		Username:          c.Username,
-		Password:          c.Password,
-		KeepaliveInterval: 60,
-		QuickLogin:        true,
+		Enable:                   true,
+		ListenAddr:               "0.0.0.0",
+		SipIP:                    c.LocalSipIp,
+		SipPort:                  sipPort,
+		Serial:                   c.LocalSipId,
+		Realm:                    realm,
+		Username:                 c.Username,
+		Password:                 c.Password,
+		KeepaliveInterval:        60,
+		QuickLogin:               true,
+		AllowNonStandardDeviceId: c.AllowNonStandardDeviceId,
 		MediaConfig: gb28181.GB28181MediaConfig{
 			MediaIp:               c.LocalSipIp,
 			ListenPort:            uint16(rtpMin),

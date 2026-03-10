@@ -194,19 +194,20 @@ type DebugConfig struct {
 }
 
 type Gb28181Config struct {
-	Enable               bool   `json:"enable"`                 // 是否启用GB28181（默认false）
-	LocalSipId           string `json:"local_sip_id"`           // 本地SIP ID（20位国标编码）
-	LocalSipIp           string `json:"local_sip_ip"`           // 本地SIP IP地址
-	LocalSipPort         int    `json:"local_sip_port"`         // 本地SIP端口（默认5060）
-	LocalSipDomain       string `json:"local_sip_domain"`       // 本地SIP域（可选，默认使用local_sip_id）
-	Username             string `json:"username"`               // 认证用户名（可选）
-	Password             string `json:"password"`               // 认证密码（可选）
-	Expires              int    `json:"expires"`                // 注册过期时间（秒，默认3600）
-	CatalogQueryInterval int    `json:"catalog_query_interval"` // Catalog查询间隔（秒，0表示不启用定时查询）
-	RtpPortMin           int    `json:"rtp_port_min"`           // RTP接收端口段最小值（默认30000，已废弃，使用sip_rtp_port_min）
-	RtpPortMax           int    `json:"rtp_port_max"`           // RTP接收端口段最大值（默认60000，已废弃，使用sip_rtp_port_max）
-	SipRtpPortMin        int    `json:"sip_rtp_port_min"`       // SIP收流端口范围最小值（默认30000）
-	SipRtpPortMax        int    `json:"sip_rtp_port_max"`       // SIP收流端口范围最大值（默认60000）
+	Enable                   bool   `json:"enable"`                       // 是否启用GB28181（默认false）
+	AllowNonStandardDeviceId bool   `json:"allow_non_standard_device_id"` // 是否允许非20位国标设备ID注册（默认false，标准要求20位）
+	LocalSipId               string `json:"local_sip_id"`                 // 本地SIP ID（20位国标编码）
+	LocalSipIp               string `json:"local_sip_ip"`                 // 本地SIP IP地址
+	LocalSipPort             int    `json:"local_sip_port"`               // 本地SIP端口（默认5060）
+	LocalSipDomain           string `json:"local_sip_domain"`             // 本地SIP域（可选，默认使用local_sip_id）
+	Username                 string `json:"username"`                     // 认证用户名（可选）
+	Password                 string `json:"password"`                     // 认证密码（可选）
+	Expires                  int    `json:"expires"`                      // 注册过期时间（秒，默认3600）
+	CatalogQueryInterval     int    `json:"catalog_query_interval"`       // Catalog查询间隔（秒，0表示不启用定时查询）
+	RtpPortMin               int    `json:"rtp_port_min"`                 // RTP接收端口段最小值（默认30000，已废弃，使用sip_rtp_port_min）
+	RtpPortMax               int    `json:"rtp_port_max"`                 // RTP接收端口段最大值（默认60000，已废弃，使用sip_rtp_port_max）
+	SipRtpPortMin            int    `json:"sip_rtp_port_min"`             // SIP收流端口范围最小值（默认30000）
+	SipRtpPortMax            int    `json:"sip_rtp_port_max"`             // SIP收流端口范围最大值（默认60000）
 	// 视频参数配置（平铺，与 gb28181 根下 video_* 一一对应；数值支持 JSON 数字或字符串如 "720"）
 	VideoCodec     string  `json:"video_codec"`     // 视频编码格式：H264/H265（默认H264）
 	VideoWidth     flexInt `json:"video_width"`     // 视频宽度（分辨率，默认0表示不指定）

@@ -714,8 +714,11 @@ func (s *GB28181Server) OnRegister(req sip.Request, tx sip.ServerTransaction) {
 	base.Log.Info("OnRegister", " isUnregister:", isUnregister, " id:", id, " source:", req.Source(), " destination:", req.Destination())
 
 	if len(id) != 20 {
-		base.Log.Error("invalid id: ", id)
-		return
+		if !s.conf.AllowNonStandardDeviceId {
+			base.Log.Error("invalid id: ", id)
+			return
+		}
+		base.Log.Warnf("gb28181 register non-standard device id accepted. id=%s len=%d source=%s", id, len(id), req.Source())
 	}
 
 	passAuth := false
