@@ -70,6 +70,7 @@ func (h *HttpApiServer) RunLoop() error {
 	mux.HandleFunc("/api/ctrl/gb28181_invite", h.ctrlGb28181InviteHandler)
 	mux.HandleFunc("/api/ctrl/gb28181_bye", h.ctrlGb28181ByeHandler)
 	mux.HandleFunc("/api/ctrl/gb28181_playback", h.ctrlGb28181PlaybackHandler)
+	mux.HandleFunc("/api/ctrl/gb28181_playback_scale", h.ctrlGb28181PlaybackScaleHandler)
 	mux.HandleFunc("/api/ctrl/gb28181_ptz", h.ctrlGb28181PtzHandler)
 	mux.HandleFunc("/api/ctrl/gb28181_devices", h.statGb28181DevicesHandler)
 	mux.HandleFunc("/api/ctrl/gb28181_streams", h.statGb28181StreamsHandler)
@@ -398,9 +399,6 @@ func (h *HttpApiServer) ctrlGb28181PlaybackHandler(w http.ResponseWriter, req *h
 	if !j.Exist("is_tcp_flag") {
 		info.IsTcpFlag = 0
 	}
-	if !j.Exist("scale") {
-		info.Scale = 1.0
-	}
 	if !j.Exist("stream_index") {
 		info.StreamIndex = 0
 	}
@@ -408,6 +406,25 @@ func (h *HttpApiServer) ctrlGb28181PlaybackHandler(w http.ResponseWriter, req *h
 	Log.Infof("http api gb28181 playback. req info=%+v", info)
 
 	resp := h.sm.CtrlGb28181Playback(info)
+	feedback(resp, w)
+}
+
+func (h *HttpApiServer) ctrlGb28181PlaybackScaleHandler(w http.ResponseWriter, req *http.Request) {
+	var v base.ApiCtrlGb28181PlaybackScaleResp
+	var info base.ApiCtrlGb28181PlaybackScaleReq
+
+	_, err := unmarshalRequestJsonBody(req, &info, "stream_name", "scale")
+	if err != nil {
+		Log.Warnf("http api gb28181 playback scale error. err=%+v", err)
+		v.ErrorCode = base.ErrorCodeParamMissing
+		v.Desp = base.DespParamMissing
+		feedback(v, w)
+		return
+	}
+
+	Log.Infof("http api gb28181 playback scale. req info=%+v", info)
+
+	resp := h.sm.CtrlGb28181PlaybackScale(info)
 	feedback(resp, w)
 }
 

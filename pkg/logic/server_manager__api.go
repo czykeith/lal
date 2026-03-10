@@ -452,14 +452,9 @@ func (sm *ServerManager) CtrlGb28181Playback(info base.ApiCtrlGb28181PlaybackReq
 		SinglePort:  false,
 		StreamIndex: streamIndex,
 	}
-	scale := info.Scale
-	if scale <= 0 {
-		scale = 1.0
-	}
 	opt := &gb28181.InviteOptions{
 		Start: int(startTime.Unix()),
 		End:   int(endTime.Unix()),
-		Scale: scale,
 	}
 	gbConf := sm.gb28181Server.GetConfig()
 	code, err := ch.Invite(opt, streamName, playInfo, &gbConf)
@@ -539,6 +534,39 @@ func (sm *ServerManager) CtrlGb28181Bye(info base.ApiCtrlGb28181ByeReq) (ret bas
 	ret.ErrorCode = base.ErrorCodeSucc
 	ret.Desp = base.DespSucc
 	ret.Data.StreamName = streamName
+	return
+}
+
+// CtrlGb28181PlaybackScale GB28181回放倍速控制（发送控制指令，不改变本地拉流逻辑）
+func (sm *ServerManager) CtrlGb28181PlaybackScale(info base.ApiCtrlGb28181PlaybackScaleReq) (ret base.ApiCtrlGb28181PlaybackScaleResp) {
+	sm.mutex.Lock()
+	defer sm.mutex.Unlock()
+
+	if sm.gb28181Server == nil {
+		ret.ErrorCode = base.ErrorCodeGb28181PlaybackCtrlFail
+		ret.Desp = "gb28181 server not enabled"
+		return
+	}
+
+	streamName := info.StreamName
+	ch := sm.gb28181Server.FindChannelByStreamName(streamName)
+	if ch == nil {
+		ret.ErrorCode = base.ErrorCodeGb28181PlaybackCtrlFail
+		ret.Desp = "gb28181 stream not found"
+		return
+	}
+
+	if err := ch.PlaybackScale(info.Scale); err != nil {
+		ret.ErrorCode = base.ErrorCodeGb28181PlaybackCtrlFail
+		ret.Desp = err.Error()
+		return
+	}
+
+	ret.ErrorCode = base.ErrorCodeSucc
+	ret.Desp = base.DespSucc
+	ret.Data.StreamName = streamName
+	ret.Data.Scale = info.Scale
+	ret.Data.SessionId = ch.GetCallId()
 	return
 }
 

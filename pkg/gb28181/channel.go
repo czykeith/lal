@@ -252,10 +252,6 @@ func (channel *Channel) Invite(opt *InviteOptions, streamName string, playInfo *
 		"c=IN IP4 "+d.mediaIP,
 		opt.String(),
 	)
-	// 回放倍速：放在会话级（t= 之后），部分设备仅解析此处；整倍速输出整数（如 2 而非 2.00）
-	if opt != nil && !opt.IsLive() && opt.Scale > 0 {
-		sdpInfo = append(sdpInfo, buildGb28181ScaleLine(opt.Scale))
-	}
 	sdpInfo = append(sdpInfo,
 		fmt.Sprintf("m=video %d %sRTP/AVP 96 97 98", opt.MediaPort, protocol),
 		"a=recvonly",
@@ -291,10 +287,6 @@ func (channel *Channel) Invite(opt *InviteOptions, streamName string, playInfo *
 
 	if playInfo.NetWork == "tcp" {
 		sdpInfo = append(sdpInfo, "a=setup:passive", "a=connection:new")
-	}
-	// 回放倍速在媒体级再带一份，兼容只解析 m= 后 a= 的设备
-	if opt != nil && !opt.IsLive() && opt.Scale > 0 {
-		sdpInfo = append(sdpInfo, buildGb28181ScaleLine(opt.Scale))
 	}
 
 	invite := channel.CreateRequst(sip.INVITE, channel.conf)
@@ -499,12 +491,70 @@ func (channel *Channel) Bye(streamName string) (err error) {
 	channel.playInfo = nil
 	return err
 }
+
+// PlaybackScale 通过 SIP INFO 发送 PlaybackControl 控制指令，调整回放倍速。
+//
+// 注意：
+// - 本方法仅向设备端发送控制命令，不改变本地拉流/转码逻辑；
+// - 需要回放会话已建立（channel.ackReq 非空），否则返回失败。
+func (channel *Channel) PlaybackScale(scale float64) error {
+	if channel.ackReq == nil {
+		return errors.New("gb28181 playback control: no active dialog")
+	}
+	if scale <= 0 {
+		return errors.New("gb28181 playback control: invalid scale")
+	}
+
+	// GB28181 常见实现：SIP INFO + Application/MANSCDP+xml
+	// XML 的 <Info> 字段内携带类 RTSP 的 PLAY 命令与 Scale 参数。
+	cseq := int(channel.sn.Add(1))
+	// 兼容性：Scale 固定 6 位小数，格式参考常见实现（String.format(\"%.6f\", speed)）
+	// 注意：<Info> 中直接使用换行分隔即可，避免部分设备对 CRLF（\r\n）解析异常/显示乱码
+	infoText := fmt.Sprintf("PLAY RTSP/1.0\nCSeq: %d\nScale: %.6f\n", cseq, scale)
+	msg := &MessagePlaybackControl{
+		CmdType:  PlaybackControl,
+		SN:       cseq,
+		DeviceID: channel.ChannelId,
+		Info:     CDataText{Text: infoText},
+	}
+	xmlBody, err := XmlEncode(msg)
+	if err != nil {
+		return err
+	}
+
+	infoReq := channel.ackReq
+	infoReq.SetMethod(sip.INFO)
+	if seq, ok := infoReq.CSeq(); ok {
+		seq.SeqNo += 1
+		seq.MethodName = sip.INFO
+	}
+	ua := sip.UserAgentHeader(SipUserAgent)
+	infoReq.RemoveHeader("User-Agent")
+	infoReq.AppendHeader(&ua)
+	contentType := sip.ContentType("Application/MANSCDP+xml")
+	infoReq.AppendHeader(&contentType)
+	infoReq.SetBody(xmlBody, true)
+
+	base.Log.Info("GB28181 INFO(PlaybackControl) >>>", "\n", infoReq.String())
+
+	resp, err := channel.device.SipRequestForResponse(infoReq)
+	if err != nil {
+		return err
+	}
+	if resp == nil {
+		return errors.New("gb28181 playback control: empty response")
+	}
+	if int(resp.StatusCode()) != http.StatusOK {
+		return errors.New(fmt.Sprintf("gb28181 playback control fail, code=%d", resp.StatusCode()))
+	}
+	return nil
+}
 func (channel *Channel) CreateRequst(Method sip.RequestMethod, conf GB28181Config) (req sip.Request) {
 	d := channel.device
 	d.sn++
 
 	callId := sip.CallID(RandNumString(10))
-	userAgent := sip.UserAgentHeader("LALMax")
+	userAgent := sip.UserAgentHeader(SipUserAgent)
 	maxForwards := sip.MaxForwards(70) //增加max-forwards为默认值 70
 	cseq := sip.CSeq{
 		SeqNo:      uint32(d.sn),

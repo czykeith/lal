@@ -11,6 +11,8 @@ import (
 	"time"
 )
 
+const SipUserAgent = "keith_lalserver"
+
 func RandNumString(n int) string {
 	numbers := "0123456789"
 	return randStringBySoure(numbers, n)

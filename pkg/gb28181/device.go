@@ -145,7 +145,7 @@ func (d *Device) CreateRequest(Method sip.RequestMethod, conf GB28181Config) (re
 	d.sn++
 
 	callId := sip.CallID(RandNumString(10))
-	userAgent := sip.UserAgentHeader("LALMax")
+	userAgent := sip.UserAgentHeader(SipUserAgent)
 	maxForwards := sip.MaxForwards(70) //增加max-forwards为默认值 70
 	cseq := sip.CSeq{
 		SeqNo:      uint32(d.sn),

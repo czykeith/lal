@@ -2,6 +2,7 @@
 
 - [feat] GB28181: 回放会话支持 TTL，默认 3 小时自动释放，防止会话长期占用资源
 - [feat] HTTP API: 新增从已有流转推接口 `POST /api/ctrl/start_relay_from_stream`（stream_name + push_url，仅推流不额外拉流）
+- [feat] GB28181: 新增回放倍速控制接口 `POST /api/ctrl/gb28181_playback_scale`，通过 SIP INFO 发送 PlaybackControl 命令调整倍速（不改变本地拉流逻辑；回放 INVITE/SDP 不再携带倍速参数）
 - [fix] GB28181: 设备主动发 BYE 时从回放会话表正确移除，避免会话残留
 - [feat] 统计: `/api/stat/all_group` 中 GB28181 Pub 展示字节与码率（read_bytes_sum、read_bitrate_kbits、bitrate_kbits）
 - [opt] CustomizePubSessionContext: 在 FeedAvPacket/FeedRtmpMsg 入口累加收流字节，UpdateStat 中计算码率；Group 定时调用 customizePubSession.UpdateStat

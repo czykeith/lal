@@ -96,15 +96,22 @@ type ApiCtrlGb28181ByeReq struct {
 
 // ApiCtrlGb28181PlaybackReq GB28181回放请求
 type ApiCtrlGb28181PlaybackReq struct {
-	DeviceId    string  `json:"device_id"`    // 设备ID（国标编码，20位，必填）
-	ChannelId   string  `json:"channel_id"`   // 通道ID（国标编码，20位，必填）
-	StreamName  string  `json:"stream_name"`  // 流名称（必填，全局唯一，用于拉流与停止时标识）
-	StartTime   string  `json:"start_time"`   // 开始时间（必填）。格式：2006-01-02T15:04:05 或 2006-01-02 15:04:05；无时区按服务器本地时区解析（如东八区）
-	EndTime     string  `json:"end_time"`     // 结束时间（必填）。格式同上，须晚于 start_time
-	Port        int     `json:"port"`         // RTP接收端口（可选，0=自动分配）
-	IsTcpFlag   int     `json:"is_tcp_flag"`  // 传输方式：0=UDP（默认），1=TCP
-	Scale       float64 `json:"scale"`        // 倍速：1.0=正常，2.0=2倍速，0.5=0.5倍速等（默认1.0）
-	StreamIndex int     `json:"stream_index"` // 码流索引：0=主码流，1=子码流，2=第三码流…（默认0）
+	DeviceId    string `json:"device_id"`    // 设备ID（国标编码，20位，必填）
+	ChannelId   string `json:"channel_id"`   // 通道ID（国标编码，20位，必填）
+	StreamName  string `json:"stream_name"`  // 流名称（必填，全局唯一，用于拉流与停止时标识）
+	StartTime   string `json:"start_time"`   // 开始时间（必填）。格式：2006-01-02T15:04:05 或 2006-01-02 15:04:05；无时区按服务器本地时区解析（如东八区）
+	EndTime     string `json:"end_time"`     // 结束时间（必填）。格式同上，须晚于 start_time
+	Port        int    `json:"port"`         // RTP接收端口（可选，0=自动分配）
+	IsTcpFlag   int    `json:"is_tcp_flag"`  // 传输方式：0=UDP（默认），1=TCP
+	StreamIndex int    `json:"stream_index"` // 码流索引：0=主码流，1=子码流，2=第三码流…（默认0）
+}
+
+// ApiCtrlGb28181PlaybackScaleReq GB28181回放倍速控制请求（通过控制指令调整设备端推流速率，不改变本地拉流逻辑）
+//
+// 注意：该接口要求对应 stream_name 已经处于回放会话中（已建立 INVITE/ACK 对话），否则会返回失败。
+type ApiCtrlGb28181PlaybackScaleReq struct {
+	StreamName string  `json:"stream_name"` // 回放会话对应的流名称（必填）
+	Scale      float64 `json:"scale"`       // 倍速（必填），例如 0.5/1/2/4/8
 }
 
 // ApiCtrlGb28181PtzReq GB28181 PTZ控制请求
@@ -153,16 +160,18 @@ const (
 	ErrorCodeStopRelayFail      = 2004
 	DespStopRelayFail           = "stop relay fail"
 
-	ErrorCodeGb28181DeviceNotFound = 3001
-	DespGb28181DeviceNotFound      = "gb28181 device not found"
-	ErrorCodeGb28181InviteFail     = 3002
-	DespGb28181InviteFail          = "gb28181 invite fail"
-	ErrorCodeGb28181ByeFail        = 3003
-	DespGb28181ByeFail             = "gb28181 bye fail"
-	ErrorCodeGb28181PtzFail        = 3004
-	DespGb28181PtzFail             = "gb28181 ptz control fail"
-	ErrorCodeGb28181QueryFail      = 3005
-	DespGb28181QueryFail           = "gb28181 query fail"
+	ErrorCodeGb28181DeviceNotFound   = 3001
+	DespGb28181DeviceNotFound        = "gb28181 device not found"
+	ErrorCodeGb28181InviteFail       = 3002
+	DespGb28181InviteFail            = "gb28181 invite fail"
+	ErrorCodeGb28181ByeFail          = 3003
+	DespGb28181ByeFail               = "gb28181 bye fail"
+	ErrorCodeGb28181PtzFail          = 3004
+	DespGb28181PtzFail               = "gb28181 ptz control fail"
+	ErrorCodeGb28181QueryFail        = 3005
+	DespGb28181QueryFail             = "gb28181 query fail"
+	ErrorCodeGb28181PlaybackCtrlFail = 3006
+	DespGb28181PlaybackCtrlFail      = "gb28181 playback control fail"
 )
 
 type ApiRespBasic struct {
@@ -267,6 +276,16 @@ type ApiCtrlGb28181ByeResp struct {
 	Data struct {
 		StreamName string `json:"stream_name"`
 		SessionId  string `json:"session_id"`
+	} `json:"data"`
+}
+
+// ApiCtrlGb28181PlaybackScaleResp GB28181回放倍速控制响应
+type ApiCtrlGb28181PlaybackScaleResp struct {
+	ApiRespBasic
+	Data struct {
+		StreamName string  `json:"stream_name"`
+		Scale      float64 `json:"scale"`
+		SessionId  string  `json:"session_id"` // 对话 Call-ID（若可获取），便于排查
 	} `json:"data"`
 }
 

@@ -8,7 +8,6 @@ import (
 type InviteOptions struct {
 	Start     int
 	End       int
-	Scale     float64 // 回放倍速（1.0=正常，2.0=2倍速等），仅回放有效
 	ssrc      string
 	SSRC      uint32
 	MediaPort uint16
