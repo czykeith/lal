@@ -532,18 +532,20 @@ func (channel *Channel) PlaybackScale(scale float64) error {
 	ua := sip.UserAgentHeader(SipUserAgent)
 	infoReq.RemoveHeader("User-Agent")
 	infoReq.AppendHeader(&ua)
-	// Contact 使用设备注册时的地址（client channel_id@domain），与对端期望保持一致。
+	// INFO + MANSRTSP 按规范应携带 Content-Type: Application/MANSRTSP
+	contentType := sip.ContentType("Application/MANSRTSP")
+	infoReq.RemoveHeader("Content-Type")
+	infoReq.AppendHeader(&contentType)
+	// 复用对话请求时，确保 Content-Length 与最新 body 一致（部分设备严格校验）
+	contentLength := sip.ContentLength(len(body))
+	infoReq.RemoveHeader("Content-Length")
+	infoReq.AppendHeader(&contentLength)
+	// 按你的要求，让 Contact 出现在 Content-Length 之后，使用设备注册时的地址（client channel_id@domain）。
 	if channel.device != nil {
 		contact := channel.device.addr.AsContactHeader()
 		infoReq.RemoveHeader("Contact")
 		infoReq.AppendHeader(contact)
 	}
-	// 部分实现不需要（甚至不接受）INFO 携带 Content-Type，这里仍保持移除，和正常抓包对齐。
-	infoReq.RemoveHeader("Content-Type")
-	// 复用对话请求时，确保 Content-Length 与最新 body 一致（部分设备严格校验）
-	contentLength := sip.ContentLength(len(body))
-	infoReq.RemoveHeader("Content-Length")
-	infoReq.AppendHeader(&contentLength)
 	infoReq.SetBody(body, true)
 
 	base.Log.Info("GB28181 INFO(PlaybackControl) >>>", "\n", infoReq.String())
