@@ -115,6 +115,11 @@ func NewGB28181Server(conf GB28181Config, lal mediaserver.ILalServer) *GB28181Se
 	return gb28181Server
 }
 
+// GetConfig 返回当前 GB28181 配置（用于生成 SDP 时保证使用最新配置）
+func (s *GB28181Server) GetConfig() GB28181Config {
+	return s.conf
+}
+
 func (s *GB28181Server) Start() {
 	s.sipUdpSvr = s.newSipServer("udp")
 	s.sipTcpSvr = s.newSipServer("tcp")

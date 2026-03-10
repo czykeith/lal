@@ -66,7 +66,7 @@ func (channel *Channel) WithMediaServer(observer IMediaOpObserver) {
 
 func (channel *Channel) TryAutoInvite(opt *InviteOptions, streamName string, playInfo *PlayInfo) {
 	if channel.CanInvite(streamName) {
-		go channel.Invite(opt, streamName, playInfo)
+		go channel.Invite(opt, streamName, playInfo, nil)
 	}
 }
 
@@ -141,9 +141,18 @@ f字段中视、音频参数段之间不需空格分割。
 可使用f字段中的分辨率参数标识同一设备不同分辨率的码流。
 */
 
-func (channel *Channel) Invite(opt *InviteOptions, streamName string, playInfo *PlayInfo) (code int, err error) {
+// Invite 发起 INVITE。sdpConf 可选：非 nil 时用其生成 SDP 的 f=/fmtp，否则用 channel.conf（保证 API 调用时传入服务器配置可使视频参数生效）。
+func (channel *Channel) Invite(opt *InviteOptions, streamName string, playInfo *PlayInfo, sdpConf *GB28181Config) (code int, err error) {
 	d := channel.device
+	sdpCfg := channel.conf
+	if sdpConf != nil {
+		sdpCfg = *sdpConf
+	}
+	// 实时点播 s=Play；历史回放 s=Playback（国标要求）
 	s := "Play"
+	if opt != nil && !opt.IsLive() {
+		s = "Playback"
+	}
 
 	//然后按顺序生成，一个channel最大999 方便排查问题,也能保证唯一性
 	channel.number++
@@ -185,22 +194,28 @@ func (channel *Channel) Invite(opt *InviteOptions, streamName string, playInfo *
 		"v=0",
 		fmt.Sprintf("o=%s 0 0 IN IP4 %s", channel.ChannelId, d.mediaIP),
 		"s=" + s,
-		"c=IN IP4 " + d.mediaIP,
+	}
+	// 回放时必须有 u= 字段（通道ID:回放类型，0=回放 3=下载）
+	if opt != nil && !opt.IsLive() {
+		sdpInfo = append(sdpInfo, fmt.Sprintf("u=%s:0", channel.ChannelId))
+	}
+	sdpInfo = append(sdpInfo,
+		"c=IN IP4 "+d.mediaIP,
 		opt.String(),
 		fmt.Sprintf("m=video %d %sRTP/AVP 96", opt.MediaPort, protocol),
 		"a=recvonly",
 		"a=rtpmap:96 PS/90000",
-		"y=" + opt.ssrc,
-	}
+		"y="+opt.ssrc,
+	)
 
 	// 视频参数（GB28181 常用：f= 行；部分设备也会接受 fmtp 扩展）
 	// f= v/编码格式/分辨率/帧率/码率类型/码率大小 a///
 	//
 	// 编码格式（常见映射）：1=H264，4=H265；分辨率：1=QCIF，2=CIF，3=4CIF，4=720P，5=1080P；也可用 WxH。
-	if f := buildGb28181SdpFLine(channel.conf); f != "" {
+	if f := buildGb28181SdpFLine(sdpCfg); f != "" {
 		sdpInfo = append(sdpInfo, "f="+f)
 	}
-	if fmtp := buildGb28181SdpFmtpLine(channel.conf); fmtp != "" {
+	if fmtp := buildGb28181SdpFmtpLine(sdpCfg); fmtp != "" {
 		sdpInfo = append(sdpInfo, "a=fmtp:96 "+fmtp)
 	}
 
@@ -219,6 +234,10 @@ func (channel *Channel) Invite(opt *InviteOptions, streamName string, playInfo *
 
 	if playInfo.NetWork == "tcp" {
 		sdpInfo = append(sdpInfo, "a=setup:passive", "a=connection:new")
+	}
+	// 回放倍速（国标常见 a=scale 或 downloadspeed；部分设备用 a=scale:1.0）
+	if opt != nil && !opt.IsLive() && opt.Scale > 0 {
+		sdpInfo = append(sdpInfo, fmt.Sprintf("a=scale:%.2f", opt.Scale))
 	}
 
 	invite := channel.CreateRequst(sip.INVITE, channel.conf)

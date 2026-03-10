@@ -982,16 +982,42 @@ func gb28181ConfigFromLogic(c Gb28181Config) gb28181.GB28181Config {
 	if len(realm) > 10 {
 		realm = realm[:10]
 	}
+	// 视频参数：优先使用嵌套 video，否则用平铺字段（flexInt 已支持 JSON 数字或字符串）
+	videoCodec, videoWidth, videoHeight := c.VideoCodec, int(c.VideoWidth), int(c.VideoHeight)
+	videoBitrate, videoFramerate := int(c.VideoBitrate), int(c.VideoFramerate)
+	videoProfile, videoLevel := c.VideoProfile, c.VideoLevel
+	if c.Video != nil {
+		if c.Video.Codec != "" {
+			videoCodec = c.Video.Codec
+		}
+		if c.Video.Width > 0 {
+			videoWidth = int(c.Video.Width)
+		}
+		if c.Video.Height > 0 {
+			videoHeight = int(c.Video.Height)
+		}
+		if c.Video.Bitrate > 0 {
+			videoBitrate = int(c.Video.Bitrate)
+		}
+		if c.Video.Framerate > 0 {
+			videoFramerate = int(c.Video.Framerate)
+		}
+		if c.Video.Profile != "" {
+			videoProfile = c.Video.Profile
+		}
+		if c.Video.Level != "" {
+			videoLevel = c.Video.Level
+		}
+	}
 	return gb28181.GB28181Config{
-		Enable:     true,
-		ListenAddr: "0.0.0.0",
-		SipIP:      c.LocalSipIp,
-		SipPort:    sipPort,
-		Serial:     c.LocalSipId,
-		Realm:      realm,
-		Username:   c.Username,
-		Password:   c.Password,
-		// 保持和你之前实现尽量一致：只要设备发心跳就认为在线并记录在 Devices 中。
+		Enable:            true,
+		ListenAddr:        "0.0.0.0",
+		SipIP:             c.LocalSipIp,
+		SipPort:           sipPort,
+		Serial:            c.LocalSipId,
+		Realm:             realm,
+		Username:          c.Username,
+		Password:          c.Password,
 		KeepaliveInterval: 60,
 		QuickLogin:        true,
 		MediaConfig: gb28181.GB28181MediaConfig{
@@ -999,12 +1025,12 @@ func gb28181ConfigFromLogic(c Gb28181Config) gb28181.GB28181Config {
 			ListenPort:            uint16(rtpMin),
 			MultiPortMaxIncrement: inc,
 		},
-		VideoCodec:     c.VideoCodec,
-		VideoWidth:     c.VideoWidth,
-		VideoHeight:    c.VideoHeight,
-		VideoBitrate:   c.VideoBitrate,
-		VideoFramerate: c.VideoFramerate,
-		VideoProfile:   c.VideoProfile,
-		VideoLevel:     c.VideoLevel,
+		VideoCodec:     videoCodec,
+		VideoWidth:     videoWidth,
+		VideoHeight:    videoHeight,
+		VideoBitrate:   videoBitrate,
+		VideoFramerate: videoFramerate,
+		VideoProfile:   videoProfile,
+		VideoLevel:     videoLevel,
 	}
 }

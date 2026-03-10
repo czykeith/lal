@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/q191201771/lal/pkg/base"
@@ -27,6 +28,30 @@ const (
 	defaultHttptsUrlPattern  = "/live/"
 	defaultHlsUrlPattern     = "/hls/"
 )
+
+// flexInt 可从 JSON 数字或字符串解析，避免配置里写成 "720" 导致未生效
+type flexInt int
+
+func (v *flexInt) UnmarshalJSON(data []byte) error {
+	if len(data) > 0 && data[0] == '"' {
+		var s string
+		if err := json.Unmarshal(data, &s); err != nil {
+			return err
+		}
+		n, err := strconv.Atoi(strings.TrimSpace(s))
+		if err != nil {
+			return err
+		}
+		*v = flexInt(n)
+		return nil
+	}
+	var n int
+	if err := json.Unmarshal(data, &n); err != nil {
+		return err
+	}
+	*v = flexInt(n)
+	return nil
+}
 
 type Config struct {
 	ConfVersion           string                `json:"conf_version"`
@@ -182,14 +207,27 @@ type Gb28181Config struct {
 	RtpPortMax           int    `json:"rtp_port_max"`           // RTP接收端口段最大值（默认60000，已废弃，使用sip_rtp_port_max）
 	SipRtpPortMin        int    `json:"sip_rtp_port_min"`       // SIP收流端口范围最小值（默认30000）
 	SipRtpPortMax        int    `json:"sip_rtp_port_max"`       // SIP收流端口范围最大值（默认60000）
-	// 视频参数配置
-	VideoCodec     string `json:"video_codec"`     // 视频编码格式：H264/H265（默认H264）
-	VideoWidth     int    `json:"video_width"`     // 视频宽度（分辨率，默认0表示不指定）
-	VideoHeight    int    `json:"video_height"`    // 视频高度（分辨率，默认0表示不指定）
-	VideoBitrate   int    `json:"video_bitrate"`   // 视频码率（kbps，默认0表示不指定）
-	VideoFramerate int    `json:"video_framerate"` // 视频帧率（fps，默认0表示不指定）
-	VideoProfile   string `json:"video_profile"`   // H264 Profile：baseline/main/high（默认不指定）
-	VideoLevel     string `json:"video_level"`     // H264 Level：如3.1、4.0等（默认不指定）
+	// 视频参数配置（平铺，与 gb28181 根下 video_* 一一对应；数值支持 JSON 数字或字符串如 "720"）
+	VideoCodec     string  `json:"video_codec"`     // 视频编码格式：H264/H265（默认H264）
+	VideoWidth     flexInt `json:"video_width"`     // 视频宽度（分辨率，默认0表示不指定）
+	VideoHeight    flexInt `json:"video_height"`    // 视频高度（分辨率，默认0表示不指定）
+	VideoBitrate   flexInt `json:"video_bitrate"`   // 视频码率（kbps，默认0表示不指定）
+	VideoFramerate flexInt `json:"video_framerate"` // 视频帧率（fps，默认0表示不指定）
+	VideoProfile   string  `json:"video_profile"`   // H264 Profile：baseline/main/high（默认不指定）
+	VideoLevel     string  `json:"video_level"`     // H264 Level：如3.1、4.0等（默认不指定）
+	// 可选：嵌套 video 对象，若存在则优先使用（便于部分配置写法）
+	Video *Gb28181VideoConfig `json:"video"`
+}
+
+// Gb28181VideoConfig 嵌套视频参数，与 Gb28181Config 平铺字段二选一
+type Gb28181VideoConfig struct {
+	Codec     string  `json:"codec"`     // H264/H265
+	Width     flexInt `json:"width"`     // 宽
+	Height    flexInt `json:"height"`    // 高
+	Bitrate   flexInt `json:"bitrate"`   // kbps
+	Framerate flexInt `json:"framerate"` // fps
+	Profile   string  `json:"profile"`   // baseline/main/high
+	Level     string  `json:"level"`     // 3.1/4.0
 }
 
 type CommonHttpServerConfig struct {

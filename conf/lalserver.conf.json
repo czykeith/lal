@@ -142,10 +142,10 @@
     "sip_rtp_port_min": 30000,
     "sip_rtp_port_max": 60000,
     "video_codec": "H264",
-    "video_width": 1920,
-    "video_height": 1080,
-    "video_bitrate": 1024,
-    "video_framerate": 25,
+    "video_width": 720,
+    "video_height": 680,
+    "video_bitrate": 512,
+    "video_framerate": 20,
     "video_level": "4.0"
   }
 }

@@ -290,7 +290,8 @@ func (sm *ServerManager) CtrlGb28181Invite(info base.ApiCtrlGb28181InviteReq) (r
 		SinglePort:  false,
 		StreamIndex: streamIndex,
 	}
-	code, err := ch.Invite(&gb28181.InviteOptions{}, streamName, playInfo)
+	gbConf := sm.gb28181Server.GetConfig()
+	code, err := ch.Invite(&gb28181.InviteOptions{}, streamName, playInfo, &gbConf)
 	if err != nil || code != 200 {
 		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
 		if err != nil {
@@ -386,11 +387,17 @@ func (sm *ServerManager) CtrlGb28181Playback(info base.ApiCtrlGb28181PlaybackReq
 		StreamName: streamName,
 		SinglePort: false,
 	}
+	scale := info.Scale
+	if scale <= 0 {
+		scale = 1.0
+	}
 	opt := &gb28181.InviteOptions{
 		Start: int(startTime.Unix()),
 		End:   int(endTime.Unix()),
+		Scale: scale,
 	}
-	code, err := ch.Invite(opt, streamName, playInfo)
+	gbConf := sm.gb28181Server.GetConfig()
+	code, err := ch.Invite(opt, streamName, playInfo, &gbConf)
 	if err != nil || code != 200 {
 		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
 		if err != nil {
