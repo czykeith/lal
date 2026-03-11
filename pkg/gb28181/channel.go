@@ -286,6 +286,26 @@ func (channel *Channel) Invite(opt *InviteOptions, streamName string, playInfo *
 		fmt.Sprintf("a=streamprofile:%d", streamIndex),
 		fmt.Sprintf("a=streamid:%d", streamIndex),
 	)
+	// 码流类型扩展：a=streamtype 携带码流索引；a=stream:main|sub 区分主/子码流（部分设备与海康兼容）
+	sdpInfo = append(sdpInfo, fmt.Sprintf("a=streamtype:%d", streamIndex))
+	if streamIndex == 0 {
+		sdpInfo = append(sdpInfo, "a=stream:main")
+	} else {
+		sdpInfo = append(sdpInfo, "a=stream:sub")
+	}
+
+	// 实时点播（Play）海康码流适配：部分海康设备在 m= 媒体段内要求 a=control:streamid=<n> 才切主/子码流
+	// 常见约定：主码流 streamid=1，副码流 streamid=2；更高索引用 streamIndex+1
+	if s == "Play" {
+		controlStreamId := streamIndex + 1
+		if controlStreamId < 1 {
+			controlStreamId = 1
+		}
+		if controlStreamId > 8 {
+			controlStreamId = 8
+		}
+		sdpInfo = append(sdpInfo, fmt.Sprintf("a=control:streamid=%d", controlStreamId))
+	}
 
 	if playInfo.NetWork == "tcp" {
 		sdpInfo = append(sdpInfo, "a=setup:passive", "a=connection:new")
@@ -328,6 +348,10 @@ func (channel *Channel) Invite(opt *InviteOptions, streamName string, playInfo *
 		return http.StatusInternalServerError, err
 	}
 	code = int(inviteRes.StatusCode())
+	// 打印 INVITE 响应完整报文，便于对照设备 SDP/SSRC 等是否与请求一致
+	if inviteRes != nil {
+		base.Log.Info("GB28181 INVITE response <<<", " status=", code, "\n", inviteRes.String())
+	}
 	if code == http.StatusOK {
 		ds := strings.Split(inviteRes.Body(), "\r\n")
 		for _, l := range ds {
