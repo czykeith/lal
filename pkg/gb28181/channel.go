@@ -286,8 +286,9 @@ func (channel *Channel) Invite(opt *InviteOptions, streamName string, playInfo *
 		fmt.Sprintf("a=streamprofile:%d", streamIndex),
 		fmt.Sprintf("a=streamid:%d", streamIndex),
 	)
-	// 码流类型扩展：a=streamtype 携带码流索引；a=stream:main|sub 区分主/子码流（部分设备与海康兼容）
+	// 码流类型扩展：a=streamtype / a=streamnumber 携带码流索引；a=stream:main|sub 区分主/子码流（部分设备与海康兼容）
 	sdpInfo = append(sdpInfo, fmt.Sprintf("a=streamtype:%d", streamIndex))
+	sdpInfo = append(sdpInfo, fmt.Sprintf("a=streamnumber:%d", streamIndex))
 	if streamIndex == 0 {
 		sdpInfo = append(sdpInfo, "a=stream:main")
 	} else {
