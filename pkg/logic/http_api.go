@@ -61,7 +61,6 @@ func (h *HttpApiServer) RunLoop() error {
 	mux.HandleFunc("/api/ctrl/start_relay_pull", h.ctrlStartRelayPullHandler)
 	mux.HandleFunc("/api/ctrl/stop_relay_pull", h.ctrlStopRelayPullHandler)
 	mux.HandleFunc("/api/ctrl/kick_session", h.ctrlKickSessionHandler)
-	mux.HandleFunc("/api/ctrl/start_rtp_pub", h.ctrlStartRtpPubHandler)
 	mux.HandleFunc("/api/ctrl/add_ip_blacklist", h.ctrlAddIpBlacklistHandler)
 	mux.HandleFunc("/api/ctrl/start_relay", h.ctrlStartRelayHandler)
 	mux.HandleFunc("/api/ctrl/stop_relay", h.ctrlStopRelayHandler)
@@ -210,36 +209,6 @@ func (h *HttpApiServer) ctrlKickSessionHandler(w http.ResponseWriter, req *http.
 	Log.Infof("http api kick session. req info=%+v", info)
 
 	resp := h.sm.CtrlKickSession(info)
-	feedback(resp, w)
-}
-
-func (h *HttpApiServer) ctrlStartRtpPubHandler(w http.ResponseWriter, req *http.Request) {
-	var v base.ApiCtrlStartRtpPubResp
-	var info base.ApiCtrlStartRtpPubReq
-
-	j, err := unmarshalRequestJsonBody(req, &info, "stream_name")
-	if err != nil {
-		Log.Warnf("http api start rtp pub error. err=%+v", err)
-		v.ErrorCode = base.ErrorCodeParamMissing
-		v.Desp = base.DespParamMissing
-		feedback(v, w)
-		return
-	}
-
-	if !j.Exist("timeout_ms") {
-		info.TimeoutMs = DefaultApiCtrlStartRtpPubReqTimeoutMs
-	}
-	// 不存在时默认0值的，不需要手动写了
-	//if !j.Exist("port") {
-	//	info.Port = 0
-	//}
-	//if !j.Exist("is_tcp_flag") {
-	//	info.IsTcpFlag = 0
-	//}
-
-	Log.Infof("http api start rtp pub. req info=%+v", info)
-
-	resp := h.sm.CtrlStartRtpPub(info)
 	feedback(resp, w)
 }
 

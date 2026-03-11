@@ -160,17 +160,6 @@ func (sm *ServerManager) CtrlAddIpBlacklist(info base.ApiCtrlAddIpBlacklistReq) 
 	return
 }
 
-func (sm *ServerManager) CtrlStartRtpPub(info base.ApiCtrlStartRtpPubReq) (ret base.ApiCtrlStartRtpPubResp) {
-	sm.mutex.Lock()
-	defer sm.mutex.Unlock()
-
-	// 注意，如果group不存在，我们依然relay pull
-	g := sm.getOrCreateGroup("", info.StreamName)
-	ret = g.StartRtpPub(info)
-
-	return
-}
-
 // CtrlStartRelay 启动转推
 func (sm *ServerManager) CtrlStartRelay(info base.ApiCtrlStartRelayReq) (ret base.ApiCtrlStartRelayResp) {
 	sm.mutex.Lock()

@@ -30,8 +30,8 @@ import (
 // 1. 让业务方提供lalserver录制下来的dumpfile文件
 // 2. 将dumpfile存放在下面filename变量处，或者修改下面filename变量值
 // 3. 启动lalserver
-// 4. 调用HTTP API
-// curl -H "Content-Type:application/json" -X POST -d '{"stream_name": "test110", "port": 10002, "timeout_ms": 10000}' http://127.0.0.1:8083/api/ctrl/start_rtp_pub
+// 4. 通过 GB28181 Invite 建立收流（或自行在对应端口监听）；本测试向 127.0.0.1:10002 推 PS，需与 lal 收流端口一致
+//    示例：POST /api/ctrl/gb28181_invite 建立会话后，将设备/推流指向媒体端口
 // 5. 执行该测试
 // go test -test.run TestDump_PsPub
 func TestDump_PsPub(t *testing.T) {

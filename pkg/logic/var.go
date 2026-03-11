@@ -27,8 +27,7 @@ var (
 	// - rtmp sub, rtsp sub, httpflv sub, httpts sub,
 	// - rtmp push,
 	//
-	// (1.2.) HTTP-API参数 ApiCtrlStartRtpPubReq.TimeoutMs
-	// - ps pub,
+	// (1.2.) 无（GB28181 PS 由 Invite 接入，无单独 RTP pub 超时 API）
 	//
 	// (1.3.) 无
 	// - customize pub,
@@ -56,7 +55,6 @@ var (
 
 	StaticRelayPullTimeoutMs = 10000
 
-	DefaultApiCtrlStartRtpPubReqTimeoutMs        = 60000
 	DefaultApiCtrlStartRelayPullReqPullTimeoutMs = 10000
 )
 

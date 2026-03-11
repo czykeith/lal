@@ -9,7 +9,8 @@
 - [feat] 统计: `/api/stat/all_group` 中 GB28181 Pub 展示字节与码率（read_bytes_sum、read_bitrate_kbits、bitrate_kbits）
 - [opt] CustomizePubSessionContext: 在 FeedAvPacket/FeedRtmpMsg 入口累加收流字节，UpdateStat 中计算码率；Group 定时调用 customizePubSession.UpdateStat
 - [refactor] base: 新增 NewStatSessionForPsPub，供 logic 包初始化 PS Pub 统计，解决 StatSession.typ 未导出无法赋值的问题
-- [doc] README: 补全所有 HTTP 接口索引与说明（stat/lal_info、all_group/group 响应结构、拉流/停止拉流/踢会话/添加 IP 黑名单、start_rtp_pub 废弃说明）；start_relay/GB28181 回放倍速 `scale` 参数文档与实现统一（默认 1，有效范围 `[1,8]`）；gb28181_bye 响应示例补充 session_id
+- [remove] HTTP API: 删除已废弃的 `POST /api/ctrl/start_rtp_pub` 整条链路；RTP/PS 收流统一通过 GB28181 `gb28181_invite` 建立
+- [doc] README: 补全所有 HTTP 接口索引与说明；已移除废弃接口 `start_rtp_pub` 相关文档；start_relay/GB28181 回放倍速 `scale` 参数文档与实现统一（默认 1，有效范围 `[1,8]`）；gb28181_bye 响应示例补充 session_id
 
 #### v0.37.4 (2024-04)
 

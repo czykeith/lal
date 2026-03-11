@@ -93,18 +93,6 @@ func (group *Group) AddRtspPubSession(session *rtsp.PubSession) error {
 	return nil
 }
 
-// StartRtpPub 已废弃：RTP 收流仅通过 GB28181 Invite（lalmax）接入，请使用 /api/ctrl/gb28181_invite
-func (group *Group) StartRtpPub(req base.ApiCtrlStartRtpPubReq) (ret base.ApiCtrlStartRtpPubResp) {
-	ret.ErrorCode = base.ErrorCodeListenUdpPortFail
-	ret.Desp = "RTP pub only supported via GB28181 invite, use /api/ctrl/gb28181_invite"
-	return
-}
-
-// StopRtpPub 已废弃：与 StartRtpPub 配套，现由 GB28181 Bye 处理
-func (group *Group) StopRtpPub(streamName string) string {
-	return ""
-}
-
 func (group *Group) AddRtmpPullSession(session *rtmp.PullSession) error {
 	group.mutex.Lock()
 	defer group.mutex.Unlock()

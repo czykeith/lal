@@ -39,14 +39,6 @@ type ApiCtrlKickSessionReq struct {
 	SessionId  string `json:"session_id"`
 }
 
-type ApiCtrlStartRtpPubReq struct {
-	StreamName      string `json:"stream_name"`
-	Port            int    `json:"port"`
-	TimeoutMs       int    `json:"timeout_ms"`
-	IsTcpFlag       int    `json:"is_tcp_flag"`
-	DebugDumpPacket string `json:"debug_dump_packet"`
-}
-
 type ApiCtrlAddIpBlacklistReq struct {
 	Ip          string `json:"ip"`
 	DurationSec int    `json:"duration_sec"`
@@ -222,15 +214,6 @@ type ApiCtrlStopRelayPullResp struct {
 
 type ApiCtrlKickSessionResp struct {
 	ApiRespBasic
-}
-
-type ApiCtrlStartRtpPubResp struct {
-	ApiRespBasic
-	Data struct {
-		StreamName string `json:"stream_name"`
-		SessionId  string `json:"session_id"`
-		Port       int    `json:"port"`
-	} `json:"data"`
 }
 
 type ApiCtrlAddIpBlacklistResp struct {

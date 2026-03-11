@@ -140,7 +140,6 @@ LAL 提供了丰富的 HTTP API 接口，用于控制和管理流媒体服务。
 | POST | `/api/ctrl/start_relay_pull` | 启动拉流（仅拉流到本地，可多协议播放） |
 | GET | `/api/ctrl/stop_relay_pull` | 停止拉流（query: stream_name） |
 | POST | `/api/ctrl/kick_session` | 踢出指定会话（stream_name + session_id） |
-| POST | `/api/ctrl/start_rtp_pub` | 启动 RTP 收流（已废弃，请用 gb28181_invite） |
 | POST | `/api/ctrl/add_ip_blacklist` | 添加 IP 黑名单（ip + duration_sec） |
 | POST | `/api/ctrl/start_relay` | 启动转推（拉流+推流） |
 | GET | `/api/ctrl/stop_relay` | 停止转推（query: stream_name） |
@@ -1138,14 +1137,6 @@ curl -X POST http://127.0.0.1:8083/api/ctrl/add_ip_blacklist \
   -H "Content-Type: application/json" \
   -d '{"ip":"192.168.1.100","duration_sec":3600}'
 ```
-
-#### 启动 RTP 收流（已废弃）
-
-**接口地址：** `POST /api/ctrl/start_rtp_pub`
-
-**说明：** 该接口已废弃。RTP 收流请使用 GB28181 方式：在配置中启用 GB28181 后，通过 `POST /api/ctrl/gb28181_invite` 拉流。调用本接口会返回错误提示使用 `gb28181_invite`。
-
----
 
 更多 API 文档请参考：https://pengrl.com/lal/#/HTTPAPI
 
