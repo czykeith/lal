@@ -1,4 +1,4 @@
-#### v0.38.3 (2026-03)
+#### v0.38.4 (2026-03)
 
 - [feat] GB28181: 回放会话支持 TTL，默认 3 小时自动释放，防止会话长期占用资源
 - [feat] HTTP API: 新增从已有流转推接口 `POST /api/ctrl/start_relay_from_stream`（stream_name + push_url，仅推流不额外拉流）
