@@ -136,7 +136,7 @@
     "local_sip_port": 5060,
     "local_sip_domain": "34020000",
     "username": "",
-    "password": "",
+    "password": "1234567",
     "expires": 3600,
     "catalog_query_interval": 300,
     "sip_rtp_port_min": 30000,

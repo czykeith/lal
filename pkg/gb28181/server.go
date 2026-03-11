@@ -761,12 +761,19 @@ func (s *GB28181Server) OnRegister(req sip.Request, tx sip.ServerTransaction) {
 			authenticateHeader := hdrs[0].(*sip.GenericHeader)
 			auth := &Authorization{sip.AuthFromValue(authenticateHeader.Contents)}
 
-			// 有些摄像头没有配置用户名的地方，用户名就是摄像头自己的国标id
+			// Digest 校验用 r1 = MD5(username:realm:password)，username 必须与客户端计算时一致。
+			// 有些摄像头没有配置用户名，只用密码注册，Digest 里用户名往往是设备国标 ID，或 Authorization 不带 username。
+			// 服务端若也只配密码未配 Username，不能用空字符串算 r1，否则与客户端不一致导致校验失败。
 			var username string
-			if auth.Username() == id {
+			switch {
+			case auth.Username() == id:
 				username = id
-			} else {
+			case auth.Username() == "":
+				username = id // 客户端未带用户名时按国标惯例用设备 ID
+			case s.conf.Username != "":
 				username = s.conf.Username
+			default:
+				username = id // 服务端仅密码、未配 Username 时与客户端「只填密码」一致，用设备 ID
 			}
 
 			if dc, ok := DeviceRegisterCount.LoadOrStore(id, 1); ok && dc.(int) > MaxRegisterCount {
