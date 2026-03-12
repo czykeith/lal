@@ -23,27 +23,21 @@ func (group *Group) AddCustomizePubSession(streamName string) (ICustomizePubSess
 	defer group.mutex.Unlock()
 
 	if group.hasInSession() {
-		// GB28181 等设备可能未先发 BYE 就重新 INVITE，或旧 RTP 连接超时后新连接才到，
-		// 此时 group 里仍占着上一路 CUSTOMIZEPUB，AddCustomizePubSession 会直接失败，
-		// 新 Conn 退出时 lalSession==nil 无法 DelCustomizePubSession，形成死锁式占用。
-		// 1) 同一 streamName：按同一路流重连替换。
-		// 2) 仅存在 customize pub（无 RTMP/RTSP pub、无 pull）时一律替换：旧 Conn 未清理时
-		//    streamName 可能与当前 MediaInfo 不一致，仍应让新 RTP 接管，否则永久 ErrDupInStream。
+		// 同一 streamName 已存在 customize pub：不替换，直接拒绝第二路（与 HTTP 层「同 streamName 重复发起直接成功、不重复 INVITE」配合；
+		// 若设备仍推第二路 RTP，Conn 侧会 ErrDup 退出，避免 remuxer 被拆掉导致花屏/断流）。
+		if group.customizePubSession != nil && group.customizePubSession.StreamName() == streamName {
+			Log.Debugf("[%s] customize pub already exists for streamName=%s, exist=%s, skip add/replace",
+				group.UniqueKey, streamName, group.customizePubSession.UniqueKey())
+			return nil, base.ErrDupInStream
+		}
+		// 仅存在 customize pub 且 streamName 不同：视为旧 Conn 未清理或 MediaInfo 变更，允许替换让新 RTP 接管。
 		onlyCustomizePub := group.customizePubSession != nil &&
 			group.rtmpPubSession == nil && group.rtspPubSession == nil && !group.hasPullSession()
-		sameStream := group.customizePubSession != nil && group.customizePubSession.StreamName() == streamName
-		if onlyCustomizePub || sameStream {
-			if group.customizePubSession != nil {
-				if !sameStream {
-					Log.Warnf("[%s] replace stale customize pub (streamName changed %s -> %s), exist=%s",
-						group.UniqueKey, group.customizePubSession.StreamName(), streamName, group.customizePubSession.UniqueKey())
-				} else {
-					Log.Warnf("[%s] replace stale customize pub for same streamName=%s, exist=%s",
-						group.UniqueKey, streamName, group.customizePubSession.UniqueKey())
-				}
-				group.customizePubSession.Dispose()
-				group.delCustomizePubSession(group.customizePubSession)
-			}
+		if onlyCustomizePub {
+			Log.Warnf("[%s] replace stale customize pub (streamName changed %s -> %s), exist=%s",
+				group.UniqueKey, group.customizePubSession.StreamName(), streamName, group.customizePubSession.UniqueKey())
+			group.customizePubSession.Dispose()
+			group.delCustomizePubSession(group.customizePubSession)
 		} else {
 			Log.Errorf("[%s] in stream already exist at group. add customize pub session, exist=%s",
 				group.UniqueKey, group.inSessionUniqueKey())
@@ -275,15 +269,9 @@ func (group *Group) delCustomizePubSession(sessionCtx ICustomizePubSessionContex
 	Log.Debugf("[%s] [%s] del customize PubSession from group.", group.UniqueKey, sessionCtx.UniqueKey())
 
 	if sessionCtx != group.customizePubSession {
-		// 常见于 replace stale customize pub 后旧 Conn 才退出：group 已挂新 session 或已 delIn，
-		// 旧 session 再 Del 必然 not match，属预期，避免 WARN 刷屏。
-		if group.customizePubSession == nil {
-			Log.Debugf("[%s] del customize pub session skipped (already replaced). del session=%s",
-				group.UniqueKey, sessionCtx.UniqueKey())
-		} else {
-			Log.Warnf("[%s] del customize pub session but not match. del session=%s, group session=%p",
-				group.UniqueKey, sessionCtx.UniqueKey(), group.customizePubSession)
-		}
+		// replace 后旧 Conn 晚到 Del，或 CloseConn 先关掉旧 Conn 时 group 已被新路占满，均属预期，降为 Debug。
+		Log.Debugf("[%s] del customize pub session skipped (not current). del session=%s, group session=%p",
+			group.UniqueKey, sessionCtx.UniqueKey(), group.customizePubSession)
 		return
 	}
 

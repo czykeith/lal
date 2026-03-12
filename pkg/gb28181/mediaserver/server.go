@@ -86,6 +86,7 @@ func (s *GB28181MediaServer) CloseConn(streamName string) {
 		return true
 	})
 }
+
 func (s *GB28181MediaServer) Dispose() {
 	s.disposeOnce.Do(func() {
 		s.conns.Range(func(_, value any) bool {

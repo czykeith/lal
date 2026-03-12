@@ -122,8 +122,11 @@ func (c *Conn) Serve() (err error) {
 	// 单端口模式下 UDP 端口可能会被外部探测，连接建立日志容易刷屏；改为 Debug。
 	base.Log.Debug("gb28181 conn, remoteaddr:", c.conn.RemoteAddr().String(), " localaddr:", c.conn.LocalAddr().String())
 
+	// GB28181 设备/网络可能数秒无包（切换码流、短暂丢包）；10s 过短会误杀连接并触发 replace，收流抖动。
+	// 用较长超时，真正断流再由设备 BYE 或业务 stop 关闭。
+	const gb28181ReadTimeout = 60 * time.Second
 	for {
-		c.conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		c.conn.SetReadDeadline(time.Now().Add(gb28181ReadTimeout))
 		pkt := &rtp.Packet{}
 		if c.conn.RemoteAddr().Network() == "udp" {
 			buf := make([]byte, 1472*4)
@@ -188,6 +191,7 @@ func (c *Conn) Serve() (err error) {
 			}
 			c.check = true
 			c.streamName = mediaInfo.StreamName
+			// 同 streamName 已在 group 内存在 customize pub 时不替换；此处不再 CloseOtherConns，避免误关正在收流的第一路。
 			c.oneSaveConn.Do(func() {
 				if c.mediaServer != nil {
 					// 按 remoteAddr 保存连接，避免同一 streamName 覆盖导致 stop(BYE) 关不掉旧连接。
