@@ -275,8 +275,15 @@ func (group *Group) delCustomizePubSession(sessionCtx ICustomizePubSessionContex
 	Log.Debugf("[%s] [%s] del customize PubSession from group.", group.UniqueKey, sessionCtx.UniqueKey())
 
 	if sessionCtx != group.customizePubSession {
-		Log.Warnf("[%s] del customize pub session but not match. del session=%s, group session=%p",
-			group.UniqueKey, sessionCtx.UniqueKey(), group.customizePubSession)
+		// 常见于 replace stale customize pub 后旧 Conn 才退出：group 已挂新 session 或已 delIn，
+		// 旧 session 再 Del 必然 not match，属预期，避免 WARN 刷屏。
+		if group.customizePubSession == nil {
+			Log.Debugf("[%s] del customize pub session skipped (already replaced). del session=%s",
+				group.UniqueKey, sessionCtx.UniqueKey())
+		} else {
+			Log.Warnf("[%s] del customize pub session but not match. del session=%s, group session=%p",
+				group.UniqueKey, sessionCtx.UniqueKey(), group.customizePubSession)
+		}
 		return
 	}
 

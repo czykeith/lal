@@ -293,6 +293,20 @@ func (sm *ServerManager) CtrlGb28181Invite(info base.ApiCtrlGb28181InviteReq) (r
 		streamIndex = 0
 	}
 
+	// 同设备+通道+码流已在拉流则直接幂等返回，不再发 INVITE。
+	// 外部服务定时调用 gb28181_invite 保活时，若仅按 stream_name 判断会漏掉
+	// MediaInfo 已 Clear/或请求 stream_name 与通道当前不一致 等情况，重复 INVITE
+	// 会导致设备重推、新 RTP 连接触发 replace customize pub，remuxer 断裂后出现 iterate nalu failed。
+	if cur := sm.gb28181Server.FindInvitingChannelByRequest(info.DeviceId, info.ChannelId, streamIndex); cur != nil && cur.MediaInfo.IsInvite {
+		ret.ErrorCode = base.ErrorCodeSucc
+		ret.Desp = base.DespSucc
+		ret.Data.StreamName = cur.MediaInfo.StreamName
+		if port := parseGb28181MediaPort(cur.MediaInfo.MediaKey); port > 0 {
+			ret.Data.Port = port
+		}
+		return
+	}
+
 	// 重复拉流校验（全局）：
 	// 1) stream_name 已存在：幂等返回（避免因为 heuristic 选到不同 ChannelId 导致重复 INVITE）
 	if cur := sm.gb28181Server.FindChannelByStreamName(streamName); cur != nil && cur.MediaInfo.IsInvite {
