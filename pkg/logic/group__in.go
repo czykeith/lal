@@ -30,9 +30,7 @@ func (group *Group) AddCustomizePubSession(streamName string) (ICustomizePubSess
 		if group.customizePubSession != nil && group.customizePubSession.StreamName() == streamName {
 			Log.Warnf("[%s] replace stale customize pub for same streamName=%s, exist=%s",
 				group.UniqueKey, streamName, group.customizePubSession.UniqueKey())
-			if ctx, ok := group.customizePubSession.(*CustomizePubSessionContext); ok {
-				ctx.Dispose()
-			}
+			group.customizePubSession.Dispose()
 			group.delCustomizePubSession(group.customizePubSession)
 		} else {
 			Log.Errorf("[%s] in stream already exist at group. add customize pub session, exist=%s",
