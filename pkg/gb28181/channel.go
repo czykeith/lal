@@ -194,6 +194,13 @@ f字段中视、音频参数段之间不需空格分割。
 
 // Invite 发起 INVITE。sdpConf 可选：非 nil 时用其生成 SDP 的 f=/fmtp，否则用 channel.conf（保证 API 调用时传入服务器配置可使视频参数生效）。
 func (channel *Channel) Invite(opt *InviteOptions, streamName string, playInfo *PlayInfo, sdpConf *GB28181Config) (code int, err error) {
+	// 同一 streamName 已在拉流：直接成功，不再发 INVITE、不覆盖 MediaInfo/SSRC，避免设备再推一路 RTP
+	// 导致第二路 Conn AddCustomizePubSession 失败（ErrDupInStream）或误杀第一路。
+	if channel.MediaInfo.IsInvite && channel.MediaInfo.StreamName == streamName {
+		base.Log.Debugf("gb28181 Invite idempotent skip, streamName=%s channel=%s", streamName, channel.ChannelId)
+		return http.StatusOK, nil
+	}
+
 	d := channel.device
 	sdpCfg := channel.conf
 	if sdpConf != nil {

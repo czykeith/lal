@@ -209,7 +209,12 @@ func (c *Conn) Serve() (err error) {
 
 			session, err := c.lalServer.AddCustomizePubSession(mediaInfo.StreamName)
 			if err != nil {
-				base.Log.Error("lal server AddCustomizePubSession failed, err:", err)
+				// 同 streamName 已存在输入源时拒绝第二路，属预期，避免 ERROR 刷屏
+				if errors.Is(err, base.ErrDupInStream) {
+					base.Log.Debug("lal server AddCustomizePubSession skipped (dup in stream), streamName:", mediaInfo.StreamName)
+				} else {
+					base.Log.Error("lal server AddCustomizePubSession failed, err:", err)
+				}
 				return err
 			}
 
