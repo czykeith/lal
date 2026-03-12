@@ -23,9 +23,22 @@ func (group *Group) AddCustomizePubSession(streamName string) (ICustomizePubSess
 	defer group.mutex.Unlock()
 
 	if group.hasInSession() {
-		Log.Errorf("[%s] in stream already exist at group. add customize pub session, exist=%s",
-			group.UniqueKey, group.inSessionUniqueKey())
-		return nil, base.ErrDupInStream
+		// GB28181 等设备可能未先发 BYE 就重新 INVITE，或旧 RTP 连接超时后新连接才到，
+		// 此时 group 里仍占着上一路 CUSTOMIZEPUB，AddCustomizePubSession 会直接失败，
+		// 新 Conn 退出时 lalSession==nil 无法 DelCustomizePubSession，形成死锁式占用。
+		// 同一 streamName 视为同一路流重连：先 Dispose + 拆掉旧 in session，再挂新 session。
+		if group.customizePubSession != nil && group.customizePubSession.StreamName() == streamName {
+			Log.Warnf("[%s] replace stale customize pub for same streamName=%s, exist=%s",
+				group.UniqueKey, streamName, group.customizePubSession.UniqueKey())
+			if ctx, ok := group.customizePubSession.(*CustomizePubSessionContext); ok {
+				ctx.Dispose()
+			}
+			group.delCustomizePubSession(group.customizePubSession)
+		} else {
+			Log.Errorf("[%s] in stream already exist at group. add customize pub session, exist=%s",
+				group.UniqueKey, group.inSessionUniqueKey())
+			return nil, base.ErrDupInStream
+		}
 	}
 
 	group.customizePubSession = NewCustomizePubSessionContext(streamName)
