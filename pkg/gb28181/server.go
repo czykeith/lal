@@ -737,7 +737,8 @@ func (s *GB28181Server) OnRegister(req sip.Request, tx sip.ServerTransaction) {
 			isUnregister = true
 		}
 	} else {
-		base.Log.Error("has no expire header")
+		base.Log.Warn("OnRegister has no expire header, source:", req.Source())
+		_ = tx.Respond(sip.NewResponseFromRequest("", req, http.StatusBadRequest, "Missing Expires", ""))
 		return
 	}
 
@@ -745,7 +746,9 @@ func (s *GB28181Server) OnRegister(req sip.Request, tx sip.ServerTransaction) {
 
 	if len(id) != 20 {
 		if !s.conf.AllowNonStandardDeviceId {
-			base.Log.Error("invalid id: ", id)
+			// 多为扫描或非国标客户端；不回复会堆积事务，刷 ERROR 也无助于排障
+			base.Log.Debugf("gb28181 register rejected non-standard id=%s len=%d source=%s", id, len(id), req.Source())
+			_ = tx.Respond(sip.NewResponseFromRequest("", req, http.StatusForbidden, "Invalid device id", ""))
 			return
 		}
 		base.Log.Warnf("gb28181 register non-standard device id accepted. id=%s len=%d source=%s", id, len(id), req.Source())

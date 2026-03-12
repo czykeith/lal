@@ -26,12 +26,24 @@ func (group *Group) AddCustomizePubSession(streamName string) (ICustomizePubSess
 		// GB28181 等设备可能未先发 BYE 就重新 INVITE，或旧 RTP 连接超时后新连接才到，
 		// 此时 group 里仍占着上一路 CUSTOMIZEPUB，AddCustomizePubSession 会直接失败，
 		// 新 Conn 退出时 lalSession==nil 无法 DelCustomizePubSession，形成死锁式占用。
-		// 同一 streamName 视为同一路流重连：先 Dispose + 拆掉旧 in session，再挂新 session。
-		if group.customizePubSession != nil && group.customizePubSession.StreamName() == streamName {
-			Log.Warnf("[%s] replace stale customize pub for same streamName=%s, exist=%s",
-				group.UniqueKey, streamName, group.customizePubSession.UniqueKey())
-			group.customizePubSession.Dispose()
-			group.delCustomizePubSession(group.customizePubSession)
+		// 1) 同一 streamName：按同一路流重连替换。
+		// 2) 仅存在 customize pub（无 RTMP/RTSP pub、无 pull）时一律替换：旧 Conn 未清理时
+		//    streamName 可能与当前 MediaInfo 不一致，仍应让新 RTP 接管，否则永久 ErrDupInStream。
+		onlyCustomizePub := group.customizePubSession != nil &&
+			group.rtmpPubSession == nil && group.rtspPubSession == nil && !group.hasPullSession()
+		sameStream := group.customizePubSession != nil && group.customizePubSession.StreamName() == streamName
+		if onlyCustomizePub || sameStream {
+			if group.customizePubSession != nil {
+				if !sameStream {
+					Log.Warnf("[%s] replace stale customize pub (streamName changed %s -> %s), exist=%s",
+						group.UniqueKey, group.customizePubSession.StreamName(), streamName, group.customizePubSession.UniqueKey())
+				} else {
+					Log.Warnf("[%s] replace stale customize pub for same streamName=%s, exist=%s",
+						group.UniqueKey, streamName, group.customizePubSession.UniqueKey())
+				}
+				group.customizePubSession.Dispose()
+				group.delCustomizePubSession(group.customizePubSession)
+			}
 		} else {
 			Log.Errorf("[%s] in stream already exist at group. add customize pub session, exist=%s",
 				group.UniqueKey, group.inSessionUniqueKey())
