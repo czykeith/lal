@@ -144,6 +144,7 @@ LAL 提供了丰富的 HTTP API 接口，用于控制和管理流媒体服务。
 | POST | `/api/ctrl/start_relay` | 启动转推（拉流+推流） |
 | GET | `/api/ctrl/stop_relay` | 停止转推（query: stream_name） |
 | POST | `/api/ctrl/start_relay_from_stream` | 从已有流转推（仅推流，不额外拉流） |
+| GET | `/api/ctrl/snapshot` | 截取指定流当前画面为 JPEG（query: stream_name） |
 | POST | `/api/ctrl/gb28181_invite` | GB28181 拉流 |
 | POST | `/api/ctrl/gb28181_bye` | GB28181 停止拉流/回放 |
 | POST | `/api/ctrl/gb28181_playback` | GB28181 回放 |

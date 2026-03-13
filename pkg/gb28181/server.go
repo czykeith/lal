@@ -693,6 +693,9 @@ type StreamInfo struct {
 	DeviceId   string
 	ChannelId  string
 	StreamName string
+	CallId     string
+	MediaKey   string
+	StartTime  string
 }
 
 // GetAllStreams 返回当前已邀请（正在拉流）的通道列表
@@ -707,6 +710,9 @@ func (s *GB28181Server) GetAllStreams() (list []StreamInfo) {
 					DeviceId:   d.ID,
 					ChannelId:  ch.ChannelId,
 					StreamName: ch.MediaInfo.StreamName,
+					CallId:     ch.GetCallId(),
+					MediaKey:   ch.MediaInfo.MediaKey,
+					StartTime:  ch.getStartTime(),
 				})
 			}
 			return true

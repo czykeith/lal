@@ -4,13 +4,16 @@
 - [feat] HTTP API: 新增从已有流转推接口 `POST /api/ctrl/start_relay_from_stream`（stream_name + push_url，仅推流不额外拉流）
 - [feat] GB28181: 新增回放倍速控制接口 `POST /api/ctrl/gb28181_playback_scale`，通过 SIP INFO 发送 PlaybackControl 命令调整倍速（不改变本地拉流逻辑；回放 INVITE/SDP 不再携带倍速参数）
 - [feat] GB28181: 回放倍速支持本地时间戳适配，倍速范围统一限制为 `[1,8]`，`scale>1` 时通过 `AvPacketQueue` 对 RTP → HLS/RTMP 等下游时间轴做倍速处理，保证倍速回放时 HLS/FLV/TS 播放速度一致
-- [fix] GB28181: 设备主动发 BYE 时从回放会话表正确移除，避免会话残留；修复 PS → AvPacket 在倍速路径下可能导致 AnnexB NALU 被破坏引发 `iterate nalu failed` 的问题
 - [feat] HTTP API: `/api/ctrl/start_relay_pull`、`/api/ctrl/start_relay` 的 RTSP 客户端倍速 `scale` 参数与 GB28181 回放倍速规则统一（默认 1，有效范围 `[1,8]`，超出返回参数错误）
+- [feat] HTTP API: 新增通用截图接口 `GET /api/ctrl/snapshot?stream_name=xxx`，支持对任意在线流返回最新关键帧 JPEG，用于监控面板与 AI 分析
+- [opt] 截图: 在 `Group.broadcastByRtmpMsg` 中统一挂接 `remux.Rtmp2AvPacketRemuxer`，只缓存可独立解码的关键帧（H.264 必须同时包含 SPS/PPS），避免 ffmpeg 单帧解码出现 `non-existing PPS`/`no frame` 等错误
+- [opt] GB28181: Invite/重连逻辑幂等化，同一 stream_name 或同一 deviceId+channelId+streamIndex 已在拉流时直接返回成功，避免重复 INVITE 和二次推流
+- [fix] GB28181: 设备主动发 BYE 时从回放会话表正确移除，避免会话残留；修复 PS → AvPacket 在倍速路径下可能导致 AnnexB NALU 被破坏引发 `iterate nalu failed` 的问题
 - [feat] 统计: `/api/stat/all_group` 中 GB28181 Pub 展示字节与码率（read_bytes_sum、read_bitrate_kbits、bitrate_kbits）
 - [opt] CustomizePubSessionContext: 在 FeedAvPacket/FeedRtmpMsg 入口累加收流字节，UpdateStat 中计算码率；Group 定时调用 customizePubSession.UpdateStat
 - [refactor] base: 新增 NewStatSessionForPsPub，供 logic 包初始化 PS Pub 统计，解决 StatSession.typ 未导出无法赋值的问题
 - [remove] HTTP API: 删除已废弃的 `POST /api/ctrl/start_rtp_pub` 整条链路；RTP/PS 收流统一通过 GB28181 `gb28181_invite` 建立
-- [doc] README: 补全所有 HTTP 接口索引与说明；已移除废弃接口 `start_rtp_pub` 相关文档；start_relay/GB28181 回放倍速 `scale` 参数文档与实现统一（默认 1，有效范围 `[1,8]`）；gb28181_bye 响应示例补充 session_id
+- [doc] README: 补全所有 HTTP 接口索引与说明；已移除废弃接口 `start_rtp_pub` 相关文档；start_relay/GB28181 回放倍速 `scale` 参数文档与实现统一（默认 1，有效范围 `[1,8]`）；gb28181_bye 响应示例补充 session_id；新增 `/api/ctrl/snapshot` 截图接口文档
 
 #### v0.37.4 (2024-04)
 

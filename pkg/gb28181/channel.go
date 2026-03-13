@@ -75,6 +75,7 @@ type Channel struct {
 
 	observer IMediaOpObserver
 	playInfo *PlayInfo
+	startAt  time.Time
 
 	ChannelInfo
 	conf GB28181Config
@@ -361,6 +362,8 @@ func (channel *Channel) Invite(opt *InviteOptions, streamName string, playInfo *
 		base.Log.Info("GB28181 INVITE response <<<", " status=", code, "\n", inviteRes.String())
 	}
 	if code == http.StatusOK {
+		// 记录本地会话开始时间，供 StatGb28181Streams 展示使用。
+		channel.startAt = time.Now()
 		ds := strings.Split(inviteRes.Body(), "\r\n")
 		for _, l := range ds {
 			if ls := strings.Split(l, "="); len(ls) > 1 {
@@ -490,6 +493,15 @@ func (channel *Channel) GetCallId() string {
 		}
 	}
 	return ""
+}
+
+// getStartTime 返回当前拉流会话的本地开始时间（字符串形式），用于 HTTP API 展示。
+// 如果尚未建立或未记录，则返回空串。
+func (channel *Channel) getStartTime() string {
+	if channel.startAt.IsZero() {
+		return ""
+	}
+	return channel.startAt.Format(TIME_LAYOUT)
 }
 func (channel *Channel) stopMediaServer() (err error) {
 	if channel.playInfo != nil {

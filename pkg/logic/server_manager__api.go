@@ -793,10 +793,16 @@ func (sm *ServerManager) StatGb28181Streams() (ret base.ApiStatGb28181StreamsRes
 	streams := sm.gb28181Server.GetAllStreams()
 	streamInfos := make([]base.Gb28181StreamInfo, 0, len(streams))
 	for _, s := range streams {
+		port := parseGb28181MediaPort(s.MediaKey)
+		isTcp := strings.HasPrefix(s.MediaKey, "tcp")
 		streamInfos = append(streamInfos, base.Gb28181StreamInfo{
 			DeviceId:   s.DeviceId,
 			ChannelId:  s.ChannelId,
 			StreamName: s.StreamName,
+			CallId:     s.CallId,
+			Port:       port,
+			IsTcp:      isTcp,
+			StartTime:  s.StartTime,
 		})
 	}
 
