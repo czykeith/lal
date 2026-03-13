@@ -40,10 +40,22 @@ func (sm *ServerManager) StatLalInfo() base.LalInfo {
 func (sm *ServerManager) StatAllGroup() (sgs []base.StatGroup) {
 	sm.mutex.Lock()
 	defer sm.mutex.Unlock()
+
+	// 如果已有缓存，直接返回一份拷贝，避免修改底层切片。
+	if sm.lastStatAllGroup != nil {
+		sgs = make([]base.StatGroup, len(sm.lastStatAllGroup))
+		copy(sgs, sm.lastStatAllGroup)
+		return
+	}
+
+	// 首次调用或缓存尚未构建时，计算一次并写入缓存。
 	sm.groupManager.Iterate(func(group *Group) bool {
 		sgs = append(sgs, group.GetStat(math.MaxInt32))
 		return true
 	})
+	sm.lastStatAllGroup = make([]base.StatGroup, len(sgs))
+	copy(sm.lastStatAllGroup, sgs)
+	sm.lastStatAllGroupAt = time.Now()
 	return
 }
 

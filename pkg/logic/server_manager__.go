@@ -11,6 +11,7 @@ package logic
 import (
 	"context"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
@@ -55,6 +56,9 @@ type ServerManager struct {
 	mutex         sync.Mutex
 	groupManager  IGroupManager
 	snapshotStore *SnapshotStore
+	// 缓存最近一次 StatAllGroup 的结果，避免高频 HTTP 调用时重复遍历所有 Group 计算统计。
+	lastStatAllGroup   []base.StatGroup
+	lastStatAllGroupAt time.Time
 
 	onHookSession func(uniqueKey string, streamName string) ICustomizeHookSessionContext
 
@@ -363,6 +367,7 @@ func (sm *ServerManager) RunLoop() error {
 
 	uis := uint32(sm.config.HttpNotifyConfig.UpdateIntervalSec)
 	var updateInfo base.UpdateInfo
+	// 首次启动时构建一份 StatAllGroup 缓存，供 HTTP-API 与 Notify 复用。
 	updateInfo.Groups = sm.StatAllGroup()
 	sm.nhOnUpdate(updateInfo)
 
@@ -389,6 +394,15 @@ func (sm *ServerManager) RunLoop() error {
 				group.Tick(tickCount)
 				return true
 			})
+
+			// 每秒刷新一次 StatAllGroup 缓存，供 HTTP-API 使用。
+			var sgs []base.StatGroup
+			sm.groupManager.Iterate(func(group *Group) bool {
+				sgs = append(sgs, group.GetStat(math.MaxInt32))
+				return true
+			})
+			sm.lastStatAllGroup = sgs
+			sm.lastStatAllGroupAt = time.Now()
 
 			// 定时打印一些group相关的debug日志
 			if sm.config.DebugConfig.LogGroupIntervalSec > 0 &&
