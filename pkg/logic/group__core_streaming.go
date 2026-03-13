@@ -218,6 +218,12 @@ func (group *Group) broadcastByRtmpMsg(msg base.RtmpMsg) {
 
 	//Log.Debugf("> broadcastByRtmpMsg. %s", msg.DebugString())
 
+	// 在统一的 RTMP 广播出口提取关键帧，用于全局截图缓存。
+	// 这样无论输入来源是 RTMP/RTSP/GB28181/Relay，都会经过这里。
+	if group.rtmp2AvPacketRemuxer != nil && msg.Header.MsgTypeId == base.RtmpTypeIdVideo {
+		_ = group.rtmp2AvPacketRemuxer.FeedRtmpMsg(msg, nil)
+	}
+
 	if msg.Header.MsgLen != uint32(len(msg.Payload)) {
 		Log.Errorf("[%s] diff. msgLen=%d, payload len=%d, %+v", group.UniqueKey, msg.Header.MsgLen, len(msg.Payload), msg.Header)
 	}

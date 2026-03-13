@@ -52,8 +52,9 @@ type ServerManager struct {
 	gb28181Server *gb28181.GB28181Server
 	exitChan      chan struct{}
 
-	mutex        sync.Mutex
-	groupManager IGroupManager
+	mutex         sync.Mutex
+	groupManager  IGroupManager
+	snapshotStore *SnapshotStore
 
 	onHookSession func(uniqueKey string, streamName string) ICustomizeHookSessionContext
 
@@ -88,6 +89,7 @@ func NewServerManager(modOption ...ModOption) *ServerManager {
 		exitChan:        make(chan struct{}, 1),
 	}
 	sm.groupManager = NewSimpleGroupManager(sm)
+	sm.snapshotStore = NewSnapshotStore()
 
 	sm.option = defaultOption
 	for _, fn := range modOption {
@@ -894,6 +896,22 @@ func (sm *ServerManager) OnHlsMakeTs(info base.HlsMakeTsInfo) {
 
 func (sm *ServerManager) Config() *Config {
 	return sm.config
+}
+
+// UpdateSnapshot 实现 IGroupObserver：将关键帧写入全局截图缓存。
+func (sm *ServerManager) UpdateSnapshot(streamName string, pkt base.AvPacket) {
+	if sm.snapshotStore == nil {
+		return
+	}
+	sm.snapshotStore.Update(streamName, pkt)
+}
+
+// GetSnapshotFrame 提供给 HTTP API，按 streamName 获取最新关键帧。
+func (sm *ServerManager) GetSnapshotFrame(streamName string) (*SnapshotFrame, bool) {
+	if sm.snapshotStore == nil {
+		return nil, false
+	}
+	return sm.snapshotStore.Get(streamName)
 }
 
 func (sm *ServerManager) GetGroup(appName string, streamName string) *Group {

@@ -73,6 +73,8 @@ type IGroupObserver interface {
 	OnHlsMakeTs(info base.HlsMakeTsInfo)
 	OnRelayPullStart(info base.PullStartInfo) // TODO(chef): refactor me
 	OnRelayPullStop(info base.PullStopInfo)
+	// UpdateSnapshot 将指定 streamName 的最新关键帧写入全局缓存。
+	UpdateSnapshot(streamName string, pkt base.AvPacket)
 }
 
 type Group struct {
@@ -96,6 +98,8 @@ type Group struct {
 	rtsp2RtmpRemuxer    *remux.AvPacket2RtmpRemuxer
 	rtmp2RtspRemuxer    *remux.Rtmp2RtspRemuxer
 	rtmp2MpegtsRemuxer  *remux.Rtmp2MpegtsRemuxer
+	// rtmp2AvPacketRemuxer 将广播路径上的 RTMP 视频转换为 AnnexB AvPacket，用于全局截图缓存。
+	rtmp2AvPacketRemuxer *remux.Rtmp2AvPacketRemuxer
 	// pull
 	pullProxy *pullProxy
 	// relay
@@ -176,6 +180,18 @@ func NewGroup(appName string, streamName string, config *Config, option GroupOpt
 	if config.RtmpConfig.MergeWriteSize > 0 {
 		g.rtmpMergeWriter = base.NewMergeWriter(g.writev2RtmpSubSessions, config.RtmpConfig.MergeWriteSize)
 	}
+
+	// 初始化用于截图的 AvPacket Remuxer：只在有视频关键帧时更新全局缓存，对主流程影响极小。
+	g.rtmp2AvPacketRemuxer = remux.NewRtmp2AvPacketRemuxer().WithOnAvPacket(
+		func(pkt base.AvPacket, _ interface{}) {
+			if !pkt.IsVideo() {
+				return
+			}
+			if g.observer != nil {
+				g.observer.UpdateSnapshot(g.streamName, pkt)
+			}
+		},
+	)
 
 	Log.Infof("[%s] lifecycle new group. group=%p, appName=%s, streamName=%s", uk, g, appName, streamName)
 	return g

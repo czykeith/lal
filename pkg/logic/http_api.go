@@ -77,6 +77,9 @@ func (h *HttpApiServer) RunLoop() error {
 	mux.HandleFunc("/api/ctrl/gb28181_device_status", h.queryGb28181DeviceStatusHandler)
 	mux.HandleFunc("/api/ctrl/gb28181_channels", h.queryGb28181ChannelsHandler)
 
+	// 通用截图接口：根据 stream_name 返回最近一帧关键帧的 JPEG 图片。
+	mux.HandleFunc("/api/ctrl/snapshot", h.ctrlSnapshotHandler)
+
 	// 所有没有注册路由的走下面这个处理函数
 	mux.HandleFunc("/", h.notFoundHandler)
 
@@ -128,6 +131,42 @@ func (h *HttpApiServer) statGroupHandler(w http.ResponseWriter, req *http.Reques
 	v.ErrorCode = base.ErrorCodeSucc
 	v.Desp = base.DespSucc
 	feedback(v, w)
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+
+// ctrlSnapshotHandler 截图接口：GET /api/ctrl/snapshot?stream_name=xxx
+// 返回最近缓存的关键帧解码后的 JPEG 图片。
+func (h *HttpApiServer) ctrlSnapshotHandler(w http.ResponseWriter, req *http.Request) {
+	q := req.URL.Query()
+	streamName := q.Get("stream_name")
+	if streamName == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte("missing stream_name"))
+		return
+	}
+
+	frame, ok := h.sm.GetSnapshotFrame(streamName)
+	if !ok || frame == nil || len(frame.Data) == 0 {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte("no snapshot for stream"))
+		return
+	}
+
+	jpg, err := convertAnnexbToJPEG(frame)
+	if err != nil || len(jpg) == 0 {
+		w.WriteHeader(http.StatusInternalServerError)
+		if err != nil {
+			_, _ = w.Write([]byte("snapshot decode failed: " + err.Error()))
+		} else {
+			_, _ = w.Write([]byte("snapshot decode failed"))
+		}
+		return
+	}
+
+	w.Header().Set("Content-Type", "image/jpeg")
+	w.Header().Set("Cache-Control", "no-cache")
+	_, _ = w.Write(jpg)
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
