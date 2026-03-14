@@ -94,6 +94,20 @@ func (server *Server) Dispose() {
 func (server *Server) handleTcpConnect(conn net.Conn) {
 	Log.Infof("accept a rtmp connection. remoteAddr=%s", conn.RemoteAddr().String())
 	session := NewServerSession(server, conn)
+	defer func() {
+		if r := recover(); r != nil {
+			Log.Errorf("rtmp server session panic recovered, remoteAddr=%s panic=%+v", conn.RemoteAddr(), r)
+			_ = session.Dispose()
+			if !session.DisposeByObserverFlag {
+				switch session.sessionStat.BaseType() {
+				case base.SessionBaseTypePubStr:
+					server.observer.OnDelRtmpPubSession(session)
+				case base.SessionBaseTypeSubStr:
+					server.observer.OnDelRtmpSubSession(session)
+				}
+			}
+		}
+	}()
 	_ = session.RunLoop()
 
 	if session.DisposeByObserverFlag {

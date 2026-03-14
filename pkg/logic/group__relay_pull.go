@@ -360,6 +360,22 @@ func (group *Group) pullIfNeeded() (string, error) {
 	group.pullProxy.pullingSessionId = uk
 
 	go func(rtPullUrl string, rtIsPullByRtmp bool, rtRtmpSession *rtmp.PullSession, rtRtspSession *rtsp.PullSession) {
+		defer func() {
+			if r := recover(); r != nil {
+				Log.Errorf("[%s] relay pull goroutine panic recovered, panic=%+v", uk, r)
+				releasePullStartSlot()
+				if rtRtmpSession != nil {
+					rtRtmpSession.Dispose()
+					group.DelRtmpPullSession(rtRtmpSession)
+				}
+				if rtRtspSession != nil {
+					rtRtspSession.Dispose()
+				}
+				group.mutex.Lock()
+				group.onPullSessionExitedLocked(uk, fmt.Errorf("panic recovered: %v", r))
+				group.mutex.Unlock()
+			}
+		}()
 		// 全局限并发：只控制 Start 握手阶段的并发数量，不限制拉流总路数
 		if ok := acquirePullStartSlot(maxWaitPullStartSlot); !ok {
 			// 排队超时：说明系统处于高压（或上游长期不可用），不要一直堵在这里

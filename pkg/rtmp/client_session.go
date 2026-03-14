@@ -379,7 +379,7 @@ func (s *ClientSession) doMsg(stream *Stream) error {
 		s.onReadRtmpAvMsg(stream.toAvMsg())
 	default:
 		Log.Errorf("[%s] read unknown message. typeid=%d, %s", s.UniqueKey(), stream.header.MsgTypeId, stream.toDebugString())
-		panic(0)
+		return fmt.Errorf("read unknown message type: %d", stream.header.MsgTypeId)
 	}
 	return nil
 }

@@ -3,6 +3,7 @@ package gb28181
 import (
 	"bytes"
 	"encoding/xml"
+	"fmt"
 	"golang.org/x/net/html/charset"
 	"golang.org/x/text/encoding/simplifiedchinese"
 	"golang.org/x/text/transform"
@@ -30,7 +31,8 @@ func randStringBySoure(src string, n int) string {
 	rand.Seed(time.Now().UnixNano())
 	_, err := rand.Read(randomness)
 	if err != nil {
-		panic(err)
+		// rand.Read 失败极罕见（如内核熵不足），返回基于时间的兜底串，避免 panic 导致进程退出
+		return fmt.Sprintf("g%d", time.Now().UnixNano())
 	}
 
 	l := len(src)

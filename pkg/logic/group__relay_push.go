@@ -96,7 +96,16 @@ func (group *Group) startPushIfNeeded() {
 		Log.Infof("[%s] start relay push. url=%s", group.UniqueKey, urlWithParam)
 
 		go func(u, u2 string) {
-			pushSession := rtmp.NewPushSession(func(option *rtmp.PushSessionOption) {
+			var pushSession *rtmp.PushSession
+			defer func() {
+				if r := recover(); r != nil {
+					Log.Errorf("[%s] relay push goroutine panic recovered, url=%s panic=%+v", group.UniqueKey, u2, r)
+					if pushSession != nil {
+						group.DelRtmpPushSession(u, pushSession)
+					}
+				}
+			}()
+			pushSession = rtmp.NewPushSession(func(option *rtmp.PushSessionOption) {
 				option.PushTimeoutMs = RelayPushTimeoutMs
 				option.WriteAvTimeoutMs = RelayPushWriteAvTimeoutMs
 			})

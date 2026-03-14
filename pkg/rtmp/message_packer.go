@@ -35,10 +35,10 @@ func NewMessagePacker() *MessagePacker {
 }
 
 // 注意，这个函数只会打包一个chunk头，所以调用方应自己保证在`bodyLen`小于chunk size时使用
-func writeSingleChunkHeader(out []byte, csid int, bodyLen int, typeid uint8, streamid int) {
-	// 目前这个函数只供发送信令时调用，信令的 csid 都是小于等于 63 的，如果传入的 csid 大于 63，直接 panic
+func writeSingleChunkHeader(out []byte, csid int, bodyLen int, typeid uint8, streamid int) error {
+	// 目前这个函数只供发送信令时调用，信令的 csid 都是小于等于 63 的
 	if csid > 63 {
-		panic(csid)
+		return fmt.Errorf("rtmp: invalid csid %d for single chunk header", csid)
 	}
 
 	format := 0
@@ -50,6 +50,7 @@ func writeSingleChunkHeader(out []byte, csid int, bodyLen int, typeid uint8, str
 	bele.BePutUint24(out[4:], uint32(bodyLen))
 	out[7] = typeid
 	bele.LePutUint32(out[8:], uint32(streamid))
+	return nil
 }
 
 func (packer *MessagePacker) ChunkAndWrite(writer io.Writer, csid int, typeid uint8, streamid int) error {
@@ -57,7 +58,9 @@ func (packer *MessagePacker) ChunkAndWrite(writer io.Writer, csid int, typeid ui
 
 	if bodyLen <= LocalChunkSize {
 		// 如果一个chunk就够放（大部分信令都是这种情况），我们直接在buffer前面预留的空间写入chunk header内容，避免造成拷贝
-		writeSingleChunkHeader(packer.b.Bytes(), csid, bodyLen, typeid, streamid)
+		if err := writeSingleChunkHeader(packer.b.Bytes(), csid, bodyLen, typeid, streamid); err != nil {
+			return err
+		}
 		_, err := packer.b.WriteTo(writer)
 		return err
 	}
