@@ -65,10 +65,15 @@ func (s *GB28181MediaServer) Start(listener net.Listener) (err error) {
 				c := NewConn(conn, s.observer, s.lalServer)
 				c.SetKey(s.mediaKey)
 				c.SetMediaServer(s)
-				go func() {
-					c.Serve()
-					s.conns.Delete(c.connKey)
-				}()
+				go func(conn *Conn) {
+					defer func() {
+						if r := recover(); r != nil {
+							base.Log.Errorf("gb28181 mediaserver conn goroutine panic recovered, connKey=%s panic=%v", conn.connKey, r)
+						}
+						s.conns.Delete(conn.connKey)
+					}()
+					conn.Serve()
+				}(c)
 			}
 		}()
 	}

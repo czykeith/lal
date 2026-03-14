@@ -98,6 +98,12 @@ func (c *Conn) SetKey(key string) {
 }
 func (c *Conn) Serve() (err error) {
 	defer func() {
+		if r := recover(); r != nil {
+			base.Log.Errorf("gb28181 conn Serve panic recovered, streamName=%s connKey=%s panic=%v", c.streamName, c.connKey, r)
+			err = fmt.Errorf("panic recovered: %v", r)
+		}
+	}()
+	defer func() {
 		// 频繁的无效 SSRC 多数来自端口扫描或非预期设备推流，降噪避免刷屏。
 		if err != nil && errors.Is(err, ErrInvalidSsrc) {
 			base.Log.Debug("conn close, err:", err)
