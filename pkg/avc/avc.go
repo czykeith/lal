@@ -470,6 +470,9 @@ func SplitNaluAvcc(nals []byte) (nalList [][]byte, err error) {
 
 // IterateNaluAnnexb
 //
+// 对 GB28181 等可能产生非标准 AnnexB 的数据做容错：若开头无 start code 则从中间查找；
+// 若出现连续 start code（start >= pos）则跳过该错误 start code 继续解析，减少整包丢弃和掉线。
+//
 // @param handler: 回调函数中的`nal`参数引用`nals`中的内存
 func IterateNaluAnnexb(nals []byte, handler func(nal []byte)) error {
 	if nals == nil {
@@ -477,8 +480,18 @@ func IterateNaluAnnexb(nals []byte, handler func(nal []byte)) error {
 	}
 	prePos, preLength := IterateNaluStartCode(nals, 0)
 	if prePos == -1 {
-		handler(nals)
-		return nazaerrors.Wrap(base.ErrAvc)
+		// 开头无 start code：尝试从中间查找，兼容 PS 解复用等产生的 leading 垃圾
+		for i := 1; i < len(nals); i++ {
+			p, l := IterateNaluStartCode(nals, i)
+			if p != -1 {
+				prePos, preLength = p, l
+				break
+			}
+		}
+		if prePos == -1 {
+			handler(nals)
+			return nazaerrors.Wrap(base.ErrAvc)
+		}
 	}
 
 	for {
@@ -495,7 +508,10 @@ func IterateNaluAnnexb(nals []byte, handler func(nal []byte)) error {
 		if start < pos {
 			handler(nals[start:pos])
 		} else {
-			return nazaerrors.Wrap(base.ErrAvc)
+			// 连续 start code 或重叠：跳过该错误 start code 继续，避免整包丢弃
+			prePos = pos
+			preLength = length
+			continue
 		}
 
 		prePos = pos

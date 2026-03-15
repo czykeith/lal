@@ -270,10 +270,18 @@ func (psDemuxer *PsDemuxer) demuxH26x(stream *psStream, pes *PesPacket) error {
 		stream.streamBuf = append(stream.streamBuf, pes.PesPayload...)
 	} else {
 		start, sc := FindStartCode(stream.streamBuf, 0)
+		scLen := int(sc)
 		for start >= 0 && start < len(stream.streamBuf) {
-			end, sc2 := FindStartCode(stream.streamBuf, start+int(sc))
+			end, sc2 := FindStartCode(stream.streamBuf, start+scLen)
 			if end < 0 {
 				end = len(stream.streamBuf)
+			}
+			// 跳过零长度或仅有 start code 的 NAL，避免下游 AnnexB 解析报错或 panic
+			if end <= start+scLen {
+				start = end
+				sc = sc2
+				scLen = int(sc)
+				continue
 			}
 			if stream.cid == PsStreamH264 {
 				naluType := H264NaluType(stream.streamBuf[start:])
@@ -292,6 +300,7 @@ func (psDemuxer *PsDemuxer) demuxH26x(stream *psStream, pes *PesPacket) error {
 			}
 			start = end
 			sc = sc2
+			scLen = int(sc)
 		}
 		stream.streamBuf = nil
 		stream.streamBuf = append(stream.streamBuf, pes.PesPayload...)

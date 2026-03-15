@@ -236,7 +236,15 @@ func (c *Conn) Serve() (err error) {
 			if c.psDumpFile != nil {
 				c.psDumpFile.WriteWithType(pkt.Payload, base.DumpTypePsRtpData)
 			}
-			c.demuxer.Input(pkt.Payload)
+			if err := c.demuxer.Input(pkt.Payload); err != nil {
+				// 单包 PS 解析失败不关闭连接，仅打日志并继续收包，提高拉流稳定性
+				var psErr mpegps.Error
+				if errors.As(err, &psErr) && psErr.NeedMore() {
+					// 正常“需要更多数据”，不打印
+				} else {
+					base.Log.Debug("gb28181 ps demux input err, skip packet. streamName=%s err=%v", c.streamName, err)
+				}
+			}
 		}
 	}
 	return

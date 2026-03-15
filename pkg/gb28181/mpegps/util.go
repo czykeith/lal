@@ -107,11 +107,25 @@ func SplitFrame(frames []byte, onFrame func(nalu []byte) bool) {
 }
 func H264NaluType(h264 []byte) uint8 {
 	loc, sc := FindStartCode(h264, 0)
-	return h264[loc+int(sc)] & 0x1F
+	if loc < 0 {
+		return 0
+	}
+	nalPos := loc + int(sc)
+	if nalPos >= len(h264) {
+		return 0
+	}
+	return h264[nalPos] & 0x1F
 }
 func H265NaluType(h265 []byte) uint8 {
 	loc, sc := FindStartCode(h265, 0)
-	return (h265[loc+int(sc)] >> 1) & 0x3F
+	if loc < 0 {
+		return 0
+	}
+	nalPos := loc + int(sc)
+	if nalPos >= len(h265) {
+		return 0
+	}
+	return (h265[nalPos] >> 1) & 0x3F
 }
 
 func mpegH264FindNALU(data []byte) (int, int, error) {

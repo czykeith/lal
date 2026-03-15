@@ -53,9 +53,10 @@ var (
 	RelayPushTimeoutMs        = 10000
 	RelayPushWriteAvTimeoutMs = 10000
 
-	StaticRelayPullTimeoutMs = 10000
+	// 拉流建立连接+握手的超时。上游慢或并发多时易触发 context deadline exceeded，适当调大可提高成功率
+	StaticRelayPullTimeoutMs = 20000
 
-	DefaultApiCtrlStartRelayPullReqPullTimeoutMs = 10000
+	DefaultApiCtrlStartRelayPullReqPullTimeoutMs = 20000
 )
 
 // 注意，这是配置文件中静态回源的配置值，不是HTTP-API的默认值
