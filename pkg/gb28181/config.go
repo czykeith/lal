@@ -23,6 +23,12 @@ type GB28181Config struct {
 	VideoFramerate int    `json:"video_framerate"` // fps（0表示不指定）
 	VideoProfile   string `json:"video_profile"`   // baseline/main/high（可选）
 	VideoLevel     string `json:"video_level"`     // 例如 3.1/4.0（可选）
+
+	// 断线重试恢复（仅对实时点播生效，回放不自动重试）
+	AutoRetryOnDisconnect bool `json:"auto_retry_on_disconnect"` // 拉流断线后是否自动重试 Invite，默认 false
+	RetryMaxCount         int  `json:"retry_max_count"`          // 最大重试次数，0=不重试，-1=无限重试，默认 3
+	RetryFirstDelayMs     int  `json:"retry_first_delay_ms"`     // 首次重试延迟（毫秒），默认 3000
+	RetryMaxDelayMs       int  `json:"retry_max_delay_ms"`       // 退避上限（毫秒），默认 60000
 }
 
 // GB28181MediaConfig 媒体服务配置

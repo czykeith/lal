@@ -1058,12 +1058,35 @@ func gb28181ConfigFromLogic(c Gb28181Config) gb28181.GB28181Config {
 			ListenPort:            uint16(rtpMin),
 			MultiPortMaxIncrement: inc,
 		},
-		VideoCodec:     videoCodec,
-		VideoWidth:     videoWidth,
-		VideoHeight:    videoHeight,
-		VideoBitrate:   videoBitrate,
-		VideoFramerate: videoFramerate,
-		VideoProfile:   videoProfile,
-		VideoLevel:     videoLevel,
+		VideoCodec:            videoCodec,
+		VideoWidth:            videoWidth,
+		VideoHeight:           videoHeight,
+		VideoBitrate:          videoBitrate,
+		VideoFramerate:        videoFramerate,
+		VideoProfile:          videoProfile,
+		VideoLevel:            videoLevel,
+		AutoRetryOnDisconnect: c.AutoRetryOnDisconnect,
+		RetryMaxCount:         defaultGb28181RetryMaxCount(c.AutoRetryOnDisconnect, c.RetryMaxCount),
+		RetryFirstDelayMs:     retryFirstDelayMs(c.RetryFirstDelayMs),
+		RetryMaxDelayMs:       retryMaxDelayMs(c.RetryMaxDelayMs),
 	}
+}
+
+func defaultGb28181RetryMaxCount(autoRetry bool, v int) int {
+	if autoRetry && v == 0 {
+		return 3
+	}
+	return v
+}
+func retryFirstDelayMs(v int) int {
+	if v <= 0 {
+		return 3000
+	}
+	return v
+}
+func retryMaxDelayMs(v int) int {
+	if v <= 0 {
+		return 60000
+	}
+	return v
 }

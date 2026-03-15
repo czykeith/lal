@@ -48,6 +48,16 @@ type GB28181Server struct {
 	playbackSessions sync.Map
 	// playbackScales 记录回放会话的倍速配置，key 为 streamName，value 为 float64 倍速（>0，1 表示正常速度）
 	playbackScales sync.Map
+	// recoveryPending 断线待恢复的实时点播，key 为 streamName，value 为 *streamRecovery
+	recoveryPending sync.Map
+}
+
+// streamRecovery 用于断线后自动重试 Invite（仅实时点播）
+type streamRecovery struct {
+	StreamName  string
+	PlayInfo    PlayInfo
+	RetryCount  int
+	NextRetryAt time.Time
 }
 
 const MaxRegisterCount = 3
@@ -265,6 +275,10 @@ func (s *GB28181Server) OnStopMediaServer(netWork string, singlePort bool, devic
 		}
 	}
 	if mediasvr != nil {
+		// 主动 Stop 时移除该流的断线恢复任务，避免关闭后仍被重试
+		if StreamName != "" {
+			s.recoveryPending.Delete(StreamName)
+		}
 		if singlePort {
 			mediasvr.CloseConn(StreamName)
 		} else {
@@ -330,17 +344,35 @@ func (s *GB28181Server) GetMediaInfoByKey(key string) (*mediaserver.MediaInfo, b
 
 func (s *GB28181Server) NotifyClose(streamName string) {
 	var ok bool
+	var chFound *Channel
 	Devices.Range(func(_, value any) bool {
 		d := value.(*Device)
 		d.channelMap.Range(func(key, value any) bool {
 			ch := value.(*Channel)
 			if ch.MediaInfo.StreamName == streamName {
+				chFound = ch
+				// 断线重试：仅对实时点播、且启用自动重试时登记恢复任务（回放不自动重试）
+				if s.conf.AutoRetryOnDisconnect && s.conf.RetryMaxCount != 0 && ch.playInfo != nil {
+					if _, inPlayback := s.playbackSessions.Load(streamName); !inPlayback {
+						firstDelay := time.Duration(s.conf.RetryFirstDelayMs) * time.Millisecond
+						if firstDelay <= 0 {
+							firstDelay = 3 * time.Second
+						}
+						s.recoveryPending.Store(streamName, &streamRecovery{
+							StreamName:  streamName,
+							PlayInfo:    *ch.playInfo,
+							RetryCount:  0,
+							NextRetryAt: time.Now().Add(firstDelay),
+						})
+						base.Log.Infof("gb28181 stream disconnect, schedule retry. streamName=%s firstRetryIn=%v maxRetry=%d",
+							streamName, firstDelay, s.conf.RetryMaxCount)
+					}
+				}
 				if ch.MediaInfo.IsInvite {
 					ch.Bye(streamName)
 				}
 				ch.MediaInfo.Clear()
 				ok = true
-				// 主动关闭时移除回放会话
 				s.UnregisterPlaybackSession(streamName)
 				return false
 			}
@@ -351,11 +383,13 @@ func (s *GB28181Server) NotifyClose(streamName string) {
 		}
 		return true
 	})
+	_ = chFound
 }
 
 func (s *GB28181Server) startJob() {
 	statusTick := time.NewTicker(s.HeartbeatInterval / 2)
 	banTick := time.NewTicker(s.RemoveBanInterval)
+	recoveryTick := time.NewTicker(2 * time.Second)
 	for {
 		select {
 		case <-banTick.C:
@@ -364,8 +398,9 @@ func (s *GB28181Server) startJob() {
 			}
 		case <-statusTick.C:
 			s.statusCheck()
-			// 定期清理超时的回放会话
 			s.clearExpiredPlaybackSessions()
+		case <-recoveryTick.C:
+			s.processRecoveryPending()
 		}
 	}
 }
@@ -424,6 +459,54 @@ func (s *GB28181Server) GetPlaybackScale(streamName string) float64 {
 		}
 	}
 	return 1.0
+}
+
+// processRecoveryPending 处理断线待恢复的实时点播：到点则重新 Invite，成功则移除，失败则退避后再次重试。
+func (s *GB28181Server) processRecoveryPending() {
+	if !s.conf.AutoRetryOnDisconnect || s.conf.RetryMaxCount == 0 {
+		return
+	}
+	now := time.Now()
+	s.recoveryPending.Range(func(key, value any) bool {
+		streamName, _ := key.(string)
+		rec, _ := value.(*streamRecovery)
+		if rec == nil || now.Before(rec.NextRetryAt) {
+			return true
+		}
+		ch := s.FindChannel(rec.PlayInfo.DeviceId, rec.PlayInfo.ChannelId)
+		if ch == nil {
+			base.Log.Warnf("gb28181 retry: channel not found, remove recovery. streamName=%s deviceId=%s channelId=%s",
+				streamName, rec.PlayInfo.DeviceId, rec.PlayInfo.ChannelId)
+			s.recoveryPending.Delete(streamName)
+			return true
+		}
+		opt := &InviteOptions{}
+		code, err := ch.Invite(opt, rec.StreamName, &rec.PlayInfo, &s.conf)
+		if code == http.StatusOK && err == nil {
+			s.recoveryPending.Delete(streamName)
+			base.Log.Infof("gb28181 retry success. streamName=%s", streamName)
+			return true
+		}
+		rec.RetryCount++
+		backoffMs := s.conf.RetryFirstDelayMs
+		for i := 0; i < rec.RetryCount && i < 10; i++ {
+			backoffMs *= 2
+		}
+		if maxMs := s.conf.RetryMaxDelayMs; maxMs > 0 && backoffMs > maxMs {
+			backoffMs = maxMs
+		}
+		rec.NextRetryAt = now.Add(time.Duration(backoffMs) * time.Millisecond)
+		s.recoveryPending.Store(streamName, rec)
+		if s.conf.RetryMaxCount > 0 && rec.RetryCount >= s.conf.RetryMaxCount {
+			base.Log.Warnf("gb28181 retry limit reached, remove recovery. streamName=%s retries=%d err=%v",
+				streamName, rec.RetryCount, err)
+			s.recoveryPending.Delete(streamName)
+			return true
+		}
+		base.Log.Infof("gb28181 retry failed, will retry again. streamName=%s retries=%d nextIn=%v err=%v",
+			streamName, rec.RetryCount, time.Duration(backoffMs)*time.Millisecond, err)
+		return true
+	})
 }
 
 // clearExpiredPlaybackSessions 清理已超过有效期的回放会话。

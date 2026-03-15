@@ -218,6 +218,11 @@ type Gb28181Config struct {
 	VideoLevel     string  `json:"video_level"`     // H264 Level：如3.1、4.0等（默认不指定）
 	// 可选：嵌套 video 对象，若存在则优先使用（便于部分配置写法）
 	Video *Gb28181VideoConfig `json:"video"`
+	// 断线重试恢复（仅对实时点播生效）
+	AutoRetryOnDisconnect bool `json:"auto_retry_on_disconnect"` // 拉流断线后是否自动重试，默认 false
+	RetryMaxCount         int  `json:"retry_max_count"`          // 最大重试次数，0=不重试，-1=无限，默认 3
+	RetryFirstDelayMs     int  `json:"retry_first_delay_ms"`     // 首次重试延迟（毫秒），默认 3000
+	RetryMaxDelayMs       int  `json:"retry_max_delay_ms"`       // 退避上限（毫秒），默认 60000
 }
 
 // Gb28181VideoConfig 嵌套视频参数，与 Gb28181Config 平铺字段二选一
