@@ -792,6 +792,7 @@ func (sm *ServerManager) QueryGb28181Channels(info base.ApiQueryGb28181ChannelsR
 }
 
 // StatGb28181Streams 获取GB28181流列表（lalmax：GetAllStreams）
+// 仅使用 GB28181Server 自身维护的流信息，保证 Active Streams 中展示的是 GB 层的真实、完整信息。
 func (sm *ServerManager) StatGb28181Streams() (ret base.ApiStatGb28181StreamsResp) {
 	sm.mutex.Lock()
 	defer sm.mutex.Unlock()
