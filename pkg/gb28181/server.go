@@ -782,17 +782,24 @@ type StreamInfo struct {
 }
 
 // GetAllStreams 返回当前已邀请（正在拉流）的通道列表
+//
+// 优先使用 Channel.MediaInfo.StreamName；为兼容个别路径下 MediaInfo 被清理但 playInfo 仍存在的情况，
+// 当 MediaInfo.StreamName 为空、但 playInfo 非空时，回退使用 playInfo.StreamName，避免 Active Streams 漏报。
 func (s *GB28181Server) GetAllStreams() (list []StreamInfo) {
 	list = make([]StreamInfo, 0)
 	Devices.Range(func(_, value any) bool {
 		d := value.(*Device)
 		d.channelMap.Range(func(_, value any) bool {
 			ch := value.(*Channel)
-			if ch.MediaInfo.StreamName != "" {
+			streamName := ch.MediaInfo.StreamName
+			if streamName == "" && ch.playInfo != nil {
+				streamName = ch.playInfo.StreamName
+			}
+			if streamName != "" {
 				list = append(list, StreamInfo{
 					DeviceId:   d.ID,
 					ChannelId:  ch.ChannelId,
-					StreamName: ch.MediaInfo.StreamName,
+					StreamName: streamName,
 					CallId:     ch.GetCallId(),
 					MediaKey:   ch.MediaInfo.MediaKey,
 					StartTime:  ch.getStartTime(),

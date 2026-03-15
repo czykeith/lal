@@ -103,10 +103,17 @@ func (d *Device) UpdateChannels(list ...ChannelInfo) {
 	}
 }
 
+// addOrUpdateChannel 增加或更新通道信息（来自 Catalog/NOTIFY 等）。更新时保留该通道当前的拉流/回放状态（MediaInfo、playInfo），
+// 避免因设备注册刷新或通道列表同步导致正在收流的通道被误清空，从而 Active Streams 不再显示。
 func (d *Device) addOrUpdateChannel(info ChannelInfo) (c *Channel) {
 	if old, ok := d.channelMap.Load(info.ChannelId); ok {
 		c = old.(*Channel)
+		// ChannelInfo 内嵌了 MediaInfo，直接赋值会清空 IsInvite/StreamName 等，导致 Active Streams 丢失
+		oldMedia := c.MediaInfo
+		oldPlay := c.playInfo
 		c.ChannelInfo = info
+		c.MediaInfo = oldMedia
+		c.playInfo = oldPlay
 	} else {
 		c = &Channel{
 			device:      d,
