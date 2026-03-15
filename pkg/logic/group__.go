@@ -289,6 +289,19 @@ func (group *Group) GetStat(maxsub int) base.StatGroup {
 		group.stat.StatPub = base.StatPub{}
 	}
 
+	// 创建时未带 appName（如 GB28181 通过 AddCustomizePubSession 仅传 streamName）的 Group，在统计展示时补全默认 app_name，不影响拉流/播放（SimpleGroupManager 仅按 streamName 路由）
+	if group.appName == "" {
+		if group.customizePubSession != nil {
+			group.stat.AppName = group.customizePubSession.AppName() // "gb28181"
+		} else if group.rtmpPubSession != nil {
+			group.stat.AppName = group.rtmpPubSession.AppName()
+		} else if group.rtspPubSession != nil {
+			group.stat.AppName = group.rtspPubSession.AppName()
+		} else {
+			group.stat.AppName = "live"
+		}
+	}
+
 	group.stat.StatPull = group.getStatPull()
 
 	group.stat.StatSubs = nil
