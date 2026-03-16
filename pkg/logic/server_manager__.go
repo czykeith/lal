@@ -166,6 +166,13 @@ Doc: %s
 		adapter := &gbLalAdapter{inner: sm}
 		sm.gb28181Server = gb28181.NewGB28181Server(gb28181Conf, adapter)
 		sm.gb28181Server.Start()
+		// 若独立配置文件中定义了上级平台的订阅关系，则在 gb28181Server 启动后进行初始化。
+		for _, sub := range sm.config.Gb28181Config.UpstreamSubs {
+			if err := sm.gb28181Server.AddUpstreamSub(sub.UpstreamID, sub.StreamName, sub.ChannelID); err != nil {
+				Log.Warnf("init gb28181 upstream sub failed. upstream=%s stream=%s channel=%s err=%+v",
+					sub.UpstreamID, sub.StreamName, sub.ChannelID, err)
+			}
+		}
 		Log.Infof("gb28181 server started (lalmax).")
 	}
 
@@ -1041,11 +1048,17 @@ func gb28181ConfigFromLogic(c Gb28181Config) gb28181.GB28181Config {
 			videoLevel = c.Video.Level
 		}
 	}
-	return gb28181.GB28181Config{
-		Enable:                   true,
-		ListenAddr:               "0.0.0.0",
-		SipIP:                    c.LocalSipIp,
-		SipPort:                  sipPort,
+	cfg := gb28181.GB28181Config{
+		Enable:     true,
+		ListenAddr: "0.0.0.0",
+		SipIP:      c.LocalSipIp,
+		SipPort:    sipPort,
+		UpstreamSipPort: func(v int) uint16 {
+			if v <= 0 {
+				return 5061
+			}
+			return uint16(v)
+		}(c.UpstreamSipPort),
 		Serial:                   c.LocalSipId,
 		Realm:                    realm,
 		Username:                 c.Username,
@@ -1069,7 +1082,39 @@ func gb28181ConfigFromLogic(c Gb28181Config) gb28181.GB28181Config {
 		RetryMaxCount:         defaultGb28181RetryMaxCount(c.AutoRetryOnDisconnect, c.RetryMaxCount),
 		RetryFirstDelayMs:     retryFirstDelayMs(c.RetryFirstDelayMs),
 		RetryMaxDelayMs:       retryMaxDelayMs(c.RetryMaxDelayMs),
+		CatalogQueryInterval:  c.CatalogQueryInterval,
 	}
+
+	// 映射上级平台配置（级联）
+	if len(c.Upstreams) > 0 {
+		cfg.Upstreams = make([]gb28181.GB28181UpstreamConfig, 0, len(c.Upstreams))
+		for _, u := range c.Upstreams {
+			up := gb28181.GB28181UpstreamConfig{
+				ID:               u.ID,
+				Enable:           u.Enable,
+				SipID:            u.SipID,
+				Realm:            u.Realm,
+				SipIP:            u.SipIP,
+				SipPort:          uint16(u.SipPort),
+				LocalDeviceID:    u.LocalDeviceID,
+				Username:         u.Username,
+				Password:         u.Password,
+				RegisterValidity: u.RegisterValidity,
+				KeepaliveInterval: func(v int) int {
+					if v <= 0 {
+						return 60
+					}
+					return v
+				}(u.KeepaliveInterval),
+				MediaIP:   u.MediaIP,
+				MediaPort: uint16(u.MediaPort),
+				Comment:   u.Comment,
+			}
+			cfg.Upstreams = append(cfg.Upstreams, up)
+		}
+	}
+
+	return cfg
 }
 
 func defaultGb28181RetryMaxCount(autoRetry bool, v int) int {

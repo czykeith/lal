@@ -375,6 +375,92 @@ func (sm *ServerManager) CtrlGb28181Invite(info base.ApiCtrlGb28181InviteReq) (r
 	return
 }
 
+// StatGb28181Upstreams 查询 GB28181 上级平台配置列表（中间平台模式）。
+// 注意：当前实现只读主配置与独立 upstream_config_file 中的内容，并不会通过此接口修改配置文件。
+func (sm *ServerManager) StatGb28181Upstreams() (ret base.ApiGb28181UpstreamListResp) {
+	ret.ErrorCode = base.ErrorCodeSucc
+	ret.Desp = base.DespSucc
+
+	conf := sm.config.Gb28181Config
+	upstreams := make([]base.ApiGb28181Upstream, 0, len(conf.Upstreams))
+	for _, u := range conf.Upstreams {
+		upstreams = append(upstreams, base.ApiGb28181Upstream{
+			ID:            u.ID,
+			Enable:        u.Enable,
+			SipID:         u.SipID,
+			Realm:         u.Realm,
+			SipIP:         u.SipIP,
+			SipPort:       u.SipPort,
+			LocalDeviceID: u.LocalDeviceID,
+			Comment:       u.Comment,
+		})
+	}
+	ret.Data.Upstreams = upstreams
+	return
+}
+
+// StatGb28181UpstreamSubs 查询指定上级平台当前的订阅流列表（以 stream_name 为标识）。
+// 数据来源为运行时 gb28181Server 内部的订阅表（而非配置文件）。
+func (sm *ServerManager) StatGb28181UpstreamSubs(upstreamID string) (ret base.ApiGb28181UpstreamSubsResp) {
+	ret.ErrorCode = base.ErrorCodeSucc
+	ret.Desp = base.DespSucc
+
+	if sm.gb28181Server == nil {
+		ret.ErrorCode = base.ErrorCodeGb28181QueryFail
+		ret.Desp = "gb28181 server not enabled"
+		return
+	}
+
+	subs := sm.gb28181Server.ListUpstreamSubs(upstreamID)
+	list := make([]base.ApiGb28181UpstreamSub, 0, len(subs))
+	for _, ssub := range subs {
+		list = append(list, base.ApiGb28181UpstreamSub{
+			UpstreamID: ssub.UpstreamID,
+			StreamName: ssub.StreamName,
+			ChannelID:  ssub.ChannelID,
+		})
+	}
+	ret.Data.UpstreamID = upstreamID
+	ret.Data.Subs = list
+	return
+}
+
+// CtrlGb28181UpstreamSubAdd 为指定上级平台新增订阅流（stream_name 级别）。
+// 注意：这是运行时行为，仅影响当前进程内的订阅表，不会自动写回 upstream_config_file。
+func (sm *ServerManager) CtrlGb28181UpstreamSubAdd(info base.ApiGb28181UpstreamSub) (ret base.ApiRespBasic) {
+	ret.ErrorCode = base.ErrorCodeSucc
+	ret.Desp = base.DespSucc
+
+	if sm.gb28181Server == nil {
+		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
+		ret.Desp = "gb28181 server not enabled"
+		return
+	}
+	if err := sm.gb28181Server.AddUpstreamSub(info.UpstreamID, info.StreamName, info.ChannelID); err != nil {
+		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
+		ret.Desp = err.Error()
+	}
+	return
+}
+
+// CtrlGb28181UpstreamSubDel 删除指定上级平台的一条订阅关系。
+// 同样仅修改运行时状态，如需持久化请同时更新 upstream_config_file。
+func (sm *ServerManager) CtrlGb28181UpstreamSubDel(info base.ApiGb28181UpstreamSub) (ret base.ApiRespBasic) {
+	ret.ErrorCode = base.ErrorCodeSucc
+	ret.Desp = base.DespSucc
+
+	if sm.gb28181Server == nil {
+		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
+		ret.Desp = "gb28181 server not enabled"
+		return
+	}
+	if err := sm.gb28181Server.RemoveUpstreamSub(info.UpstreamID, info.StreamName); err != nil {
+		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
+		ret.Desp = err.Error()
+	}
+	return
+}
+
 // CtrlGb28181Playback GB28181回放（lalmax：FindChannel + channel.Invite 带 Start/End）
 func (sm *ServerManager) CtrlGb28181Playback(info base.ApiCtrlGb28181PlaybackReq) (ret base.ApiCtrlGb28181PlaybackResp) {
 	sm.mutex.Lock()

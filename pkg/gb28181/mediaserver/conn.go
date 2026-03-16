@@ -232,6 +232,11 @@ func (c *Conn) Serve() (err error) {
 			c.lalSession = session
 		}
 		c.rtpPts = uint64(pkt.Header.Timestamp)
+		// 将该 RTP 包额外转发给已注册的上级 Sink（级联转推）。
+		if c.mediaServer != nil && c.streamName != "" {
+			c.mediaServer.ForwardRtp(c.streamName, pkt)
+		}
+
 		if c.demuxer != nil {
 			if c.psDumpFile != nil {
 				c.psDumpFile.WriteWithType(pkt.Payload, base.DumpTypePsRtpData)

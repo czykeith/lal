@@ -1,15 +1,18 @@
 package gb28181
 
 import (
+	"bytes"
 	"context"
-	"github.com/ghettovoice/gosip"
+	"encoding/xml"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/ghettovoice/gosip"
 	"github.com/ghettovoice/gosip/sip"
 	"github.com/q191201771/lal/pkg/base"
+	"golang.org/x/net/html/charset"
 )
 
 const TIME_LAYOUT = "2006-01-02T15:04:05"
@@ -141,6 +144,27 @@ func (d *Device) Catalog(conf GB28181Config) int {
 	resp, err := d.SipRequestForResponse(request)
 	if err == nil && resp != nil {
 		base.Log.Info("SIP->Catalog Response:", resp.String())
+
+		// 解析响应体中的 MANSCDP Catalog，更新本设备的通道列表。
+		body := resp.Body()
+		if body != "" {
+			temp := &struct {
+				XMLName    xml.Name
+				CmdType    string
+				SN         int
+				DeviceID   string
+				DeviceList []ChannelInfo `xml:"DeviceList>Item"`
+				SumNum     int
+			}{}
+			decoder := xml.NewDecoder(bytes.NewReader([]byte(body)))
+			decoder.CharsetReader = charset.NewReaderLabel
+			if decErr := decoder.Decode(temp); decErr != nil {
+				base.Log.Errorf("gb28181 catalog decode response body failed. device=%s err=%+v body=%s", d.ID, decErr, body)
+			} else if temp.CmdType == "Catalog" && len(temp.DeviceList) > 0 {
+				d.UpdateChannels(temp.DeviceList...)
+			}
+		}
+
 		return int(resp.StatusCode())
 	} else if err != nil {
 		base.Log.Error("SIP<-Catalog error:", err)
