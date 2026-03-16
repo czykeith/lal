@@ -129,7 +129,7 @@
     "log_group_max_group_num": 10,
     "log_group_max_sub_num_per_group": 10
   },
-"gb28181": {
+  "gb28181": {
     "enable": true,
     "local_sip_id": "42010000101234567123",
     "local_sip_ip": "192.168.110.164",
@@ -147,6 +147,8 @@
     "video_bitrate": 512,
     "video_framerate": 20,
     "video_level": "4.0",
+    "upstream_sip_port": 5061,
+    "upstream_enable": true,
     "upstream_config_file": "conf/gb28181_upstreams.json"
   }
 }

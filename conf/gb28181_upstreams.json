@@ -2,7 +2,7 @@
  "upstreams": [
      {
        "id": "center-a",
-       "enable": true,
+       "enable": false,
        "sip_id": "42010000101234567890",
        "realm": "houqinban.cn",
        "sip_ip": "192.168.110.110",

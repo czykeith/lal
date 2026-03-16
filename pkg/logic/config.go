@@ -229,6 +229,10 @@ type Gb28181Config struct {
 	// 若为 0，则内部会使用默认值 5061。
 	UpstreamSipPort int `json:"upstream_sip_port"`
 
+	// UpstreamEnable 是否启用 GB28181 上级模式（中间平台 / 级联网关）。
+	// 关闭时不会启动针对上级的 SIP Server，也不会向上级 REGISTER/Keepalive。
+	UpstreamEnable bool `json:"upstream_enable"`
+
 	// Upstreams 上级 GB28181 平台列表（级联）。
 	// 本服务在这些上级眼中以“设备”身份存在，用于实现级联转推。
 	Upstreams []Gb28181UpstreamConfig `json:"upstreams"`

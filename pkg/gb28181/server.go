@@ -191,14 +191,17 @@ func (s *GB28181Server) Start() {
 	s.sipUdpSvr = s.newSipServer("udp", s.conf.SipPort)
 	s.sipTcpSvr = s.newSipServer("tcp", s.conf.SipPort)
 
-	// 上级平台侧 SIP Server（仅 UDP，端口与下级分离）
-	if s.conf.UpstreamSipPort == 0 {
-		s.conf.UpstreamSipPort = 5061
-	}
-	s.upstreamSipSvr = s.newUpstreamSipServer("udp", s.conf.UpstreamSipPort)
+	// 上级平台侧（中间平台）仅在启用时启动。
+	if s.conf.UpstreamEnable {
+		// 上级平台侧 SIP Server（仅 UDP，端口与下级分离）
+		if s.conf.UpstreamSipPort == 0 {
+			s.conf.UpstreamSipPort = 5061
+		}
+		s.upstreamSipSvr = s.newUpstreamSipServer("udp", s.conf.UpstreamSipPort)
 
-	// 初始化上级 GB28181 平台（级联）客户端
-	s.initUpstreams()
+		// 初始化上级 GB28181 平台（级联）客户端
+		s.initUpstreams()
+	}
 	go s.startJob()
 }
 
@@ -218,6 +221,9 @@ type upstreamServer struct {
 	sn int
 
 	subs sync.Map // key=streamName, value=*UpstreamStreamSub
+
+	// 用于优雅退出 runUpstreamLoop 的控制通道。
+	stopCh chan struct{}
 }
 
 // UpstreamStreamSub 表示某个上级平台对本节点某一路 streamName 的订阅关系。
@@ -346,6 +352,19 @@ func (s *GB28181Server) ListUpstreamSubs(upstreamID string) []UpstreamStreamSub 
 	return out
 }
 
+// ClearAllUpstreamSubs 清空所有上级平台当前记录的订阅关系。
+// 用于从配置文件重新加载订阅时先清理旧的运行时状态。
+func (s *GB28181Server) ClearAllUpstreamSubs() {
+	s.upstreamsMu.RLock()
+	defer s.upstreamsMu.RUnlock()
+	for _, up := range s.upstreams {
+		up.subs.Range(func(key, _ any) bool {
+			up.subs.Delete(key)
+			return true
+		})
+	}
+}
+
 // invalidateUpstreamCatalogCache 在订阅关系变更时，清除指定上级的目录缓存。
 func (s *GB28181Server) invalidateUpstreamCatalogCache(upstreamID string) {
 	s.upstreamCatalogCacheMu.Lock()
@@ -361,7 +380,18 @@ func (s *GB28181Server) runUpstreamLoop(up *upstreamServer) {
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 
-	for range ticker.C {
+	for {
+		select {
+		case <-ticker.C:
+		default:
+		}
+
+		select {
+		case <-ticker.C:
+		case <-up.stopCh:
+			return
+		}
+
 		prevRegisterAt := up.lastRegisterOKAt
 
 		// 注册与续注册
@@ -1500,26 +1530,85 @@ func (s *GB28181Server) initUpstreams() {
 	}
 	if s.upstreamsByIP == nil {
 		s.upstreamsByIP = make(map[string]string)
+	} else {
+		// 保留现有上级的同时重建 IP 索引。
+		s.upstreamsByIPMu.Lock()
+		s.upstreamsByIP = make(map[string]string)
+		s.upstreamsByIPMu.Unlock()
 	}
 
 	for _, uc := range s.conf.Upstreams {
 		if !uc.Enable || uc.ID == "" {
 			continue
 		}
-		if _, ok := s.upstreams[uc.ID]; ok {
-			continue
+		if up, ok := s.upstreams[uc.ID]; ok {
+			// 已存在的上级仅更新配置，不重复启动循环。
+			up.conf = uc
+		} else {
+			up = &upstreamServer{
+				conf:   uc,
+				stopCh: make(chan struct{}),
+			}
+			s.upstreams[uc.ID] = up
+			// 启动上级注册/心跳循环
+			go s.runUpstreamLoop(up)
 		}
-
-		up := &upstreamServer{
-			conf: uc,
-		}
-		s.upstreams[uc.ID] = up
 		if uc.SipIP != "" {
 			s.upstreamsByIP[uc.SipIP] = uc.ID
 		}
+	}
+}
 
-		// 启动上级注册/心跳循环
-		go s.runUpstreamLoop(up)
+// ReloadUpstreams 仅根据新的上级配置刷新 upstreams，不影响下级 GB28181 设备接入。
+// - 新增的上级：创建 upstreamServer 并启动 runUpstreamLoop；
+// - 已存在的上级：仅更新 conf；
+// - 被删除的上级：发 stop 信号结束其 runUpstreamLoop，并从映射表中移除。
+func (s *GB28181Server) ReloadUpstreams(newConfs []GB28181UpstreamConfig) {
+	s.upstreamsMu.Lock()
+	defer s.upstreamsMu.Unlock()
+
+	old := s.upstreams
+	if old == nil {
+		old = make(map[string]*upstreamServer)
+	}
+	s.upstreams = make(map[string]*upstreamServer)
+
+	// 重建 IP 索引
+	s.upstreamsByIPMu.Lock()
+	s.upstreamsByIP = make(map[string]string)
+	s.upstreamsByIPMu.Unlock()
+
+	for _, uc := range newConfs {
+		if !uc.Enable || uc.ID == "" {
+			continue
+		}
+		if upOld, ok := old[uc.ID]; ok {
+			upOld.conf = uc
+			s.upstreams[uc.ID] = upOld
+		} else {
+			up := &upstreamServer{
+				conf:   uc,
+				stopCh: make(chan struct{}),
+			}
+			s.upstreams[uc.ID] = up
+			go s.runUpstreamLoop(up)
+		}
+		if uc.SipIP != "" {
+			s.upstreamsByIPMu.Lock()
+			s.upstreamsByIP[uc.SipIP] = uc.ID
+			s.upstreamsByIPMu.Unlock()
+		}
+	}
+
+	// 对于不再存在的上级，发 stop 信号结束其循环。
+	for id, up := range old {
+		if _, ok := s.upstreams[id]; !ok {
+			// 清理该上级下所有上级播放会话和转发 Sink。
+			s.cleanupUpstreamSessionsForUpstream(id, true)
+			if up.stopCh != nil {
+				close(up.stopCh)
+			}
+		}
 	}
 }
 func (s *GB28181Server) newSipServer(network string, port uint16) gosip.Server {
@@ -2645,6 +2734,90 @@ func (s *GB28181Server) cleanupUpstreamSessionForChannel(upstreamID, channelID s
 		s.upstreamSessions.Delete(key)
 		return true
 	})
+}
+
+// cleanupUpstreamSessionsForUpstream 清理指定上级平台下所有上级播放会话和转发 Sink。
+// 当上级配置被删除或重启时，用于优雅结束现有播放转发，避免上级继续推流到无效会话。
+func (s *GB28181Server) cleanupUpstreamSessionsForUpstream(upstreamID string, sendBye bool) {
+	if upstreamID == "" {
+		return
+	}
+	s.upstreamSessions.Range(func(key, value any) bool {
+		sess, ok := value.(*UpstreamSession)
+		if !ok || sess.UpstreamID != upstreamID {
+			return true
+		}
+
+		// 可选：先向上级发送 BYE，结束 SIP 会话。
+		if sendBye {
+			s.sendUpstreamBye(sess)
+		}
+
+		// 移除对应的上级 Sink 转发。
+		if sess.MediaKey != "" && sess.SinkID != "" {
+			if v, ok2 := s.MediaServerMap.Load(sess.MediaKey); ok2 {
+				if mediasvr, ok3 := v.(*mediaserver.GB28181MediaServer); ok3 {
+					mediasvr.RemoveUpstreamSink(sess.SinkID)
+				}
+			}
+		}
+
+		s.upstreamSessions.Delete(key)
+		return true
+	})
+}
+
+// reconcileUpstreamSessionsWithSubs 在订阅关系发生变化后，对当前所有上级播放会话进行对齐：
+// - 若某会话对应的 (UpstreamID, DeviceID, StreamName) 不再出现在订阅表中，则主动结束该会话并关闭转发。
+func (s *GB28181Server) reconcileUpstreamSessionsWithSubs() {
+	s.upstreamSessions.Range(func(key, value any) bool {
+		sess, ok := value.(*UpstreamSession)
+		if !ok {
+			return true
+		}
+		upID := sess.UpstreamID
+		channelID := sess.DeviceID
+		streamName := sess.StreamName
+		if upID == "" || channelID == "" || streamName == "" {
+			return true
+		}
+
+		// 检查当前会话是否仍被订阅允许。
+		allowed := false
+		s.upstreamsMu.RLock()
+		up, ok2 := s.upstreams[upID]
+		s.upstreamsMu.RUnlock()
+		if ok2 && up != nil {
+			up.subs.Range(func(_, v any) bool {
+				if sub, ok3 := v.(*UpstreamStreamSub); ok3 {
+					if sub.StreamName == streamName && sub.ChannelID == channelID {
+						allowed = true
+						return false
+					}
+				}
+				return true
+			})
+		}
+
+		if !allowed {
+			// 不再允许的会话：向上级发送 BYE，关闭 sink，并删除会话。
+			s.sendUpstreamBye(sess)
+			if sess.MediaKey != "" && sess.SinkID != "" {
+				if v, ok2 := s.MediaServerMap.Load(sess.MediaKey); ok2 {
+					if mediasvr, ok3 := v.(*mediaserver.GB28181MediaServer); ok3 {
+						mediasvr.RemoveUpstreamSink(sess.SinkID)
+					}
+				}
+			}
+			s.upstreamSessions.Delete(key)
+		}
+		return true
+	})
+}
+
+// ReconcileUpstreamSessionsWithSubs 为导出封装，供 logic 层调用，用于在订阅关系重载后对正在转发的会话做一次对齐。
+func (s *GB28181Server) ReconcileUpstreamSessionsWithSubs() {
+	s.reconcileUpstreamSessionsWithSubs()
 }
 
 func (s *GB28181Server) StoreDevice(id string, req sip.Request) (d *Device) {

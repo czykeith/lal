@@ -173,7 +173,7 @@ Doc: %s
 					sub.UpstreamID, sub.StreamName, sub.ChannelID, err)
 			}
 		}
-		Log.Infof("gb28181 server started (lalmax).")
+		Log.Infof("gb28181 server started . upsteam_enable=%v", sm.config.Gb28181Config.UpstreamEnable)
 	}
 
 	if sm.config.PprofConfig.Enable {
@@ -1089,6 +1089,7 @@ func gb28181ConfigFromLogic(c Gb28181Config) gb28181.GB28181Config {
 		RetryFirstDelayMs:     retryFirstDelayMs(c.RetryFirstDelayMs),
 		RetryMaxDelayMs:       retryMaxDelayMs(c.RetryMaxDelayMs),
 		CatalogQueryInterval:  c.CatalogQueryInterval,
+		UpstreamEnable:        c.UpstreamEnable,
 	}
 
 	// 映射上级平台配置（级联）

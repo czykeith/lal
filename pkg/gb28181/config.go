@@ -34,6 +34,10 @@ type GB28181Config struct {
 	// 若配置值 <=0，则在 gb28181Server 中采用默认值 180 秒。
 	CatalogQueryInterval int `json:"catalog_query_interval"`
 
+	// UpstreamEnable 是否启用 GB28181 上级模式（中间平台功能）。
+	// 关闭时不会监听 upstream_sip_port，也不会向上级 REGISTER/Keepalive。
+	UpstreamEnable bool `json:"upstream_enable"`
+
 	// 上级 GB28181 消息监听端口（中间平台模式下对上级开放的 SIP 端口），仅供自定义 REGISTER 使用。
 	// 设备接入仍使用 sip_port。本字段主要用于自定义 UDP 客户端绑定本地端口，避免与设备侧 5060 端口混用。
 	// 默认 5061。

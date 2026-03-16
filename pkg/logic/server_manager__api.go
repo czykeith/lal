@@ -9,8 +9,10 @@
 package logic
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -599,6 +601,94 @@ func (sm *ServerManager) CtrlGb28181Playback(info base.ApiCtrlGb28181PlaybackReq
 	if port := parseGb28181MediaPort(ch.MediaInfo.MediaKey); port > 0 {
 		ret.Data.Port = port
 	}
+	return
+}
+
+// CtrlGb28181UpstreamsConfSet 覆盖写入 gb28181 上级配置文件（例如 conf/gb28181_upstreams.json）。
+// 注意：该接口只负责写盘，不会自动重启 gb28181Server。
+func (sm *ServerManager) CtrlGb28181UpstreamsConfSet(confFile Gb28181UpstreamConfigFile) (ret base.ApiRespBasic) {
+	ret.ErrorCode = base.ErrorCodeSucc
+	ret.Desp = base.DespSucc
+
+	path := sm.config.Gb28181Config.UpstreamConfigFile
+	if path == "" {
+		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
+		ret.Desp = "gb28181.upstream_config_file is empty"
+		return
+	}
+
+	// 使用与 LoadConfAndInitLog 相同的结构，直接写回 JSON。
+	data, err := json.MarshalIndent(confFile, "", "  ")
+	if err != nil {
+		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
+		ret.Desp = fmt.Sprintf("marshal upstream config failed: %v", err)
+		return
+	}
+
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
+		ret.Desp = fmt.Sprintf("write upstream config file failed: %v", err)
+		return
+	}
+	return
+}
+
+// CtrlGb28181UpstreamsReload 从 upstream_config_file 重新加载上级平台配置，并重启 gb28181 中间平台服务。
+// 实际流程：
+// 1) 读取并解析配置文件到 Gb28181UpstreamConfigFile；
+// 2) 覆盖 sm.config.Gb28181Config.Upstreams / UpstreamSubs；
+// 3) Dispose 旧的 gb28181Server（若存在），再按当前配置新建并 Start；
+// 4) 将 UpstreamSubs 通过 AddUpstreamSub 注入运行时订阅表。
+func (sm *ServerManager) CtrlGb28181UpstreamsReload() (ret base.ApiRespBasic) {
+	ret.ErrorCode = base.ErrorCodeSucc
+	ret.Desp = base.DespSucc
+
+	path := sm.config.Gb28181Config.UpstreamConfigFile
+	if path == "" {
+		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
+		ret.Desp = "gb28181.upstream_config_file is empty"
+		return
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
+		ret.Desp = fmt.Sprintf("read upstream config file failed: %v", err)
+		return
+	}
+
+	var file Gb28181UpstreamConfigFile
+	if err := json.Unmarshal(data, &file); err != nil {
+		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
+		ret.Desp = fmt.Sprintf("unmarshal upstream config file failed: %v", err)
+		return
+	}
+
+	// 覆盖逻辑配置中的 Upstreams / UpstreamSubs
+	sm.config.Gb28181Config.Upstreams = file.Upstreams
+	sm.config.Gb28181Config.UpstreamSubs = file.Subs
+
+	// 若 gb28181 未启用，仅更新配置即可。
+	if !sm.config.Gb28181Config.Enable || sm.gb28181Server == nil {
+		return
+	}
+
+	// 仅刷新上级平台相关配置，不重启其他 GB28181 服务。
+	gbConf := gb28181ConfigFromLogic(sm.config.Gb28181Config)
+	sm.gb28181Server.ReloadUpstreams(gbConf.Upstreams)
+
+	// 重建运行时订阅表：先清空，再按配置文件重建。
+	sm.gb28181Server.ClearAllUpstreamSubs()
+	for _, sub := range sm.config.Gb28181Config.UpstreamSubs {
+		if err := sm.gb28181Server.AddUpstreamSub(sub.UpstreamID, sub.StreamName, sub.ChannelID); err != nil {
+			Log.Warnf("reload gb28181 upstream sub failed. upstream=%s stream=%s channel=%s err=%+v",
+				sub.UpstreamID, sub.StreamName, sub.ChannelID, err)
+		}
+	}
+
+	// 订阅关系变化后，对当前正在转发的上级播放会话做一次对齐：
+	// 对于已存在但不再被订阅允许的会话，主动发 BYE 并关闭对应的转发 Sink。
+	sm.gb28181Server.ReconcileUpstreamSessionsWithSubs()
 	return
 }
 
