@@ -143,6 +143,11 @@ type Group struct {
 	rtspPullDumpFile *base.DumpFile
 }
 
+// HasHlsSubSession 返回当前 Group 是否还有 HLS 订阅者。
+func (group *Group) HasHlsSubSession() bool {
+	return len(group.hlsSubSessionSet) > 0
+}
+
 func NewGroup(appName string, streamName string, config *Config, option GroupOption, observer IGroupObserver) *Group {
 	uk := base.GenUkGroup()
 
