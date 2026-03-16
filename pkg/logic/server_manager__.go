@@ -851,6 +851,12 @@ func (sm *ServerManager) OnDelHlsSubSession(session *hls.SubSession) {
 	info.HasInSession = group.HasInSession()
 	info.HasOutSession = group.HasOutSession()
 	sm.nhOnSubStop(info)
+
+	// 当最后一个 HLS 订阅者离开，且当前没有任何输入/输出会话时，
+	// 立即停止 HLS Muxer，并触发 HLS 目录清理（包括内存模式下的片段释放），以降低内存占用。
+	if !group.HasInSession() && !group.HasOutSession() && !group.HasHlsSubSession() {
+		group.stopHlsIfNeeded()
+	}
 }
 
 // ----- implement IGroupCreator interface -----------------------------------------------------------------------------

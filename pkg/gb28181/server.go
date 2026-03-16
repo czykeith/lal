@@ -49,6 +49,11 @@ type GB28181Server struct {
 	MediaServerMap sync.Map
 	disposeOnce    sync.Once
 
+	// streamMediasvrIndex 维护 streamName -> GB28181MediaServer 的快速索引，
+	// 用于加速上级 INVITE 查找 mediaserver 以及 Catalog 状态判断。
+	streamMediasvrIndexMu sync.RWMutex
+	streamMediasvrIndex   map[string]*mediaserver.GB28181MediaServer
+
 	// playbackSessions 记录回放会话的过期时间，key 为 streamName
 	playbackSessions sync.Map
 	// playbackScales 记录回放会话的倍速配置，key 为 streamName，value 为 float64 倍速（>0，1 表示正常速度）
@@ -60,8 +65,17 @@ type GB28181Server struct {
 	upstreamsMu sync.RWMutex
 	upstreams   map[string]*upstreamServer
 
+	// upstreamsByIP 额外维护 SipIP -> upstreamID 的索引，加速通过 Source IP 反查上级平台。
+	upstreamsByIPMu sync.RWMutex
+	upstreamsByIP   map[string]string
+
 	// 上级播放会话，key = Call-ID
 	upstreamSessions sync.Map // map[string]*UpstreamSession
+
+	// upstreamSessionsByChannel 维护 (upstreamID, channelID) -> Call-ID 集合 的索引，
+	// 用于按通道维度快速清理上级会话和对应的转发 sink。
+	upstreamSessionsByChannelMu sync.RWMutex
+	upstreamSessionsByChannel   map[string]map[string]*UpstreamSession
 
 	// upstreamCatalogCache 缓存为上级构造的 Catalog 设备列表，key = upstreamID。
 	// 由于下级设备目录和订阅关系不会在毫秒级频繁变化，可以做一个短 TTL 的只读缓存，
@@ -137,16 +151,19 @@ func NewGB28181Server(conf GB28181Config, lal mediaserver.ILalServer) *GB28181Se
 		conf.MediaConfig.MultiPortMaxIncrement = 3000
 	}
 	gb28181Server := &GB28181Server{
-		conf:               conf,
-		RegisterValidity:   3600 * time.Second,
-		HeartbeatInterval:  60 * time.Second,
-		RemoveBanInterval:  600 * time.Second,
-		PlaybackSessionTTL: 3 * time.Hour,
-		keepaliveInterval:  conf.KeepaliveInterval,
-		lalServer:          lal,
-		udpAvailConnPool:   NewAvailConnPool(conf.MediaConfig.ListenPort+1, conf.MediaConfig.ListenPort+conf.MediaConfig.MultiPortMaxIncrement),
-		tcpAvailConnPool:   NewAvailConnPool(conf.MediaConfig.ListenPort+1, conf.MediaConfig.ListenPort+conf.MediaConfig.MultiPortMaxIncrement),
-		upstreams:          make(map[string]*upstreamServer),
+		conf:                      conf,
+		RegisterValidity:          3600 * time.Second,
+		HeartbeatInterval:         60 * time.Second,
+		RemoveBanInterval:         600 * time.Second,
+		PlaybackSessionTTL:        3 * time.Hour,
+		keepaliveInterval:         conf.KeepaliveInterval,
+		lalServer:                 lal,
+		udpAvailConnPool:          NewAvailConnPool(conf.MediaConfig.ListenPort+1, conf.MediaConfig.ListenPort+conf.MediaConfig.MultiPortMaxIncrement),
+		tcpAvailConnPool:          NewAvailConnPool(conf.MediaConfig.ListenPort+1, conf.MediaConfig.ListenPort+conf.MediaConfig.MultiPortMaxIncrement),
+		upstreams:                 make(map[string]*upstreamServer),
+		streamMediasvrIndex:       make(map[string]*mediaserver.GB28181MediaServer),
+		upstreamsByIP:             make(map[string]string),
+		upstreamSessionsByChannel: make(map[string]map[string]*UpstreamSession),
 	}
 	gb28181Server.tcpAvailConnPool.onListenWithPort = func(port uint16) (net.Listener, error) {
 		return net.Listen("tcp", fmt.Sprintf(":%d", port))
@@ -245,9 +262,10 @@ type upstreamChannelInfo struct {
 	Latitude     string        `xml:"Latitude"`
 
 	// 媒体相关的可选字段：保留 IsInvite/SSRC/StreamName/SinglePort/DumpFileName，去除 MediaKey。
-	IsInvite     bool   `xml:"IsInvite,omitempty"`
-	Ssrc         string `xml:"Ssrc,omitempty"`
-	StreamName   string `xml:"StreamName,omitempty"`
+	IsInvite bool   `xml:"IsInvite,omitempty"`
+	Ssrc     string `xml:"Ssrc,omitempty"`
+	// StreamName 仅用于内部状态判断，不再对上级输出。
+	StreamName   string `xml:"-"`
 	SinglePort   bool   `xml:"SinglePort,omitempty"`
 	DumpFileName string `xml:"DumpFileName,omitempty"`
 }
@@ -266,8 +284,8 @@ type catalogResponse struct {
 // AddUpstreamSub 在指定上级平台新增或更新一个基于 streamName 的订阅关系。
 // 实际的 REGISTER / Invite / Bye 逻辑后续在 invite-bye-skeleton 步骤中补充。
 func (s *GB28181Server) AddUpstreamSub(upstreamID, streamName, channelID string) error {
-	if upstreamID == "" || streamName == "" {
-		return fmt.Errorf("upstreamID and streamName are required")
+	if upstreamID == "" || streamName == "" || channelID == "" {
+		return fmt.Errorf("upstreamID, streamName and channelID are required")
 	}
 	s.upstreamsMu.RLock()
 	up, ok := s.upstreams[upstreamID]
@@ -366,8 +384,8 @@ func (s *GB28181Server) runUpstreamLoop(up *upstreamServer) {
 
 // ensureUpstreamRegister 确保与上级的平台注册处于有效期内。
 // 实现：
-//  - 首次或过期时发送一次不带 Authorization 的 REGISTER；
-//  - 无论是否成功解析 401，都再发送一次带 Authorization 的 REGISTER。
+//   - 首次或过期时发送一次不带 Authorization 的 REGISTER；
+//   - 无论是否成功解析 401，都再发送一次带 Authorization 的 REGISTER。
 func (s *GB28181Server) ensureUpstreamRegister(up *upstreamServer) error {
 	now := time.Now()
 	validSec := up.conf.RegisterValidity
@@ -453,12 +471,22 @@ func (s *GB28181Server) OnUpstreamInvite(req sip.Request, tx sip.ServerTransacti
 		up   *upstreamServer
 		upID string
 	)
+	// 先通过 IP 索引快速定位上级 ID，失败再回退遍历。
+	s.upstreamsByIPMu.RLock()
+	if id, ok := s.upstreamsByIP[srcHost]; ok {
+		upID = id
+	}
+	s.upstreamsByIPMu.RUnlock()
 	s.upstreamsMu.RLock()
-	for id, u := range s.upstreams {
-		if u.conf.SipIP == srcHost {
-			up = u
-			upID = id
-			break
+	if upID != "" {
+		up = s.upstreams[upID]
+	} else {
+		for id, u := range s.upstreams {
+			if u.conf.SipIP == srcHost {
+				up = u
+				upID = id
+				break
+			}
 		}
 	}
 	s.upstreamsMu.RUnlock()
@@ -470,56 +498,100 @@ func (s *GB28181Server) OnUpstreamInvite(req sip.Request, tx sip.ServerTransacti
 
 	base.Log.Infof("gb28181 upstream INVITE from=%s source=%s\n%s", upID, source, req.String())
 
-	// 解析 MANSCDP XML，提取 CmdType/DeviceID
-	temp := &struct {
-		XMLName  xml.Name
-		CmdType  string
-		DeviceID string
-	}{}
-	if body := req.Body(); body != "" {
-		decoder := xml.NewDecoder(bytes.NewReader([]byte(body)))
-		decoder.CharsetReader = charset.NewReaderLabel
-		_ = decoder.Decode(temp)
+	// 解析 INVITE 中的通道标识。
+	// 上级通常使用两种方式：
+	// 1) 传统 MANSCDP XML（Body 为 Application/MANSCDP+xml，包含 CmdType=Play 和 DeviceID）；
+	// 2) 仅携带 SDP（常见为 application/sdp），通过 Subject 或 To/Request-URI 传递通道 ID。
+	var channelID string
+	bodyRaw := strings.TrimSpace(req.Body())
+	if strings.HasPrefix(bodyRaw, "<") {
+		// 方式 1：MANSCDP XML
+		temp := &struct {
+			XMLName  xml.Name
+			CmdType  string
+			DeviceID string
+		}{}
+		if bodyRaw != "" {
+			decoder := xml.NewDecoder(bytes.NewReader([]byte(bodyRaw)))
+			decoder.CharsetReader = charset.NewReaderLabel
+			_ = decoder.Decode(temp)
+		}
+		if temp.CmdType != "Play" {
+			base.Log.Warnf("gb28181 upstream invite unsupported CmdType=%s", temp.CmdType)
+			_ = tx.Respond(sip.NewResponseFromRequest("", req, http.StatusBadRequest, "unsupported CmdType", ""))
+			return
+		}
+		channelID = temp.DeviceID
+	} else {
+		// 方式 2：纯 SDP INVITE。这里以 Subject 中的“目标通道/平台 ID”为准：
+		// Subject: <channelID>:0,<deviceID>:0
+		var subjVal string
+		for _, h := range req.Headers() {
+			if strings.EqualFold(h.Name(), "Subject") {
+				subjVal = h.Value()
+				break
+			}
+		}
+		if subjVal != "" {
+			parts := strings.Split(subjVal, ",")
+			if len(parts) > 0 {
+				// 取 Subject 中的第一个 <channelID>:0 作为通道 ID，
+				// 例如 "34020000002000000001:0,42010000101234567890:0" => 34020000002000000001
+				first := parts[0]
+				if idx := strings.IndexByte(first, ':'); idx > 0 {
+					channelID = strings.TrimSpace(first[:idx])
+				} else {
+					channelID = strings.TrimSpace(first)
+				}
+			}
+		}
 	}
-	if temp.CmdType != "Play" {
-		base.Log.Warnf("gb28181 upstream invite unsupported CmdType=%s", temp.CmdType)
-		_ = tx.Respond(sip.NewResponseFromRequest("", req, http.StatusBadRequest, "unsupported CmdType", ""))
-		return
-	}
-	channelID := temp.DeviceID
 	if channelID == "" {
-		base.Log.Warnf("gb28181 upstream invite missing DeviceID")
+		base.Log.Warnf("gb28181 upstream invite missing DeviceID/Subject channel id")
 		_ = tx.Respond(sip.NewResponseFromRequest("", req, http.StatusBadRequest, "missing DeviceID", ""))
 		return
 	}
-
-	// 根据 DeviceID 在本地查找通道信息（这里默认 DeviceID == ChannelId）
+	// 先尝试在上级订阅表中，通过订阅时配置的 channel_id 映射到本地 streamName。
+	// 这样可支持“非下级 GB28181 流”的订阅播放。
 	var chFound *Channel
-	var devID string
-	Devices.Range(func(_, dv any) bool {
-		d := dv.(*Device)
-		if v, ok2 := d.channelMap.Load(channelID); ok2 {
-			chFound = v.(*Channel)
-			devID = d.ID
+	var streamName string
+	up.subs.Range(func(_, v any) bool {
+		sub, ok2 := v.(*UpstreamStreamSub)
+		if !ok2 {
+			return true
+		}
+		if sub.ChannelID == channelID && sub.StreamName != "" {
+			streamName = sub.StreamName
 			return false
 		}
 		return true
 	})
-	if chFound == nil {
-		base.Log.Warnf("gb28181 upstream invite channel not found. deviceID=%s", channelID)
-		_ = tx.Respond(sip.NewResponseFromRequest("", req, http.StatusNotFound, "channel not found", ""))
-		return
-	}
 
-	// 从通道信息中获取本地 streamName（优先 MediaInfo.StreamName，其次 Channel.StreamName）
-	streamName := chFound.MediaInfo.StreamName
+	// 若订阅中未找到映射关系，再退回到“下级 GB28181 通道 DeviceID == channelId”的传统查找方式。
 	if streamName == "" {
-		streamName = chFound.StreamName
-	}
-	if streamName == "" {
-		base.Log.Warnf("gb28181 upstream invite no streamName for channel=%s", channelID)
-		_ = tx.Respond(sip.NewResponseFromRequest("", req, http.StatusNotFound, "stream not found", ""))
-		return
+		Devices.Range(func(_, dv any) bool {
+			d := dv.(*Device)
+			if v, ok2 := d.channelMap.Load(channelID); ok2 {
+				chFound = v.(*Channel)
+				return false
+			}
+			return true
+		})
+		if chFound == nil {
+			base.Log.Warnf("gb28181 upstream invite channel not found. deviceID=%s", channelID)
+			_ = tx.Respond(sip.NewResponseFromRequest("", req, http.StatusNotFound, "channel not found", ""))
+			return
+		}
+		// 从通道信息中获取本地 streamName（优先 MediaInfo.StreamName，其次 Channel.StreamName）
+		streamName = chFound.MediaInfo.StreamName
+		if streamName == "" {
+			streamName = chFound.StreamName
+		}
+		if streamName == "" {
+			base.Log.Warnf("gb28181 upstream invite no streamName for channel=%s", channelID)
+			_ = tx.Respond(sip.NewResponseFromRequest("", req, http.StatusNotFound, "stream not found", ""))
+			return
+		}
 	}
 
 	// 校验该 streamName 是否在该上级的订阅列表中（作为权限控制）
@@ -541,10 +613,11 @@ func (s *GB28181Server) OnUpstreamInvite(req sip.Request, tx sip.ServerTransacti
 		return
 	}
 
-	// 解析上级 SDP，获取媒体接收 IP/端口
+	// 解析上级 SDP，获取媒体接收 IP/端口和 SSRC（y=）
 	var remoteIP string
 	var remotePort int
 	var sdpLines []string
+	var remoteSSRC string
 	isPlayback := false
 	if body := req.Body(); body != "" {
 		sdpLines = strings.Split(body, "\r\n")
@@ -559,6 +632,9 @@ func (s *GB28181Server) OnUpstreamInvite(req sip.Request, tx sip.ServerTransacti
 						remotePort = p
 					}
 				}
+			}
+			if strings.HasPrefix(l, "y=") {
+				remoteSSRC = strings.TrimSpace(strings.TrimPrefix(l, "y="))
 			}
 			// 回放场景通常会携带 u=<channelId>:0 字段（与下级点播保持一致约定）
 			if strings.HasPrefix(l, "u=") && strings.HasSuffix(l, ":0") {
@@ -597,28 +673,40 @@ func (s *GB28181Server) OnUpstreamInvite(req sip.Request, tx sip.ServerTransacti
 		CreatedAt:  time.Now(),
 	}
 
-	// 尝试找到当前 stream 对应的 GB28181MediaServer，并为其增加一个上级转推目标（Sink）。
+	// 尝试找到当前 streamName 对应的 GB28181MediaServer，并为其增加一个上级转推目标（Sink）。
+	// 以 streamName 为唯一依据，优先通过 streamMediasvrIndex 命中，必要时再 fallback 到旧逻辑。
 	var mediasvr *mediaserver.GB28181MediaServer
-	// 优先使用 deviceId+channelId 作为 key（与 OnStartMediaServer 中的存储方式保持一致）。
-	if devID != "" {
-		if v, ok := s.MediaServerMap.Load(fmt.Sprintf("%s%s", devID, channelID)); ok {
-			mediasvr = v.(*mediaserver.GB28181MediaServer)
-		}
-	}
-	// 回退：根据 MediaKey（如 "udp30000"）查找。
-	if mediasvr == nil && chFound.MediaInfo.MediaKey != "" {
-		if v, ok := s.MediaServerMap.Load(chFound.MediaInfo.MediaKey); ok {
-			mediasvr = v.(*mediaserver.GB28181MediaServer)
-		}
+	s.streamMediasvrIndexMu.RLock()
+	mediasvr = s.streamMediasvrIndex[streamName]
+	s.streamMediasvrIndexMu.RUnlock()
+	if mediasvr == nil {
+		// fallback：遍历 MediaServerMap + HasStream，兼容索引尚未建立的场景。
+		s.MediaServerMap.Range(func(_, v any) bool {
+			ms, ok := v.(*mediaserver.GB28181MediaServer)
+			if !ok {
+				return true
+			}
+			if ms.HasStream(streamName) {
+				mediasvr = ms
+				return false
+			}
+			return true
+		})
 	}
 	if mediasvr == nil {
-		base.Log.Warnf("gb28181 upstream invite: mediaserver not found. deviceID=%s channelID=%s mediaKey=%s",
-			devID, channelID, chFound.MediaInfo.MediaKey)
+		base.Log.Warnf("gb28181 upstream invite: mediaserver not found for streamName=%s", streamName)
 		_ = tx.Respond(sip.NewResponseFromRequest("", req, http.StatusServiceUnavailable, "mediaserver not found", ""))
 		return
 	}
 
-	sinkID, err := mediasvr.AddUpstreamSink(streamName, remoteIP, remotePort)
+	// 将上级期望的 SSRC 传入 mediaserver，后续转发时重写 RTP SSRC 与 y= 保持一致。
+	var ssrcUint uint32
+	if remoteSSRC != "" {
+		if v, err := strconv.ParseUint(remoteSSRC, 10, 32); err == nil {
+			ssrcUint = uint32(v)
+		}
+	}
+	sinkID, err := mediasvr.AddUpstreamSink(streamName, remoteIP, remotePort, ssrcUint)
 	if err != nil {
 		base.Log.Warnf("gb28181 upstream invite: add sink failed. stream=%s remote=%s:%d err=%+v",
 			streamName, remoteIP, remotePort, err)
@@ -630,14 +718,63 @@ func (s *GB28181Server) OnUpstreamInvite(req sip.Request, tx sip.ServerTransacti
 	sess.MediaKey = mediasvr.GetMediaKey()
 	s.upstreamSessions.Store(callIDStr, sess)
 
-	// 构造 200 OK 响应，附带 SDP，尽量与上级 INVITE 的 SDP 对齐。
-	sdpResp := strings.Join(sdpLines, "\r\n")
-	resp := sip.NewResponseFromRequest("", req, http.StatusOK, "OK", "")
-	if sdpResp != "" {
-		ct := sip.ContentType("application/sdp")
-		resp.AppendHeader(&ct)
-		resp.SetBody(sdpResp, true)
+	// 构造 200 OK 响应，按 GB28181 标准返回 SDP（参考实际设备侧响应）：
+	// v=0
+	// o=<ChannelID> 0 0 IN IP4 <本机媒体IP>
+	// s=Play
+	// c=IN IP4 <本机媒体IP>
+	// t=0 0
+	// m=video <本机媒体端口> RTP/AVP 96
+	// a=rtpmap:96 PS/90000
+	// a=sendonly
+	// y=<SSRC>
+	// f=...（可选）
+	// o=/c= 中的 IP 按 GB28181 标准，使用本设备的媒体 IP：
+	// 1) 优先使用上级配置中的 media_ip；
+	// 2) 其次使用本地 GB28181 媒体配置的 MediaIp；
+	// 3) 最后回退使用 sip_ip。
+	mediaIP := up.conf.MediaIP
+	if mediaIP == "" {
+		mediaIP = s.conf.MediaConfig.MediaIp
 	}
+	if mediaIP == "" {
+		mediaIP = s.conf.SipIP
+	}
+	mediaPort := mediasvr.GetListenerPort()
+	// y 行的 SSRC 与上级请求保持一致；若上级未提供则生成一个。
+	ssrc := remoteSSRC
+	if ssrc == "" {
+		ssrc = RandNumString(10)
+	}
+	sdpResp := fmt.Sprintf("v=0\r\n"+
+		"o=%s 0 0 IN IP4 %s\r\n"+
+		"s=Play\r\n"+
+		"c=IN IP4 %s\r\n"+
+		"t=0 0\r\n"+
+		"m=video %d RTP/AVP 96\r\n"+
+		"a=rtpmap:96 PS/90000\r\n"+
+		"a=sendonly\r\n"+
+		"y=%s\r\n"+
+		"f=v/////a/1/8/1\r\n",
+		channelID, mediaIP,
+		mediaIP,
+		mediaPort,
+		ssrc,
+	)
+
+	resp := sip.NewResponseFromRequest("", req, http.StatusOK, "OK", "")
+	ct := sip.ContentType("Application/SDP")
+	resp.AppendHeader(&ct)
+	// 按 GB28181 设备侧习惯，补充一个以通道 ID 和本机 SIP IP 为主的 Contact，便于上级后续 BYE/UPDATE 等路由。
+	contactAddr := sip.Address{
+		Uri: &sip.SipUri{
+			FUser: sip.String{Str: channelID},
+			FHost: s.conf.SipIP,
+			FPort: nil,
+		},
+	}
+	resp.AppendHeader(contactAddr.AsContactHeader())
+	resp.SetBody(sdpResp, true)
 	_ = tx.Respond(resp)
 }
 
@@ -664,12 +801,21 @@ func (s *GB28181Server) OnUpstreamMessage(req sip.Request, tx sip.ServerTransact
 		up   *upstreamServer
 		upID string
 	)
+	s.upstreamsByIPMu.RLock()
+	if id, ok := s.upstreamsByIP[srcHost]; ok {
+		upID = id
+	}
+	s.upstreamsByIPMu.RUnlock()
 	s.upstreamsMu.RLock()
-	for id, u := range s.upstreams {
-		if u.conf.SipIP == srcHost {
-			up = u
-			upID = id
-			break
+	if upID != "" {
+		up = s.upstreams[upID]
+	} else {
+		for id, u := range s.upstreams {
+			if u.conf.SipIP == srcHost {
+				up = u
+				upID = id
+				break
+			}
 		}
 	}
 	s.upstreamsMu.RUnlock()
@@ -724,7 +870,67 @@ func (s *GB28181Server) OnUpstreamMessage(req sip.Request, tx sip.ServerTransact
 // 目前直接复用现有 OnBye 逻辑（其中已先处理 upstreamSessions 再处理下级设备）。
 func (s *GB28181Server) OnUpstreamBye(req sip.Request, tx sip.ServerTransaction) {
 	base.Log.Info("SIP<-OnUpstreamBye, source:", req.Source(), " req:", req.String())
-	s.OnBye(req, tx)
+
+	// 先按 Call-ID 正常处理（标准路径）。
+	callID, _ := req.CallID()
+	if callID != nil {
+		if v, ok := s.upstreamSessions.Load(callID.Value()); ok {
+			if sess, ok2 := v.(*UpstreamSession); ok2 {
+				// 清理 Sink
+				if sess.MediaKey != "" && sess.SinkID != "" {
+					if mv, ok3 := s.MediaServerMap.Load(sess.MediaKey); ok3 {
+						if mediasvr, ok4 := mv.(*mediaserver.GB28181MediaServer); ok4 {
+							mediasvr.RemoveUpstreamSink(sess.SinkID)
+						}
+					}
+				}
+				s.upstreamSessions.Delete(callID.Value())
+				_ = tx.Respond(sip.NewResponseFromRequest("", req, http.StatusOK, "OK", ""))
+				return
+			}
+		}
+	}
+
+	// 若按 Call-ID 未找到，尝试根据 Subject/通道 ID 进行兜底清理。
+	var channelID string
+	subjVal := ""
+	for _, h := range req.Headers() {
+		if strings.EqualFold(h.Name(), "Subject") {
+			subjVal = h.Value()
+			break
+		}
+	}
+	if subjVal != "" {
+		parts := strings.Split(subjVal, ",")
+		if len(parts) > 0 {
+			first := parts[0]
+			if idx := strings.IndexByte(first, ':'); idx > 0 {
+				channelID = strings.TrimSpace(first[:idx])
+			} else {
+				channelID = strings.TrimSpace(first)
+			}
+		}
+	}
+	if channelID != "" {
+		// 通过 source IP 推断上级 ID（与 OnUpstreamInvite/OnUpstreamMessage 一致）。
+		source := req.Source()
+		srcHost := source
+		if idx := strings.LastIndex(source, ":"); idx > 0 {
+			srcHost = source[:idx]
+		}
+		var upID string
+		s.upstreamsByIPMu.RLock()
+		if id, ok := s.upstreamsByIP[srcHost]; ok {
+			upID = id
+		}
+		s.upstreamsByIPMu.RUnlock()
+		if upID != "" {
+			s.cleanupUpstreamSessionForChannel(upID, channelID)
+		}
+	}
+
+	// 无论是否找到会话，都按标准返回 200 OK，避免上级重传 BYE。
+	_ = tx.Respond(sip.NewResponseFromRequest("", req, http.StatusOK, "OK", ""))
 }
 
 // buildUpstreamRegisterRequest 构造向上级平台发送的 REGISTER 请求。
@@ -815,6 +1021,71 @@ func (s *GB28181Server) buildUpstreamRegisterRequest(up *upstreamServer, withAut
 	}
 
 	return req
+}
+
+// sendUpstreamBye 主动向上级发送 BYE，结束一次已存在的上级播放会话。
+// 仅在同一上级+通道重复 INVITE 时使用，以通道为维度保证只保留最后一次转发。
+func (s *GB28181Server) sendUpstreamBye(sess *UpstreamSession) {
+	if sess == nil || sess.UpstreamID == "" || sess.CallID == "" {
+		return
+	}
+	s.upstreamsMu.RLock()
+	up, ok := s.upstreams[sess.UpstreamID]
+	s.upstreamsMu.RUnlock()
+	if !ok {
+		return
+	}
+
+	deviceID := up.conf.LocalDeviceID
+	if deviceID == "" {
+		deviceID = s.conf.Serial
+	}
+	realm := up.conf.Realm
+	if realm == "" {
+		realm = s.conf.Realm
+	}
+
+	callId := sip.CallID(sess.CallID)
+	userAgent := sip.UserAgentHeader(SipUserAgent)
+	maxForwards := sip.MaxForwards(70)
+	cseq := sip.CSeq{
+		SeqNo:      uint32(time.Now().Unix() & 0x7fffffff),
+		MethodName: sip.BYE,
+	}
+
+	fromAddr := sip.Address{
+		Uri: &sip.SipUri{
+			FUser: sip.String{Str: deviceID},
+			FHost: realm,
+			FPort: nil,
+		},
+		Params: sip.NewParams().Add("tag", sip.String{Str: RandNumString(9)}),
+	}
+	toAddr := fromAddr
+
+	req := sip.NewRequest(
+		"",
+		sip.BYE,
+		toAddr.Uri,
+		"SIP/2.0",
+		[]sip.Header{
+			fromAddr.AsFromHeader(),
+			toAddr.AsToHeader(),
+			&callId,
+			&userAgent,
+			&cseq,
+			&maxForwards,
+			fromAddr.AsContactHeader(),
+		},
+		"",
+		nil,
+	)
+	req.SetTransport("udp")
+	req.SetDestination(net.JoinHostPort(up.conf.SipIP, strconv.Itoa(int(up.conf.SipPort))))
+
+	if _, err := s.upstreamSipSvr.RequestWithContext(context.Background(), req); err != nil {
+		base.Log.Warnf("gb28181 upstream send BYE failed. upstream=%s callID=%s err=%+v", sess.UpstreamID, sess.CallID, err)
+	}
 }
 
 // buildUpstreamKeepaliveRequest 构造向上级发送的 Keepalive MESSAGE。
@@ -1017,8 +1288,14 @@ func (s *GB28181Server) buildUpstreamCatalogBody(upstreamID string, sn int, devi
 		}
 
 		// 基于下级真实通道构造对上级可见的目录元素。
+		// 注意：返回给上级的平台的 ChannelID（DeviceID 字段）以订阅配置中的 channel_id 为准，
+		// 这样无论是主动上报还是被动查询，看到的通道 ID 都与订阅保持一致。
+		channelIDForUp := chFound.ChannelId
+		if fallbackChannelID != "" {
+			channelIDForUp = fallbackChannelID
+		}
 		ci := upstreamChannelInfo{
-			DeviceID:     chFound.ChannelId,
+			DeviceID:     channelIDForUp,
 			ParentID:     dev.ID,
 			Name:         chFound.Name,
 			Manufacturer: chFound.Manufacturer,
@@ -1035,36 +1312,50 @@ func (s *GB28181Server) buildUpstreamCatalogBody(upstreamID string, sn int, devi
 			Latitude:     chFound.Latitude,
 		}
 
-		// 确保在线状态与实际一致：设备在线只是前提条件之一。
-		// 后续还要结合实际流是否存在（MediaKey 是否映射到有效 mediaserver）决定最终状态。
-		if dev.Status == DeviceOnlineStatus {
-			ci.Status = ChannelOnStatus
-		} else {
-			ci.Status = ChannelOffStatus
-		}
-		// 为上级填充 StreamName 等媒体信息（不包含 MediaKey）。
-		if ci.StreamName == "" {
-			if chFound.MediaInfo.StreamName != "" {
-				ci.StreamName = chFound.MediaInfo.StreamName
-			} else {
-				ci.StreamName = streamName
-			}
-		}
+		// 为上级填充 StreamName：以订阅时配置的 streamName 为准，避免因下级内部映射差异导致状态不一致。
+		ci.StreamName = streamName
 		ci.IsInvite = chFound.MediaInfo.IsInvite
 		if chFound.MediaInfo.Ssrc != 0 {
 			ci.Ssrc = fmt.Sprintf("%d", chFound.MediaInfo.Ssrc)
 		}
 		ci.SinglePort = chFound.MediaInfo.SinglePort
 		ci.DumpFileName = chFound.MediaInfo.DumpFileName
-
-		// 如果该通道对应的实际流 group 没有在本地正常拉取（即没有活跃的 mediaserver / MediaKey 映射），
-		// 即使设备本身在线，也将状态设置为 OFF，告诉上级“通道当前不可用”。
-		if chFound.MediaInfo.MediaKey == "" {
-			ci.Status = ChannelOffStatus
-		} else {
-			if _, ok := s.MediaServerMap.Load(chFound.MediaInfo.MediaKey); !ok {
-				ci.Status = ChannelOffStatus
+		// 结合设备在线状态 + 实际媒体是否在本地拉取，综合判断对上级的在线状态。
+		// 1) 设备本身离线 => 一律 OFF；
+		// 2) 设备在线：
+		//    - 以 streamName 为 key，在所有 mediaserver 中查找是否存在活跃连接；
+		//    - 或者通道处于 Invite 中（IsInvite=true）；
+		//    => 满足其一则视为 ON，否则 OFF。
+		hasActiveMedia := false
+		if streamName != "" {
+			s.streamMediasvrIndexMu.RLock()
+			if s.streamMediasvrIndex[streamName] != nil {
+				hasActiveMedia = true
 			}
+			s.streamMediasvrIndexMu.RUnlock()
+			// 兼容索引尚未建立时的场景：回退遍历 MediaServerMap + HasStream。
+			if !hasActiveMedia {
+				s.MediaServerMap.Range(func(_, v any) bool {
+					ms, ok := v.(*mediaserver.GB28181MediaServer)
+					if !ok {
+						return true
+					}
+					if ms.HasStream(streamName) {
+						hasActiveMedia = true
+						return false
+					}
+					return true
+				})
+			}
+		}
+		// 如果当前通道处于 Invite 状态，也视为存在实时拉流需求。
+		if chFound.MediaInfo.IsInvite {
+			hasActiveMedia = true
+		}
+		if dev.Status == DeviceOnlineStatus && hasActiveMedia {
+			ci.Status = ChannelOnStatus
+		} else {
+			ci.Status = ChannelOffStatus
 		}
 		// 若 Owner/CivilCode 为空，则回退使用平台默认值。
 		if ci.Owner == "" {
@@ -1207,6 +1498,9 @@ func (s *GB28181Server) initUpstreams() {
 	if s.upstreams == nil {
 		s.upstreams = make(map[string]*upstreamServer)
 	}
+	if s.upstreamsByIP == nil {
+		s.upstreamsByIP = make(map[string]string)
+	}
 
 	for _, uc := range s.conf.Upstreams {
 		if !uc.Enable || uc.ID == "" {
@@ -1220,6 +1514,9 @@ func (s *GB28181Server) initUpstreams() {
 			conf: uc,
 		}
 		s.upstreams[uc.ID] = up
+		if uc.SipIP != "" {
+			s.upstreamsByIP[uc.SipIP] = uc.ID
+		}
 
 		// 启动上级注册/心跳循环
 		go s.runUpstreamLoop(up)
@@ -1395,6 +1692,35 @@ func (s *GB28181Server) OnStopMediaServer(netWork string, singlePort bool, devic
 		}
 	}
 	return nil
+}
+
+// OnStreamActive 由 mediaserver.Conn 在首次建立指定 streamName 的媒体连接时回调。
+// 这里通过 mediaKey 反查 mediaserver，并维护 streamName -> mediaserver 的快速索引。
+func (s *GB28181Server) OnStreamActive(streamName string, mediaKey string) {
+	if streamName == "" || mediaKey == "" {
+		return
+	}
+	v, ok := s.MediaServerMap.Load(mediaKey)
+	if !ok {
+		return
+	}
+	ms, ok := v.(*mediaserver.GB28181MediaServer)
+	if !ok {
+		return
+	}
+	s.streamMediasvrIndexMu.Lock()
+	s.streamMediasvrIndex[streamName] = ms
+	s.streamMediasvrIndexMu.Unlock()
+}
+
+// OnStreamInactive 由 mediaserver.Conn 在 streamName 对应的连接关闭时回调，移除索引。
+func (s *GB28181Server) OnStreamInactive(streamName string, mediaKey string) {
+	if streamName == "" {
+		return
+	}
+	s.streamMediasvrIndexMu.Lock()
+	delete(s.streamMediasvrIndex, streamName)
+	s.streamMediasvrIndexMu.Unlock()
 }
 func (s *GB28181Server) CheckSsrc(ssrc uint32) (*mediaserver.MediaInfo, bool) {
 	var isValidSsrc bool
@@ -2303,6 +2629,9 @@ func (s *GB28181Server) cleanupUpstreamSessionForChannel(upstreamID, channelID s
 		if sess.UpstreamID != upstreamID || sess.DeviceID != channelID {
 			return true
 		}
+
+		// 同一上级+通道重复 INVITE 时，先主动向上级发送 BYE，结束上一条会话。
+		s.sendUpstreamBye(sess)
 
 		// 移除旧会话对应的上级 Sink 转发。
 		if sess.MediaKey != "" && sess.SinkID != "" {

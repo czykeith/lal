@@ -17,6 +17,10 @@ type IGbObserver interface {
 	NotifyClose(streamName string)
 	// GetPlaybackScale 返回指定回放流当前配置的倍速，未配置时返回 1.0。
 	GetPlaybackScale(streamName string) float64
+	// OnStreamActive 在某个 streamName 第一次建立媒体连接时回调，用于维护上层索引。
+	OnStreamActive(streamName string, mediaKey string)
+	// OnStreamInactive 在某个 streamName 对应的媒体连接全部关闭时回调。
+	OnStreamInactive(streamName string, mediaKey string)
 }
 
 type GB28181MediaServer struct {
@@ -44,6 +48,8 @@ type UpstreamSink struct {
 	StreamName string
 	RemoteIP   string
 	RemotePort int
+	// 期望向上级输出的 SSRC（来自上级 INVITE 的 y= 字段），0 表示保持下级原始 SSRC。
+	SSRC uint32
 	// 懒加载的 UDP 连接，用于发送 RTP 包
 	conn *net.UDPConn
 }
@@ -61,6 +67,16 @@ func (s *GB28181MediaServer) GetListenerPort() uint16 {
 }
 func (s *GB28181MediaServer) GetMediaKey() string {
 	return s.mediaKey
+}
+
+// ConnsRange 对当前 mediaserver 内的所有连接执行回调，供上层按需遍历。
+func (s *GB28181MediaServer) ConnsRange(fn func(*Conn) bool) {
+	s.conns.Range(func(_, value any) bool {
+		if c, ok := value.(*Conn); ok {
+			return fn(c)
+		}
+		return true
+	})
 }
 func (s *GB28181MediaServer) Start(listener net.Listener) (err error) {
 	s.listener = listener
@@ -125,9 +141,30 @@ func (s *GB28181MediaServer) Dispose() {
 	})
 }
 
+// HasStream 判断当前 mediaserver 中是否存在指定 streamName 的活跃连接。
+// 仅用于向上级上报状态时，以 streamName 为维度判断流是否“在本机正常拉取”。
+func (s *GB28181MediaServer) HasStream(streamName string) bool {
+	if streamName == "" {
+		return false
+	}
+	found := false
+	s.conns.Range(func(_, value any) bool {
+		c, ok := value.(*Conn)
+		if !ok {
+			return true
+		}
+		if c.streamName == streamName {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
 // AddUpstreamSink 为指定 streamName 增加一个向上级平台转推的目标地址。
-// 这里只是记录 sink 信息，具体 RTP 转发逻辑需在 Conn 中按实际使用场景实现。
-func (s *GB28181MediaServer) AddUpstreamSink(streamName, remoteIP string, remotePort int) (string, error) {
+// ssrc 用于重写向上级发送的 RTP SSRC（通常与对端 INVITE SDP 中的 y= 一致），0 表示不改写。
+func (s *GB28181MediaServer) AddUpstreamSink(streamName, remoteIP string, remotePort int, ssrc uint32) (string, error) {
 	if streamName == "" || remoteIP == "" || remotePort <= 0 {
 		return "", fmt.Errorf("invalid upstream sink params")
 	}
@@ -137,6 +174,7 @@ func (s *GB28181MediaServer) AddUpstreamSink(streamName, remoteIP string, remote
 		StreamName: streamName,
 		RemoteIP:   remoteIP,
 		RemotePort: remotePort,
+		SSRC:       ssrc,
 	}
 	s.upstreamSinks.Store(id, sink)
 	base.Log.Infof("gb28181 mediaserver add upstream sink. key=%s stream=%s remote=%s:%d", id, streamName, remoteIP, remotePort)
@@ -185,8 +223,12 @@ func (s *GB28181MediaServer) ForwardRtp(streamName string, pkt *rtp.Packet) {
 			sink.conn = c
 		}
 
-		// 复用设备的 RTP 头部与负载，直接转发给上级
-		buf, err := pkt.Marshal()
+		// 复用设备的 RTP 负载，必要时重写 SSRC 后转发给上级。
+		outPkt := *pkt
+		if sink.SSRC != 0 {
+			outPkt.SSRC = sink.SSRC
+		}
+		buf, err := outPkt.Marshal()
 		if err != nil {
 			base.Log.Warnf("gb28181 ForwardRtp marshal rtp failed. sink=%s err=%+v", sink.ID, err)
 			return true

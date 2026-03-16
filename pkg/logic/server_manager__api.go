@@ -341,6 +341,22 @@ func (sm *ServerManager) CtrlGb28181Invite(info base.ApiCtrlGb28181InviteReq) (r
 		return
 	}
 
+	// 在发起 INVITE 前先检查设备与通道在线状态：
+	// - 设备必须为 ONLINE；
+	// - 通道必须为 ON（ChannelOnStatus）。
+	if dev := sm.gb28181Server.GetDevice(info.DeviceId); dev != nil {
+		if dev.Status != gb28181.DeviceOnlineStatus {
+			ret.ErrorCode = base.ErrorCodeGb28181InviteFail
+			ret.Desp = "device is offline"
+			return
+		}
+	}
+	if ch.Status != gb28181.ChannelOnStatus {
+		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
+		ret.Desp = "channel is offline"
+		return
+	}
+
 	network := "udp"
 	if info.IsTcpFlag == 1 {
 		network = "tcp"
@@ -434,6 +450,11 @@ func (sm *ServerManager) CtrlGb28181UpstreamSubAdd(info base.ApiGb28181UpstreamS
 	if sm.gb28181Server == nil {
 		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
 		ret.Desp = "gb28181 server not enabled"
+		return
+	}
+	if info.UpstreamID == "" || info.StreamName == "" || info.ChannelID == "" {
+		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
+		ret.Desp = "upstream_id, stream_name and channel_id are required and must be non-empty"
 		return
 	}
 	if err := sm.gb28181Server.AddUpstreamSub(info.UpstreamID, info.StreamName, info.ChannelID); err != nil {

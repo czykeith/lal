@@ -90,6 +90,9 @@ func NewConn(conn net.Conn, observer IGbObserver, lal ILalServer) *Conn {
 
 	return c
 }
+func (c *Conn) StreamName() string {
+	return c.streamName
+}
 func (c *Conn) SetMediaServer(mediaServer *GB28181MediaServer) {
 	c.mediaServer = mediaServer
 }
@@ -115,6 +118,9 @@ func (c *Conn) Serve() (err error) {
 		if c.observer != nil {
 			if c.streamName != "" {
 				c.observer.NotifyClose(c.streamName)
+				if c.key != "" {
+					c.observer.OnStreamInactive(c.streamName, c.key)
+				}
 			}
 		}
 		if c.psDumpFile != nil {
@@ -203,6 +209,10 @@ func (c *Conn) Serve() (err error) {
 					// 按 remoteAddr 保存连接，避免同一 streamName 覆盖导致 stop(BYE) 关不掉旧连接。
 					// stop 时将遍历并关闭所有 streamName 匹配的连接。
 					c.mediaServer.conns.Store(c.connKey, c)
+				}
+				// 通知上层有新的 streamName 活跃，用于维护 streamName -> mediaserver 索引。
+				if c.observer != nil && c.streamName != "" && c.key != "" {
+					c.observer.OnStreamActive(c.streamName, c.key)
 				}
 			})
 			if len(mediaInfo.DumpFileName) > 0 {
