@@ -1,3 +1,15 @@
+#### v0.39.0 (2026-03)
+
+- [feat] GB28181 中间平台：支持作为“虚拟设备”向多个上级 GB28181 平台注册、心跳保活与级联转推，实现下级设备/本地流统一汇聚后再上报
+- [feat] GB28181 上级订阅：引入独立的上级配置文件 `gb28181_upstreams.json`，支持配置多上级平台账号信息及其订阅的本地流（`upstream_id + stream_name + channel_id` 唯一）
+- [feat] GB28181 上级管理 API：新增 `/api/stat/gb28181_upstreams`、`/api/stat/gb28181_upstream_subs`、`/api/ctrl/gb28181_upstream_sub_add`、`/api/ctrl/gb28181_upstream_sub_del` 等接口，用于运行时管理上级平台与订阅列表
+- [feat] 上级配置热更新：新增 `/api/ctrl/gb28181_upstreams_conf_set` 和 `/api/ctrl/gb28181_upstreams_reload`，支持覆盖写入上级配置文件并在不中断下级 GB28181 服务的前提下，增删改上级平台和订阅关系
+- [feat] 上级 Catalog 兼容非 GB 流：上报给上级的平台目录以 `stream_name` 为核心，自动兼容 RTMP/RTSP/Relay 等非 GB 流，在线状态统一以“pub 或 pull 有实际数据”为准
+- [feat] 上级 INVITE/BYE 对非 GB 流的转推：支持上级对任意已订阅的本地流发起 INVITE，内部将 AvPacket 封装为 PS/RTP 级联推送到上级；收到 STOP/BYE 或订阅删除时自动停止对应转推并释放资源
+- [opt] GB28181 上级性能：为 `streamName → mediaserver`、`SipIP → upstreamID`、`(upstreamID, channelID) → 会话` 等路径增加索引，减少遍历，提高 INVITE/Catalog 等高频操作的查找性能
+- [opt] 转推链路健壮性：对上级 INVITE 的 SDP/Subject 解析、错误响应码、会话清理（包括虚拟 mediaserver 生命周期）进行了完善，避免因异常 INVITE/BYE 或配置变更导致会话/端口泄漏
+- [doc] README/CHANGELOG：补充 GB28181 中间平台整体设计说明、上级配置文件结构示例及相关 HTTP API 文档，统一中文说明和英文索引
+
 #### v0.38.4 (2026-03)
 
 - [feat] GB28181: 回放会话支持 TTL，默认 3 小时自动释放，防止会话长期占用资源
