@@ -95,6 +95,52 @@ type GB28181Server struct {
 
 const virtualMediaKey = "virtual_non_gb"
 
+// hasActiveMediaStream 判断给定 streamName 是否在当前节点“有实际媒体数据”：包括
+// - mediaserver 中存在活跃 PS 流（包含虚拟 mediaserver）；
+// - 或 logic 层 Group 中存在有读流量/码率的 pub 或 pull。
+func (s *GB28181Server) hasActiveMediaStream(streamName string) bool {
+	if streamName == "" {
+		return false
+	}
+	// 1) 优先用 streamMediasvrIndex 命中
+	s.streamMediasvrIndexMu.RLock()
+	if s.streamMediasvrIndex[streamName] != nil {
+		s.streamMediasvrIndexMu.RUnlock()
+		return true
+	}
+	s.streamMediasvrIndexMu.RUnlock()
+
+	// 2) 回退遍历 MediaServerMap + HasStream
+	found := false
+	s.MediaServerMap.Range(func(_, v any) bool {
+		ms, ok := v.(*mediaserver.GB28181MediaServer)
+		if !ok {
+			return true
+		}
+		if ms.HasStream(streamName) {
+			found = true
+			return false
+		}
+		return true
+	})
+	if found {
+		return true
+	}
+
+	// 3) 逻辑层：StatGroup 中有 pub 或 pull 且有读流量/码率
+	if s.lalServer != nil {
+		if st := s.lalServer.StatGroup(streamName); st != nil {
+			if st.StatPub.SessionId != "" && (st.StatPub.ReadBytesSum > 0 || st.StatPub.BitrateKbits > 0) {
+				return true
+			}
+			if st.StatPull.SessionId != "" && (st.StatPull.ReadBytesSum > 0 || st.StatPull.BitrateKbits > 0) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // devIDFromSerial 根据平台 Serial 简单推导一个行政区划编码（CivilCode）的兜底值。
 // 若 Serial 长度不少于 6，则取前 6 位，否则返回空字符串。
 func devIDFromSerial(serial string) string {
@@ -1357,40 +1403,8 @@ func (s *GB28181Server) buildUpstreamCatalogBody(upstreamID string, sn int, devi
 				return nil
 			}
 			var status ChannelStatus = ChannelOffStatus
-			if streamName != "" {
-				hasActiveMedia := false
-				// 先看 mediaserver 中是否有对应的 PS 流（如通过 GB28181/虚拟 mediaserver 已建 sink）。
-				s.streamMediasvrIndexMu.RLock()
-				if s.streamMediasvrIndex[streamName] != nil {
-					hasActiveMedia = true
-				}
-				s.streamMediasvrIndexMu.RUnlock()
-				if !hasActiveMedia {
-					s.MediaServerMap.Range(func(_, v any) bool {
-						ms, ok := v.(*mediaserver.GB28181MediaServer)
-						if !ok {
-							return true
-						}
-						if ms.HasStream(streamName) {
-							hasActiveMedia = true
-							return false
-						}
-						return true
-					})
-				}
-				// 再看逻辑层是否存在有实际数据的 pub 或 pull（兼容 RTMP/RTSP/Relay 等非 GB 流）。
-				if !hasActiveMedia && s.lalServer != nil {
-					if st := s.lalServer.StatGroup(streamName); st != nil {
-						if st.StatPub.SessionId != "" && (st.StatPub.ReadBytesSum > 0 || st.StatPub.BitrateKbits > 0) {
-							hasActiveMedia = true
-						} else if st.StatPull.SessionId != "" && (st.StatPull.ReadBytesSum > 0 || st.StatPull.BitrateKbits > 0) {
-							hasActiveMedia = true
-						}
-					}
-				}
-				if hasActiveMedia {
-					status = ChannelOnStatus
-				}
+			if s.hasActiveMediaStream(streamName) {
+				status = ChannelOnStatus
 			}
 			return &upstreamChannelInfo{
 				DeviceID:   fallbackChannelID,
@@ -1438,44 +1452,8 @@ func (s *GB28181Server) buildUpstreamCatalogBody(upstreamID string, sn int, devi
 		ci.DumpFileName = chFound.MediaInfo.DumpFileName
 		// 结合设备在线状态 + 实际媒体是否在本地拉取，综合判断对上级的在线状态。
 		// 1) 设备本身离线 => 一律 OFF；
-		// 2) 设备在线：
-		//    - 以 streamName 为 key，在所有 mediaserver 中查找是否存在活跃连接；
-		//    - 或者通道处于 Invite 中（IsInvite=true）；
-		//    - 或者在逻辑层 Group 中存在对应的在线流（兼容非 GB28181 流，如 RTMP/RTSP/Relay）；
-		//    => 满足其一则视为 ON，否则 OFF。
-		hasActiveMedia := false
-		if streamName != "" {
-			s.streamMediasvrIndexMu.RLock()
-			if s.streamMediasvrIndex[streamName] != nil {
-				hasActiveMedia = true
-			}
-			s.streamMediasvrIndexMu.RUnlock()
-			// 兼容索引尚未建立时的场景：回退遍历 MediaServerMap + HasStream。
-			if !hasActiveMedia {
-				s.MediaServerMap.Range(func(_, v any) bool {
-					ms, ok := v.(*mediaserver.GB28181MediaServer)
-					if !ok {
-						return true
-					}
-					if ms.HasStream(streamName) {
-						hasActiveMedia = true
-						return false
-					}
-					return true
-				})
-			}
-			// 兼容非 GB28181 流：通过 logic 层 StatGroup 判断该 streamName 是否存在在线 pub 或 pull。
-			if !hasActiveMedia && s.lalServer != nil {
-				if st := s.lalServer.StatGroup(streamName); st != nil {
-					// 有发布会话（任意协议）或存在拉流（pull）且有流量/码率，即认为该流“有数据”。
-					if st.StatPub.SessionId != "" && (st.StatPub.ReadBytesSum > 0 || st.StatPub.BitrateKbits > 0) {
-						hasActiveMedia = true
-					} else if st.StatPull.SessionId != "" && (st.StatPull.ReadBytesSum > 0 || st.StatPull.BitrateKbits > 0) {
-						hasActiveMedia = true
-					}
-				}
-			}
-		}
+		// 2) 设备在线：以 hasActiveMediaStream(streamName) + IsInvite 综合判断。
+		hasActiveMedia := s.hasActiveMediaStream(streamName)
 		// 如果当前通道处于 Invite 状态，也视为存在实时拉流需求。
 		if chFound.MediaInfo.IsInvite {
 			hasActiveMedia = true
