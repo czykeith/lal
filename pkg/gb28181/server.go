@@ -16,6 +16,7 @@ import (
 	"github.com/ghettovoice/gosip"
 	"github.com/ghettovoice/gosip/log"
 	"github.com/ghettovoice/gosip/sip"
+	"github.com/pion/rtp"
 	udpTransport "github.com/pion/transport/v3/udp"
 	"github.com/q191201771/lal/pkg/base"
 	"github.com/q191201771/lal/pkg/gb28181/mediaserver"
@@ -85,7 +86,14 @@ type GB28181Server struct {
 		list      []upstreamChannelInfo
 		updatedAt time.Time
 	}
+
+	// virtualMediaserver 用于非 GB28181 流（如 RTMP/RTSP）的上级转推：仅承载 upstreamSinks，不监听端口；
+	// logic 层通过 UpstreamRtpFeeder 向其中喂 RTP，由 ForwardRtp 发往上级。
+	virtualMediaserverMu sync.Mutex
+	virtualMediaserver   *mediaserver.GB28181MediaServer
 }
+
+const virtualMediaKey = "virtual_non_gb"
 
 // devIDFromSerial 根据平台 Serial 简单推导一个行政区划编码（CivilCode）的兜底值。
 // 若 Serial 长度不少于 6，则取前 6 位，否则返回空字符串。
@@ -246,6 +254,14 @@ type UpstreamSession struct {
 	SinkID     string // mediaserver 中对应的上级转推目标 ID
 	MediaKey   string // 对应 mediaserver 的 mediaKey，便于 Bye 时精确定位
 	CreatedAt  time.Time
+	// CancelFeed 用于非 GB28181 流：停止 logic 层向虚拟 mediaserver 喂 RTP。会话结束时调用。
+	CancelFeed func()
+}
+
+// UpstreamRtpFeeder 由 logic 层适配器实现，用于为非 GB28181 流向虚拟 mediaserver 喂 RTP，以支持上级转推。
+// feedFn 每次传入一个 RTP 包（原始字节）；cancel 由调用方在会话结束时调用以停止喂流。
+type UpstreamRtpFeeder interface {
+	RequestUpstreamRtpFeed(streamName string, feedFn func(rawRtp []byte)) (cancel func(), err error)
 }
 
 // upstreamChannelInfo 为上级平台返回的目录通道元素。
@@ -724,9 +740,18 @@ func (s *GB28181Server) OnUpstreamInvite(req sip.Request, tx sip.ServerTransacti
 		})
 	}
 	if mediasvr == nil {
-		base.Log.Warnf("gb28181 upstream invite: mediaserver not found for streamName=%s", streamName)
-		_ = tx.Respond(sip.NewResponseFromRequest("", req, http.StatusServiceUnavailable, "mediaserver not found", ""))
-		return
+		// 非 GB28181 流（如 RTMP/RTSP）：使用虚拟 mediaserver 承载 sink，并尝试向 logic 层请求 RTP 喂流。
+		mediasvr = s.getVirtualMediaServer()
+		if mediasvr == nil {
+			base.Log.Warnf("gb28181 upstream invite: mediaserver not found for streamName=%s", streamName)
+			_ = tx.Respond(sip.NewResponseFromRequest("", req, http.StatusServiceUnavailable, "mediaserver not found", ""))
+			return
+		}
+		// 将非 GB 流也纳入 streamMediasvrIndex，便于 Catalog 状态和后续查找。
+		s.streamMediasvrIndexMu.Lock()
+		s.streamMediasvrIndex[streamName] = mediasvr
+		s.streamMediasvrIndexMu.Unlock()
+		sess.MediaKey = virtualMediaKey
 	}
 
 	// 将上级期望的 SSRC 传入 mediaserver，后续转发时重写 RTP SSRC 与 y= 保持一致。
@@ -745,8 +770,28 @@ func (s *GB28181Server) OnUpstreamInvite(req sip.Request, tx sip.ServerTransacti
 	}
 	sess.SinkID = sinkID
 	// 记录 mediaKey，便于 Bye 时精确找到 mediaserver。
-	sess.MediaKey = mediasvr.GetMediaKey()
+	if sess.MediaKey == "" {
+		sess.MediaKey = mediasvr.GetMediaKey()
+	}
 	s.upstreamSessions.Store(callIDStr, sess)
+
+	// 非 GB28181 流：向 logic 层请求 RTP 喂流，以便上级能收到媒体。
+	if sess.MediaKey == virtualMediaKey {
+		if feeder, ok := s.lalServer.(UpstreamRtpFeeder); ok {
+			feedFn := func(raw []byte) {
+				var pkt rtp.Packet
+				if err := pkt.Unmarshal(raw); err != nil {
+					return
+				}
+				mediasvr.ForwardRtp(streamName, &pkt)
+			}
+			cancel, err := feeder.RequestUpstreamRtpFeed(streamName, feedFn)
+			if err == nil && cancel != nil {
+				sess.CancelFeed = cancel
+				s.upstreamSessions.Store(callIDStr, sess)
+			}
+		}
+	}
 
 	// 构造 200 OK 响应，按 GB28181 标准返回 SDP（参考实际设备侧响应）：
 	// v=0
@@ -906,7 +951,10 @@ func (s *GB28181Server) OnUpstreamBye(req sip.Request, tx sip.ServerTransaction)
 	if callID != nil {
 		if v, ok := s.upstreamSessions.Load(callID.Value()); ok {
 			if sess, ok2 := v.(*UpstreamSession); ok2 {
-				// 清理 Sink
+				if sess.CancelFeed != nil {
+					sess.CancelFeed()
+					sess.CancelFeed = nil
+				}
 				if sess.MediaKey != "" && sess.SinkID != "" {
 					if mv, ok3 := s.MediaServerMap.Load(sess.MediaKey); ok3 {
 						if mediasvr, ok4 := mv.(*mediaserver.GB28181MediaServer); ok4 {
@@ -915,6 +963,8 @@ func (s *GB28181Server) OnUpstreamBye(req sip.Request, tx sip.ServerTransaction)
 					}
 				}
 				s.upstreamSessions.Delete(callID.Value())
+				// 若不再有任何会话使用虚拟 mediaserver，则尝试清理之。
+				s.maybeCleanupVirtualMediaServer()
 				_ = tx.Respond(sip.NewResponseFromRequest("", req, http.StatusOK, "OK", ""))
 				return
 			}
@@ -1302,9 +1352,45 @@ func (s *GB28181Server) buildUpstreamCatalogBody(upstreamID string, sn int, devi
 		})
 		if chFound == nil || dev == nil {
 			// 非下级 GB28181 流：根据订阅中提供的 channel_id 构造一个虚拟通道。
-			// 当前 streamName 在本地流列表中不存在时，将状态设置为 OFF，告知上级“已订阅但当前离线/不可用”。
+			// 当前 streamName 在本地流列表中不存在时，根据“是否有实际媒体数据（pub/pull）”决定 ON/OFF。
 			if fallbackChannelID == "" {
 				return nil
+			}
+			var status ChannelStatus = ChannelOffStatus
+			if streamName != "" {
+				hasActiveMedia := false
+				// 先看 mediaserver 中是否有对应的 PS 流（如通过 GB28181/虚拟 mediaserver 已建 sink）。
+				s.streamMediasvrIndexMu.RLock()
+				if s.streamMediasvrIndex[streamName] != nil {
+					hasActiveMedia = true
+				}
+				s.streamMediasvrIndexMu.RUnlock()
+				if !hasActiveMedia {
+					s.MediaServerMap.Range(func(_, v any) bool {
+						ms, ok := v.(*mediaserver.GB28181MediaServer)
+						if !ok {
+							return true
+						}
+						if ms.HasStream(streamName) {
+							hasActiveMedia = true
+							return false
+						}
+						return true
+					})
+				}
+				// 再看逻辑层是否存在有实际数据的 pub 或 pull（兼容 RTMP/RTSP/Relay 等非 GB 流）。
+				if !hasActiveMedia && s.lalServer != nil {
+					if st := s.lalServer.StatGroup(streamName); st != nil {
+						if st.StatPub.SessionId != "" && (st.StatPub.ReadBytesSum > 0 || st.StatPub.BitrateKbits > 0) {
+							hasActiveMedia = true
+						} else if st.StatPull.SessionId != "" && (st.StatPull.ReadBytesSum > 0 || st.StatPull.BitrateKbits > 0) {
+							hasActiveMedia = true
+						}
+					}
+				}
+				if hasActiveMedia {
+					status = ChannelOnStatus
+				}
 			}
 			return &upstreamChannelInfo{
 				DeviceID:   fallbackChannelID,
@@ -1312,7 +1398,7 @@ func (s *GB28181Server) buildUpstreamCatalogBody(upstreamID string, sn int, devi
 				Name:       streamName,
 				Owner:      s.conf.Serial, // 归属平台自身
 				CivilCode:  devIDFromSerial(s.conf.Serial),
-				Status:     ChannelOffStatus,
+				Status:     status,
 				StreamName: streamName,
 			}
 		}
@@ -1355,6 +1441,7 @@ func (s *GB28181Server) buildUpstreamCatalogBody(upstreamID string, sn int, devi
 		// 2) 设备在线：
 		//    - 以 streamName 为 key，在所有 mediaserver 中查找是否存在活跃连接；
 		//    - 或者通道处于 Invite 中（IsInvite=true）；
+		//    - 或者在逻辑层 Group 中存在对应的在线流（兼容非 GB28181 流，如 RTMP/RTSP/Relay）；
 		//    => 满足其一则视为 ON，否则 OFF。
 		hasActiveMedia := false
 		if streamName != "" {
@@ -1376,6 +1463,17 @@ func (s *GB28181Server) buildUpstreamCatalogBody(upstreamID string, sn int, devi
 					}
 					return true
 				})
+			}
+			// 兼容非 GB28181 流：通过 logic 层 StatGroup 判断该 streamName 是否存在在线 pub 或 pull。
+			if !hasActiveMedia && s.lalServer != nil {
+				if st := s.lalServer.StatGroup(streamName); st != nil {
+					// 有发布会话（任意协议）或存在拉流（pull）且有流量/码率，即认为该流“有数据”。
+					if st.StatPub.SessionId != "" && (st.StatPub.ReadBytesSum > 0 || st.StatPub.BitrateKbits > 0) {
+						hasActiveMedia = true
+					} else if st.StatPull.SessionId != "" && (st.StatPull.ReadBytesSum > 0 || st.StatPull.BitrateKbits > 0) {
+						hasActiveMedia = true
+					}
+				}
 			}
 		}
 		// 如果当前通道处于 Invite 状态，也视为存在实时拉流需求。
@@ -1517,6 +1615,60 @@ func (s *GB28181Server) buildUpstreamDeviceInfoBody(sn int, deviceID string) str
 </Response>`, sn, deviceID)
 	}
 	return body
+}
+
+// getVirtualMediaServer 返回用于非 GB28181 流的虚拟 mediaserver（仅承载 upstreamSinks，不监听端口）。
+func (s *GB28181Server) getVirtualMediaServer() *mediaserver.GB28181MediaServer {
+	s.virtualMediaserverMu.Lock()
+	defer s.virtualMediaserverMu.Unlock()
+	if s.virtualMediaserver != nil {
+		return s.virtualMediaserver
+	}
+	port := int(s.conf.MediaConfig.ListenPort)
+	if port == 0 {
+		port = 30000
+	}
+	s.virtualMediaserver = mediaserver.NewGB28181MediaServer(port, virtualMediaKey, s, s.lalServer)
+	s.MediaServerMap.Store(virtualMediaKey, s.virtualMediaserver)
+	return s.virtualMediaserver
+}
+
+// maybeCleanupVirtualMediaServer 在没有任何上级会话使用虚拟 mediaserver 时，清理其索引并释放资源。
+// 仅在上级会话（包括非 GB 流转推）全部结束后调用，避免影响原始流。
+func (s *GB28181Server) maybeCleanupVirtualMediaServer() {
+	s.virtualMediaserverMu.Lock()
+	defer s.virtualMediaserverMu.Unlock()
+	vm := s.virtualMediaserver
+	if vm == nil {
+		return
+	}
+
+	// 若仍有会话引用虚拟 mediaserver，则不清理。
+	hasVirtualSession := false
+	s.upstreamSessions.Range(func(_, v any) bool {
+		if sess, ok := v.(*UpstreamSession); ok && sess.MediaKey == virtualMediaKey {
+			hasVirtualSession = true
+			return false
+		}
+		return true
+	})
+	if hasVirtualSession {
+		return
+	}
+
+	// 清理 streamMediasvrIndex 中指向虚拟 mediaserver 的条目。
+	s.streamMediasvrIndexMu.Lock()
+	for name, ms := range s.streamMediasvrIndex {
+		if ms == vm {
+			delete(s.streamMediasvrIndex, name)
+		}
+	}
+	s.streamMediasvrIndexMu.Unlock()
+
+	// 从 MediaServerMap 中移除并释放虚拟 mediaserver 资源。
+	s.MediaServerMap.Delete(virtualMediaKey)
+	vm.Dispose()
+	s.virtualMediaserver = nil
 }
 
 // initUpstreams 根据配置初始化上级平台结构。
@@ -2658,8 +2810,15 @@ func (s *GB28181Server) OnBye(req sip.Request, tx sip.ServerTransaction) {
 
 	// 优先判断是否为上级 Bye（停止上级播放）
 	if v, ok := s.upstreamSessions.LoadAndDelete(callIdStr); ok {
-		// 停止对应的上级转推 Sink
-		if sess, ok2 := v.(*UpstreamSession); ok2 && sess.SinkID != "" {
+		if sess, ok2 := v.(*UpstreamSession); ok2 {
+			if sess.CancelFeed != nil {
+				sess.CancelFeed()
+				sess.CancelFeed = nil
+			}
+			if sess.SinkID == "" {
+				tx.Respond(sip.NewResponseFromRequest("", req, http.StatusOK, "OK", ""))
+				return
+			}
 			var mediasvr *mediaserver.GB28181MediaServer
 			// 优先使用会话中记录的 MediaKey 精确定位 mediaserver
 			if sess.MediaKey != "" {
@@ -2722,7 +2881,10 @@ func (s *GB28181Server) cleanupUpstreamSessionForChannel(upstreamID, channelID s
 		// 同一上级+通道重复 INVITE 时，先主动向上级发送 BYE，结束上一条会话。
 		s.sendUpstreamBye(sess)
 
-		// 移除旧会话对应的上级 Sink 转发。
+		if sess.CancelFeed != nil {
+			sess.CancelFeed()
+			sess.CancelFeed = nil
+		}
 		if sess.MediaKey != "" && sess.SinkID != "" {
 			if v, ok2 := s.MediaServerMap.Load(sess.MediaKey); ok2 {
 				if mediasvr, ok3 := v.(*mediaserver.GB28181MediaServer); ok3 {
@@ -2732,6 +2894,8 @@ func (s *GB28181Server) cleanupUpstreamSessionForChannel(upstreamID, channelID s
 		}
 
 		s.upstreamSessions.Delete(key)
+		// 某一路通道的会话被清理后，若虚拟 mediaserver 已无会话引用，则尝试一起清理。
+		s.maybeCleanupVirtualMediaServer()
 		return true
 	})
 }
@@ -2753,7 +2917,10 @@ func (s *GB28181Server) cleanupUpstreamSessionsForUpstream(upstreamID string, se
 			s.sendUpstreamBye(sess)
 		}
 
-		// 移除对应的上级 Sink 转发。
+		if sess.CancelFeed != nil {
+			sess.CancelFeed()
+			sess.CancelFeed = nil
+		}
 		if sess.MediaKey != "" && sess.SinkID != "" {
 			if v, ok2 := s.MediaServerMap.Load(sess.MediaKey); ok2 {
 				if mediasvr, ok3 := v.(*mediaserver.GB28181MediaServer); ok3 {
@@ -2765,6 +2932,8 @@ func (s *GB28181Server) cleanupUpstreamSessionsForUpstream(upstreamID string, se
 		s.upstreamSessions.Delete(key)
 		return true
 	})
+	// 所属上级下的所有会话被清理后，若虚拟 mediaserver 已无会话引用，则尝试一起清理。
+	s.maybeCleanupVirtualMediaServer()
 }
 
 // reconcileUpstreamSessionsWithSubs 在订阅关系发生变化后，对当前所有上级播放会话进行对齐：
@@ -2800,8 +2969,11 @@ func (s *GB28181Server) reconcileUpstreamSessionsWithSubs() {
 		}
 
 		if !allowed {
-			// 不再允许的会话：向上级发送 BYE，关闭 sink，并删除会话。
 			s.sendUpstreamBye(sess)
+			if sess.CancelFeed != nil {
+				sess.CancelFeed()
+				sess.CancelFeed = nil
+			}
 			if sess.MediaKey != "" && sess.SinkID != "" {
 				if v, ok2 := s.MediaServerMap.Load(sess.MediaKey); ok2 {
 					if mediasvr, ok3 := v.(*mediaserver.GB28181MediaServer); ok3 {
@@ -2813,6 +2985,8 @@ func (s *GB28181Server) reconcileUpstreamSessionsWithSubs() {
 		}
 		return true
 	})
+	// 订阅对齐后，若虚拟 mediaserver 已无会话引用，则尝试一起清理。
+	s.maybeCleanupVirtualMediaServer()
 }
 
 // ReconcileUpstreamSessionsWithSubs 为导出封装，供 logic 层调用，用于在订阅关系重载后对正在转发的会话做一次对齐。

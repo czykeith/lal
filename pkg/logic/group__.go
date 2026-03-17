@@ -100,6 +100,11 @@ type Group struct {
 	rtmp2MpegtsRemuxer  *remux.Rtmp2MpegtsRemuxer
 	// rtmp2AvPacketRemuxer 将广播路径上的 RTMP 视频转换为 AnnexB AvPacket，用于全局截图缓存。
 	rtmp2AvPacketRemuxer *remux.Rtmp2AvPacketRemuxer
+	// avPacketSubs 订阅当前 Group 视频 AvPacket 的回调（用于如 GB28181 上级转推等场景）。
+	// 使用独立的读写锁，避免与 group.mutex 形成死锁。
+	avPacketSubsMu sync.RWMutex
+	// key 为订阅 ID，由调用方自定义保证唯一性。
+	avPacketSubs map[string]func(base.AvPacket)
 	// pull
 	pullProxy *pullProxy
 	// relay
@@ -148,6 +153,22 @@ func (group *Group) HasHlsSubSession() bool {
 	return len(group.hlsSubSessionSet) > 0
 }
 
+// AddAvPacketSubscriber 为当前 Group 增加一个视频 AvPacket 订阅者。
+// id 需由调用方保证在该 Group 内唯一；返回的 cancel 用于取消订阅。
+func (group *Group) AddAvPacketSubscriber(id string, cb func(base.AvPacket)) (cancel func()) {
+	if id == "" || cb == nil {
+		return func() {}
+	}
+	group.avPacketSubsMu.Lock()
+	group.avPacketSubs[id] = cb
+	group.avPacketSubsMu.Unlock()
+	return func() {
+		group.avPacketSubsMu.Lock()
+		delete(group.avPacketSubs, id)
+		group.avPacketSubsMu.Unlock()
+	}
+}
+
 func NewGroup(appName string, streamName string, config *Config, option GroupOption, observer IGroupObserver) *Group {
 	uk := base.GenUkGroup()
 
@@ -172,6 +193,7 @@ func NewGroup(appName string, streamName string, config *Config, option GroupOpt
 		httpflvGopCache:      remux.NewGopCache("httpflv", uk, config.HttpflvConfig.GopNum, config.HttpflvConfig.SingleGopMaxFrameNum),
 		httptsGopCache:       remux.NewGopCacheMpegts(uk, config.HttptsConfig.GopNum, config.HttptsConfig.SingleGopMaxFrameNum),
 		inVideoFpsRecords:    base.NewPeriodRecord(32),
+		avPacketSubs:         make(map[string]func(base.AvPacket)),
 	}
 
 	g.hlsCalcSessionStatIntervalSec = uint32(config.HlsConfig.FragmentDurationMs / 100) // equals to (ms/1000) * 10
@@ -194,6 +216,16 @@ func NewGroup(appName string, streamName string, config *Config, option GroupOpt
 			}
 			if g.observer != nil {
 				g.observer.UpdateSnapshot(g.streamName, pkt)
+			}
+			// 将视频 AvPacket 分发给所有订阅者（如上级转推 PS/RTP）。
+			g.avPacketSubsMu.RLock()
+			subs := make([]func(base.AvPacket), 0, len(g.avPacketSubs))
+			for _, cb := range g.avPacketSubs {
+				subs = append(subs, cb)
+			}
+			g.avPacketSubsMu.RUnlock()
+			for _, cb := range subs {
+				cb(pkt)
 			}
 		},
 	)

@@ -480,7 +480,11 @@ func (sm *ServerManager) CtrlGb28181UpstreamSubDel(info base.ApiGb28181UpstreamS
 	if err := sm.gb28181Server.RemoveUpstreamSub(info.UpstreamID, info.StreamName); err != nil {
 		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
 		ret.Desp = err.Error()
+		return
 	}
+	// 订阅删除后，立即对当前所有上级会话做一次对齐：
+	// 对于已不在订阅表中的会话（包括非 GB 流转推），主动发送 BYE、关闭转推 Sink，并停止对应的 RTP 喂流。
+	sm.gb28181Server.ReconcileUpstreamSessionsWithSubs()
 	return
 }
 
@@ -643,6 +647,12 @@ func (sm *ServerManager) CtrlGb28181UpstreamsReload() (ret base.ApiRespBasic) {
 	ret.ErrorCode = base.ErrorCodeSucc
 	ret.Desp = base.DespSucc
 
+	if !sm.config.Gb28181Config.UpstreamEnable {
+		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
+		ret.Desp = "gb28181.upstream_enable is false, middle platform is disabled, reload not allowed"
+		return
+	}
+
 	path := sm.config.Gb28181Config.UpstreamConfigFile
 	if path == "" {
 		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
@@ -677,9 +687,18 @@ func (sm *ServerManager) CtrlGb28181UpstreamsReload() (ret base.ApiRespBasic) {
 	gbConf := gb28181ConfigFromLogic(sm.config.Gb28181Config)
 	sm.gb28181Server.ReloadUpstreams(gbConf.Upstreams)
 
-	// 重建运行时订阅表：先清空，再按配置文件重建。
+	// 重建运行时订阅表：先清空，再按配置文件重建；仅对已启用的上级注入订阅。
 	sm.gb28181Server.ClearAllUpstreamSubs()
+	enabledUpstreamIDs := make(map[string]struct{})
+	for _, u := range sm.config.Gb28181Config.Upstreams {
+		if u.Enable && u.ID != "" {
+			enabledUpstreamIDs[u.ID] = struct{}{}
+		}
+	}
 	for _, sub := range sm.config.Gb28181Config.UpstreamSubs {
+		if _, enabled := enabledUpstreamIDs[sub.UpstreamID]; !enabled {
+			continue
+		}
 		if err := sm.gb28181Server.AddUpstreamSub(sub.UpstreamID, sub.StreamName, sub.ChannelID); err != nil {
 			Log.Warnf("reload gb28181 upstream sub failed. upstream=%s stream=%s channel=%s err=%+v",
 				sub.UpstreamID, sub.StreamName, sub.ChannelID, err)

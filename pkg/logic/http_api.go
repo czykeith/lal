@@ -77,6 +77,14 @@ func (h *HttpApiServer) RunLoop() error {
 	mux.HandleFunc("/api/ctrl/gb28181_device_status", h.queryGb28181DeviceStatusHandler)
 	mux.HandleFunc("/api/ctrl/gb28181_channels", h.queryGb28181ChannelsHandler)
 
+	// GB28181 上级平台（中间平台）管理
+	mux.HandleFunc("/api/stat/gb28181_upstreams", h.statGb28181UpstreamsHandler)
+	mux.HandleFunc("/api/stat/gb28181_upstream_subs", h.statGb28181UpstreamSubsHandler)
+	mux.HandleFunc("/api/ctrl/gb28181_upstream_sub_add", h.ctrlGb28181UpstreamSubAddHandler)
+	mux.HandleFunc("/api/ctrl/gb28181_upstream_sub_del", h.ctrlGb28181UpstreamSubDelHandler)
+	mux.HandleFunc("/api/ctrl/gb28181_upstreams_conf_set", h.ctrlGb28181UpstreamsConfSetHandler)
+	mux.HandleFunc("/api/ctrl/gb28181_upstreams_reload", h.ctrlGb28181UpstreamsReloadHandler)
+
 	// 通用截图接口：根据 stream_name 返回最近一帧关键帧的 JPEG 图片。
 	mux.HandleFunc("/api/ctrl/snapshot", h.ctrlSnapshotHandler)
 
@@ -565,6 +573,88 @@ func (h *HttpApiServer) queryGb28181ChannelsHandler(w http.ResponseWriter, req *
 	Log.Infof("http api query gb28181 channels. req info=%+v", info)
 
 	resp := h.sm.QueryGb28181Channels(info)
+	feedback(resp, w)
+}
+
+// GET /api/stat/gb28181_upstreams
+func (h *HttpApiServer) statGb28181UpstreamsHandler(w http.ResponseWriter, req *http.Request) {
+	resp := h.sm.StatGb28181Upstreams()
+	feedback(resp, w)
+}
+
+// GET /api/stat/gb28181_upstream_subs?upstream_id=xxx
+func (h *HttpApiServer) statGb28181UpstreamSubsHandler(w http.ResponseWriter, req *http.Request) {
+	upstreamID := req.URL.Query().Get("upstream_id")
+	if upstreamID == "" {
+		var v base.ApiGb28181UpstreamSubsResp
+		v.ErrorCode = base.ErrorCodeParamMissing
+		v.Desp = "upstream_id is required"
+		feedback(v, w)
+		return
+	}
+	resp := h.sm.StatGb28181UpstreamSubs(upstreamID)
+	feedback(resp, w)
+}
+
+// POST /api/ctrl/gb28181_upstream_sub_add
+func (h *HttpApiServer) ctrlGb28181UpstreamSubAddHandler(w http.ResponseWriter, req *http.Request) {
+	var info base.ApiGb28181UpstreamSub
+	_, err := unmarshalRequestJsonBody(req, &info, "upstream_id", "stream_name", "channel_id")
+	if err != nil {
+		Log.Warnf("http api gb28181 upstream sub add error. err=%+v", err)
+		var v base.ApiRespBasic
+		v.ErrorCode = base.ErrorCodeParamMissing
+		v.Desp = base.DespParamMissing
+		feedback(v, w)
+		return
+	}
+	resp := h.sm.CtrlGb28181UpstreamSubAdd(info)
+	feedback(resp, w)
+}
+
+// POST /api/ctrl/gb28181_upstream_sub_del
+func (h *HttpApiServer) ctrlGb28181UpstreamSubDelHandler(w http.ResponseWriter, req *http.Request) {
+	var info base.ApiGb28181UpstreamSub
+	_, err := unmarshalRequestJsonBody(req, &info, "upstream_id", "stream_name")
+	if err != nil {
+		Log.Warnf("http api gb28181 upstream sub del error. err=%+v", err)
+		var v base.ApiRespBasic
+		v.ErrorCode = base.ErrorCodeParamMissing
+		v.Desp = base.DespParamMissing
+		feedback(v, w)
+		return
+	}
+	resp := h.sm.CtrlGb28181UpstreamSubDel(info)
+	feedback(resp, w)
+}
+
+// POST /api/ctrl/gb28181_upstreams_conf_set
+func (h *HttpApiServer) ctrlGb28181UpstreamsConfSetHandler(w http.ResponseWriter, req *http.Request) {
+	var confFile Gb28181UpstreamConfigFile
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		Log.Warnf("http api gb28181 upstreams conf set read body error. err=%+v", err)
+		var v base.ApiRespBasic
+		v.ErrorCode = base.ErrorCodeParamMissing
+		v.Desp = err.Error()
+		feedback(v, w)
+		return
+	}
+	if err := json.Unmarshal(body, &confFile); err != nil {
+		Log.Warnf("http api gb28181 upstreams conf set unmarshal error. err=%+v", err)
+		var v base.ApiRespBasic
+		v.ErrorCode = base.ErrorCodeGb28181InviteFail
+		v.Desp = "invalid json: " + err.Error()
+		feedback(v, w)
+		return
+	}
+	resp := h.sm.CtrlGb28181UpstreamsConfSet(confFile)
+	feedback(resp, w)
+}
+
+// POST /api/ctrl/gb28181_upstreams_reload
+func (h *HttpApiServer) ctrlGb28181UpstreamsReloadHandler(w http.ResponseWriter, req *http.Request) {
+	resp := h.sm.CtrlGb28181UpstreamsReload()
 	feedback(resp, w)
 }
 

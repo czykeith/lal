@@ -39,6 +39,8 @@ type CustomizePubSession interface {
 type ILalServer interface {
 	AddCustomizePubSession(streamName string) (CustomizePubSession, error)
 	DelCustomizePubSession(session CustomizePubSession)
+	// StatGroup 用于判断某个 streamName 是否在逻辑层存在且处于在线状态（有 pub）。
+	StatGroup(streamName string) *base.StatGroup
 }
 
 type Conn struct {

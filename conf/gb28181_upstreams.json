@@ -2,7 +2,7 @@
  "upstreams": [
      {
        "id": "center-a",
-       "enable": false,
+       "enable": true,
        "sip_id": "42010000101234567890",
        "realm": "houqinban.cn",
        "sip_ip": "192.168.110.110",
@@ -20,7 +20,7 @@
    "subs": [
      {
        "upstream_id": "center-a",
-       "stream_name": "test_stream",
+       "stream_name": "camera3",
        "channel_id": "34020000002000000001"
      }
   ]
