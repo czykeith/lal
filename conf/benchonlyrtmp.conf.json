@@ -55,7 +55,7 @@
   },
   "http_api": {
     "enable": false,
-    "addr": ":8083"
+    "addr": ":10001"
   },
   "server_id": "1",
   "http_notify": {
