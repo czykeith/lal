@@ -263,11 +263,12 @@ func (channel *Channel) Invite(opt *InviteOptions, streamName string, playInfo *
 		opt.String(),
 	)
 	sdpInfo = append(sdpInfo,
-		fmt.Sprintf("m=video %d %sRTP/AVP 96 97 98", opt.MediaPort, protocol),
+		fmt.Sprintf("m=video %d %sRTP/AVP 96 98 99 97", opt.MediaPort, protocol),
 		"a=recvonly",
 		"a=rtpmap:96 PS/90000",
-		"a=rtpmap:97 MPEG4/90000",
 		"a=rtpmap:98 H264/90000",
+		"a=rtpmap:99 H265/90000",
+		"a=rtpmap:97 MPEG4/90000",
 		"y="+opt.ssrc,
 	)
 
