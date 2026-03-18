@@ -61,7 +61,7 @@
     "auth_method": 1,
     "username": "q191201771",
     "password": "pengrl",
-    "ws_rtsp_enable": true,
+    "ws_rtsp_enable": false,
     "ws_rtsp_addr": ":5566"
   },
   "record": {

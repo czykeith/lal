@@ -380,6 +380,11 @@ func LoadConfAndInitLog(rawContent []byte) *Config {
 		config.SnapshotConfig.TimeoutMs = 3000
 		Log.Warnf("config snapshot.timeout_ms not exist. set to default which is %d", config.SnapshotConfig.TimeoutMs)
 	}
+	// ws-rtsp 默认关闭，避免未配置时意外暴露额外端口
+	if !j.Exist("rtsp.ws_rtsp_enable") {
+		config.RtspConfig.WsRtspEnable = false
+		Log.Warnf("config rtsp.ws_rtsp_enable not exist. set to default which is %v", config.RtspConfig.WsRtspEnable)
+	}
 	if config.HlsConfig.Enable && !j.Exist("hls.cleanup_mode") {
 		Log.Warnf("config hls.cleanup_mode not exist. set to default which is %d", defaultHlsCleanupMode)
 		config.HlsConfig.CleanupMode = defaultHlsCleanupMode
