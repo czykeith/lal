@@ -141,6 +141,12 @@ func (s *GB28181Server) hasActiveMediaStream(streamName string) bool {
 	return false
 }
 
+// HasActiveMediaStream 判断给定 streamName 是否在当前节点“有实际媒体数据”。
+// 供 logic/http api 等外部调用复用统一口径。
+func (s *GB28181Server) HasActiveMediaStream(streamName string) bool {
+	return s.hasActiveMediaStream(streamName)
+}
+
 // devIDFromSerial 根据平台 Serial 简单推导一个行政区划编码（CivilCode）的兜底值。
 // 若 Serial 长度不少于 6，则取前 6 位，否则返回空字符串。
 func devIDFromSerial(serial string) string {

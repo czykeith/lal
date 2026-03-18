@@ -307,9 +307,12 @@ func (sm *ServerManager) CtrlGb28181Invite(info base.ApiCtrlGb28181InviteReq) (r
 		streamIndex = 0
 	}
 
-	// 同一 streamName 已在拉流：直接成功，不再 INVITE、不做 replace（与 AddCustomizePubSession 侧「同 streamName 不替换」一致）。
+	// 先以 device_id + channel_id + stream_name 查找：若存在“有效拉取”的流则直接返回，避免重复 INVITE。
+	// 注：内部实现实际按 (device_id+channel_id+stream_index) 找到当前 INVITE 通道后再比对 stream_name，
+	// 以兼容同一通道的主/子码流。
 	if streamName != "" {
-		if cur := sm.gb28181Server.FindChannelByStreamName(streamName); cur != nil && cur.MediaInfo.IsInvite {
+		if cur := sm.gb28181Server.FindInvitingChannelByRequest(info.DeviceId, info.ChannelId, streamIndex); cur != nil &&
+			cur.MediaInfo.IsInvite && cur.MediaInfo.StreamName == streamName && sm.gb28181Server.HasActiveMediaStream(streamName) {
 			ret.ErrorCode = base.ErrorCodeSucc
 			ret.Desp = base.DespSucc
 			ret.Data.StreamName = streamName
@@ -320,16 +323,41 @@ func (sm *ServerManager) CtrlGb28181Invite(info base.ApiCtrlGb28181InviteReq) (r
 		}
 	}
 
-	// 同设备+通道+码流已在拉流（streamName 可能与请求不一致时仍避免重复 INVITE）
-	if cur := sm.gb28181Server.FindInvitingChannelByRequest(info.DeviceId, info.ChannelId, streamIndex); cur != nil && cur.MediaInfo.IsInvite {
-		ret.ErrorCode = base.ErrorCodeSucc
-		ret.Desp = base.DespSucc
-		ret.Data.StreamName = cur.MediaInfo.StreamName
-		if port := parseGb28181MediaPort(cur.MediaInfo.MediaKey); port > 0 {
-			ret.Data.Port = port
+	// 同一 streamName 已在拉流：直接成功，不再 INVITE、不做 replace（与 AddCustomizePubSession 侧「同 streamName 不替换」一致）。
+	//
+	// 新策略：重复调用时以 “device_id + channel_id + stream_index” 维度清理已存在的拉流，
+	// 同时以 “stream_name” 维度清理可能已存在的流（解决换 streamName 和 streamName 重复冲突）。
+	stopByStreamName := func(sn string) {
+		if sn == "" {
+			return
 		}
-		return
+		ch0 := sm.gb28181Server.FindChannelByStreamName(sn)
+		if ch0 == nil || !ch0.MediaInfo.IsInvite {
+			return
+		}
+		_ = ch0.Bye(sn)
+		// 若是回放流，也同步清理回放会话记录（防残留）。
+		sm.gb28181Server.UnregisterPlaybackSession(sn)
 	}
+	stopByDeviceChannel := func(deviceID, channelID string, idx int) {
+		cur := sm.gb28181Server.FindInvitingChannelByRequest(deviceID, channelID, idx)
+		if cur == nil || !cur.MediaInfo.IsInvite {
+			return
+		}
+		oldSN := cur.MediaInfo.StreamName
+		if oldSN == "" {
+			oldSN = streamName
+		}
+		_ = cur.Bye(oldSN)
+		if oldSN != "" {
+			sm.gb28181Server.UnregisterPlaybackSession(oldSN)
+		}
+	}
+
+	// 1) 先按 device_id + channel_id + stream_index 清理已有拉流（不管旧 streamName）
+	stopByDeviceChannel(info.DeviceId, info.ChannelId, streamIndex)
+	// 2) 再按 stream_name 清理（避免 streamName 被其它通道占用或换名冲突）
+	stopByStreamName(streamName)
 
 	// 内部通道选择目前仅区分主/子（heuristic），因此将 index 映射为主(0) / 子(1)。
 	streamType := 0

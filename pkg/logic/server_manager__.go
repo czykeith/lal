@@ -659,28 +659,33 @@ func (sm *ServerManager) RequestUpstreamRtpFeed(streamName string, feedFn func(r
 
 // isH264Idr 判断 AnnexB H264 帧中是否包含 IDR 切片。
 func isH264Idr(frame []byte) bool {
-	// 简单解析第一个 NALU 头，判断是否为 IDR slice（type=5）。
+	// 扫描整帧所有 NALU，只要包含 IDR slice（type=5）即可视为关键帧。
 	i := 0
 	n := len(frame)
 	for i+4 <= n {
 		// 查找 start code 0x000001 或 0x00000001
 		if frame[i] == 0x00 && frame[i+1] == 0x00 {
 			if frame[i+2] == 0x01 {
-				// 0x000001
 				i += 3
 			} else if i+3 < n && frame[i+2] == 0x00 && frame[i+3] == 0x01 {
-				// 0x00000001
 				i += 4
 			} else {
 				i++
 				continue
 			}
+			// 跳过可能的填充 0x00
+			for i < n && frame[i] == 0x00 {
+				i++
+			}
 			if i >= n {
 				return false
 			}
-			naluType := avc.ParseNaluType(frame[i])
-			// IDR slice
-			return naluType == avc.NaluTypeIdrSlice
+			// nalu header 第一个字节
+			t := avc.ParseNaluType(frame[i])
+			if t == avc.NaluTypeIdrSlice {
+				return true
+			}
+			// 继续扫描下一个 start code（当前 NALU 的内容无需逐字节跳过，因为我们在 i++ 的循环里继续找）
 		}
 		i++
 	}
@@ -689,6 +694,7 @@ func isH264Idr(frame []byte) bool {
 
 // isHevcIdr 判断 AnnexB H265 帧中是否包含 IDR/I 帧。
 func isHevcIdr(frame []byte) bool {
+	// 扫描整帧所有 NALU，只要包含 IRAP/BLA/CRA 等 VCL 即视为关键帧起点。
 	i := 0
 	n := len(frame)
 	for i+5 <= n {
@@ -701,15 +707,17 @@ func isHevcIdr(frame []byte) bool {
 				i++
 				continue
 			}
+			for i < n && frame[i] == 0x00 {
+				i++
+			}
 			if i >= n {
 				return false
 			}
 			naluType := hevc.ParseNaluType(frame[i])
-			// 参考 hevc.NaluType* 定义：IRAP/BLA/CRA 等 VCL 都可以视为关键帧起点。
 			if naluType >= hevc.NaluTypeSliceBlaWlp && naluType <= hevc.NaluTypeSliceRsvIrapVcl23 {
 				return true
 			}
-			return false
+			// 继续扫描后续 NALU
 		}
 		i++
 	}

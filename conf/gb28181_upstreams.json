@@ -1,27 +1,26 @@
 {
- "upstreams": [
-     {
-       "id": "center-a",
-       "enable": true,
-       "sip_id": "42010000101234567890",
-       "realm": "houqinban.cn",
-       "sip_ip": "192.168.110.110",
-       "sip_port": 5060,
-       "local_device_id": "34020000001320000001",
-       "username": "",
-       "password": "czykeith",
-       "register_validity": 3600,
-       "keepalive_interval": 60,
-       "media_ip": "192.168.110.164",
-       "media_port": 30000,
-       "comment": "一级中心平台 A"
-     }
-   ],
-   "subs": [
-     {
-       "upstream_id": "center-a",
-       "stream_name": "camera3",
-       "channel_id": "34020000002000000001"
-     }
+  "upstreams": [
+    {
+      "id": "2034162200901320704",
+      "enable": true,
+      "sip_id": "42010000101234567890",
+      "realm": "houqinban.cn",
+      "sip_ip": "192.168.110.110",
+      "sip_port": 5060,
+      "local_device_id": "23432432432432234234",
+      "username": "",
+      "password": "czykeith",
+      "register_validity": 3600,
+      "keepalive_interval": 60,
+      "media_ip": "192.168.110.164",
+      "comment": "111"
+    }
+  ],
+  "subs": [
+    {
+      "upstream_id": "2034162200901320704",
+      "stream_name": "2222",
+      "channel_id": "72034176897646084096"
+    }
   ]
 }
