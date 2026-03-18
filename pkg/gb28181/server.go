@@ -1645,6 +1645,8 @@ func (s *GB28181Server) maybeCleanupVirtualMediaServer() {
 
 	// 从 MediaServerMap 中移除并释放虚拟 mediaserver 资源。
 	s.MediaServerMap.Delete(virtualMediaKey)
+	// 先清空所有上级 sink（关闭 UDP 连接），再释放实例。
+	vm.ClearAllUpstreamSinks()
 	vm.Dispose()
 	s.virtualMediaserver = nil
 }
@@ -1740,6 +1742,103 @@ func (s *GB28181Server) ReloadUpstreams(newConfs []GB28181UpstreamConfig) {
 			}
 		}
 	}
+}
+
+// BrutalReloadUpstreams 使用“简单粗暴”的方式重载上级配置：
+// - 清理所有上级相关运行时资源（会话、sink、虚拟 mediaserver、缓存、索引、上级循环）；
+// - 再按 newConfs 重建上级平台运行时结构并启动循环。
+// 该方法不会影响下级 GB28181 设备接入侧（sip_port 等）。
+func (s *GB28181Server) BrutalReloadUpstreams(newConfs []GB28181UpstreamConfig) {
+	// 1) 停止并清理所有上级播放会话（不等待、尽量不阻塞）
+	s.upstreamSessions.Range(func(key, value any) bool {
+		sess, ok := value.(*UpstreamSession)
+		if !ok {
+			s.upstreamSessions.Delete(key)
+			return true
+		}
+		// 不发送 BYE：粗暴重载以快速清理为主，避免因网络不可达阻塞或拖慢重载。
+		if sess.CancelFeed != nil {
+			sess.CancelFeed()
+			sess.CancelFeed = nil
+		}
+		if sess.MediaKey != "" && sess.SinkID != "" {
+			if mv, ok2 := s.MediaServerMap.Load(sess.MediaKey); ok2 {
+				if mediasvr, ok3 := mv.(*mediaserver.GB28181MediaServer); ok3 {
+					mediasvr.RemoveUpstreamSink(sess.SinkID)
+				}
+			}
+		}
+		s.upstreamSessions.Delete(key)
+		return true
+	})
+	// 兜底清场：即便会话表与 sink 状态不同步，也要清空所有 mediaserver 中的 upstreamSinks，避免残留转推连接。
+	s.MediaServerMap.Range(func(_, v any) bool {
+		if ms, ok := v.(*mediaserver.GB28181MediaServer); ok && ms != nil {
+			ms.ClearAllUpstreamSinks()
+		}
+		return true
+	})
+	// 清理按通道索引
+	s.upstreamSessionsByChannelMu.Lock()
+	s.upstreamSessionsByChannel = make(map[string]map[string]*UpstreamSession)
+	s.upstreamSessionsByChannelMu.Unlock()
+	// 清理目录缓存
+	s.upstreamCatalogCacheMu.Lock()
+	s.upstreamCatalogCache = make(map[string]struct {
+		list      []upstreamChannelInfo
+		updatedAt time.Time
+	})
+	s.upstreamCatalogCacheMu.Unlock()
+
+	// 2) 停止所有上级循环并清空 upstreams / upstreamsByIP
+	s.upstreamsMu.Lock()
+	old := s.upstreams
+	s.upstreams = make(map[string]*upstreamServer)
+	s.upstreamsMu.Unlock()
+
+	// 重建 IP 索引（直接清空）
+	s.upstreamsByIPMu.Lock()
+	s.upstreamsByIP = make(map[string]string)
+	s.upstreamsByIPMu.Unlock()
+
+	// 停止旧上级循环
+	for _, up := range old {
+		if up == nil || up.stopCh == nil {
+			continue
+		}
+		func() {
+			defer func() {
+				_ = recover()
+			}()
+			close(up.stopCh)
+		}()
+	}
+
+	// 3) 清理虚拟 mediaserver（此时已无会话引用，可安全销毁）
+	s.maybeCleanupVirtualMediaServer()
+
+	// 4) 按新配置重建上级运行时并启动循环
+	s.upstreamsMu.Lock()
+	if s.upstreams == nil {
+		s.upstreams = make(map[string]*upstreamServer)
+	}
+	for _, uc := range newConfs {
+		if !uc.Enable || uc.ID == "" {
+			continue
+		}
+		up := &upstreamServer{
+			conf:   uc,
+			stopCh: make(chan struct{}),
+		}
+		s.upstreams[uc.ID] = up
+		go s.runUpstreamLoop(up)
+		if uc.SipIP != "" {
+			s.upstreamsByIPMu.Lock()
+			s.upstreamsByIP[uc.SipIP] = uc.ID
+			s.upstreamsByIPMu.Unlock()
+		}
+	}
+	s.upstreamsMu.Unlock()
 }
 func (s *GB28181Server) newSipServer(network string, port uint16) gosip.Server {
 	srvConf := gosip.ServerConfig{}

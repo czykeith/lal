@@ -634,6 +634,39 @@ func (sm *ServerManager) CtrlGb28181UpstreamsConfSet(confFile Gb28181UpstreamCon
 		ret.Desp = fmt.Sprintf("write upstream config file failed: %v", err)
 		return
 	}
+
+	// 写盘成功后，直接应用到运行时（合并 reload 行为）
+	// 覆盖内存配置
+	sm.config.Gb28181Config.Upstreams = confFile.Upstreams
+	sm.config.Gb28181Config.UpstreamSubs = confFile.Subs
+
+	// 若 gb28181 未启用或服务未启动，仅更新配置即可
+	if !sm.config.Gb28181Config.Enable || sm.gb28181Server == nil {
+		return
+	}
+	// 刷新上级平台
+	gbConf := gb28181ConfigFromLogic(sm.config.Gb28181Config)
+	// 使用简单粗暴重载：先清空所有上级相关运行时资源，再按新配置重建。
+	sm.gb28181Server.BrutalReloadUpstreams(gbConf.Upstreams)
+	// 重建订阅（仅对已启用的上级）
+	sm.gb28181Server.ClearAllUpstreamSubs()
+	enabledUpstreamIDs := make(map[string]struct{})
+	for _, u := range sm.config.Gb28181Config.Upstreams {
+		if u.Enable && u.ID != "" {
+			enabledUpstreamIDs[u.ID] = struct{}{}
+		}
+	}
+	for _, sub := range sm.config.Gb28181Config.UpstreamSubs {
+		if _, enabled := enabledUpstreamIDs[sub.UpstreamID]; !enabled {
+			continue
+		}
+		if err := sm.gb28181Server.AddUpstreamSub(sub.UpstreamID, sub.StreamName, sub.ChannelID); err != nil {
+			Log.Warnf("apply gb28181 upstream sub failed. upstream=%s stream=%s channel=%s err=%+v",
+				sub.UpstreamID, sub.StreamName, sub.ChannelID, err)
+		}
+	}
+	// brutal reload 已清空所有会话，此处无需对齐，但保留一次调用以防未来逻辑调整。
+	sm.gb28181Server.ReconcileUpstreamSessionsWithSubs()
 	return
 }
 
@@ -685,7 +718,8 @@ func (sm *ServerManager) CtrlGb28181UpstreamsReload() (ret base.ApiRespBasic) {
 
 	// 仅刷新上级平台相关配置，不重启其他 GB28181 服务。
 	gbConf := gb28181ConfigFromLogic(sm.config.Gb28181Config)
-	sm.gb28181Server.ReloadUpstreams(gbConf.Upstreams)
+	// 使用简单粗暴重载：先清空所有上级相关运行时资源，再按新配置重建。
+	sm.gb28181Server.BrutalReloadUpstreams(gbConf.Upstreams)
 
 	// 重建运行时订阅表：先清空，再按配置文件重建；仅对已启用的上级注入订阅。
 	sm.gb28181Server.ClearAllUpstreamSubs()

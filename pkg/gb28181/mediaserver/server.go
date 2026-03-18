@@ -194,6 +194,23 @@ func (s *GB28181MediaServer) RemoveUpstreamSink(id string) {
 	}
 }
 
+// ClearAllUpstreamSinks 清空并关闭所有上级转推 Sink（用于重载/清场）。
+func (s *GB28181MediaServer) ClearAllUpstreamSinks() {
+	s.upstreamSinks.Range(func(k, v any) bool {
+		id, _ := k.(string)
+		if id != "" {
+			s.RemoveUpstreamSink(id)
+		} else {
+			// fallback: 尝试直接关闭 conn 并删除
+			if sink, ok := v.(*UpstreamSink); ok && sink != nil && sink.conn != nil {
+				_ = sink.conn.Close()
+			}
+			s.upstreamSinks.Delete(k)
+		}
+		return true
+	})
+}
+
 // ForwardRtp 将指定 streamName 的 RTP 包额外转发到已注册的上级 Sink。
 func (s *GB28181MediaServer) ForwardRtp(streamName string, pkt *rtp.Packet) {
 	if pkt == nil {
