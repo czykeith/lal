@@ -23,8 +23,8 @@
     "https_key_file": "./conf/key.pem"
   },
   "httpflv": {
-    "enable": true,
-    "enable_https": true,
+    "enable": false,
+    "enable_https": false,
     "url_pattern": "/",
     "gop_num": 0,
     "single_gop_max_frame_num": 0
