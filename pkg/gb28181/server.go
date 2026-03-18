@@ -585,7 +585,9 @@ func (s *GB28181Server) ensureUpstreamKeepalive(up *upstreamServer) error {
 		return fmt.Errorf("build upstream keepalive request failed")
 	}
 
-	resp, err := s.upstreamSipSvr.RequestWithContext(context.Background(), req)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	resp, err := s.upstreamSipSvr.RequestWithContext(ctx, req)
 	if err != nil {
 		return err
 	}
@@ -1258,7 +1260,9 @@ func (s *GB28181Server) sendUpstreamBye(sess *UpstreamSession) {
 	req.SetTransport("udp")
 	req.SetDestination(net.JoinHostPort(up.conf.SipIP, strconv.Itoa(int(up.conf.SipPort))))
 
-	if _, err := s.upstreamSipSvr.RequestWithContext(context.Background(), req); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if _, err := s.upstreamSipSvr.RequestWithContext(ctx, req); err != nil {
 		base.Log.Warnf("gb28181 upstream send BYE failed. upstream=%s callID=%s err=%+v", sess.UpstreamID, sess.CallID, err)
 	}
 }
@@ -1398,7 +1402,9 @@ func (s *GB28181Server) sendUpstreamCatalog(up *upstreamServer) error {
 	req.AppendHeader(&contentType)
 	req.SetBody(body, true)
 
-	resp, err := s.upstreamSipSvr.RequestWithContext(context.Background(), req)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	resp, err := s.upstreamSipSvr.RequestWithContext(ctx, req)
 	if err != nil {
 		return err
 	}

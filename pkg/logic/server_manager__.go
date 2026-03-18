@@ -651,7 +651,15 @@ func (sm *ServerManager) RequestUpstreamRtpFeed(streamName string, feedFn func(r
 		}
 		pts := uint64(pkt.Pts)
 		dts := uint64(pkt.Timestamp)
-		_ = psMuxer.Write(videoSid, pkt.Payload, pts, dts)
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					// mpegps 组件内部存在 panic（如越界写），这里做保护，避免单帧异常导致进程崩溃。
+					Log.Warnf("upstream rtp feed ps muxer panic recovered. streamName=%s panic=%v", streamName, r)
+				}
+			}()
+			_ = psMuxer.Write(videoSid, pkt.Payload, pts, dts)
+		}()
 	})
 
 	return func() { cancelSub() }, nil

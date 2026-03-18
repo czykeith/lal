@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/xml"
+	"math/rand"
 	"net/http"
 	"strings"
 	"sync"
@@ -63,6 +64,12 @@ type Device struct {
 
 	network string
 	sipSvr  gosip.Server
+
+	// DeviceInfo 查询的退避重试控制，避免离线/异常设备导致持续请求消耗资源。
+	deviceInfoRetryCount  int
+	deviceInfoNextRetryAt time.Time
+	deviceInfoLastOKAt    time.Time
+	deviceInfoLastLogAt   time.Time
 }
 
 func (d *Device) WithMediaServer(observer IMediaOpObserver) {
@@ -252,23 +259,58 @@ func (d *Device) Subscribe(conf GB28181Config) int {
 }
 
 func (d *Device) QueryDeviceInfo(conf GB28181Config) {
-	for i := time.Duration(5); i < 100; i++ {
+	now := time.Now()
+	if !d.deviceInfoNextRetryAt.IsZero() && now.Before(d.deviceInfoNextRetryAt) {
+		return
+	}
+	// 成功后冷却一段时间，避免被频繁触发导致重复查询（典型场景：大量注册/同步触发）。
+	if !d.deviceInfoLastOKAt.IsZero() && now.Sub(d.deviceInfoLastOKAt) < 30*time.Minute {
+		return
+	}
 
-		time.Sleep(time.Second * i)
-		request := d.CreateRequest(sip.MESSAGE, conf)
-		contentType := sip.ContentType("Application/MANSCDP+xml")
-		request.AppendHeader(&contentType)
-		request.SetBody(BuildDeviceInfoXML(d.sn, d.ID), true)
+	request := d.CreateRequest(sip.MESSAGE, conf)
+	contentType := sip.ContentType("Application/MANSCDP+xml")
+	request.AppendHeader(&contentType)
+	request.SetBody(BuildDeviceInfoXML(d.sn, d.ID), true)
 
-		base.Log.Info("GB28181 MESSAGE(DeviceInfo) >>>", "\n", request.String())
+	// 降噪：离线/异常设备时该请求可能反复触发，改为 Debug。
+	base.Log.Debug("GB28181 MESSAGE(DeviceInfo) >>>", "\n", request.String())
 
-		response, _ := d.SipRequestForResponse(request)
-		if response != nil {
-			if response.StatusCode() == http.StatusOK {
-				break
-			}
+	response, err := d.SipRequestForResponse(request)
+	if err == nil && response != nil && response.StatusCode() == http.StatusOK {
+		d.deviceInfoRetryCount = 0
+		d.deviceInfoNextRetryAt = time.Time{}
+		d.deviceInfoLastLogAt = time.Time{}
+		d.deviceInfoLastOKAt = now
+		return
+	}
+
+	// 失败：指数退避 + 抖动，上限 10 分钟，避免离线设备持续消耗资源。
+	d.deviceInfoRetryCount++
+	backoff := 5 * time.Second
+	for i := 0; i < d.deviceInfoRetryCount && i < 10; i++ {
+		backoff *= 2
+	}
+	if backoff > 10*time.Minute {
+		backoff = 10 * time.Minute
+	}
+	// jitter: 0.8~1.2
+	j := 0.8 + rand.New(rand.NewSource(now.UnixNano())).Float64()*0.4
+	backoff = time.Duration(float64(backoff) * j)
+	d.deviceInfoNextRetryAt = now.Add(backoff)
+
+	// 日志限速：至少间隔 30s 打一次
+	if d.deviceInfoLastLogAt.IsZero() || now.Sub(d.deviceInfoLastLogAt) >= 30*time.Second {
+		d.deviceInfoLastLogAt = now
+		if err != nil {
+			base.Log.Warnf("gb28181 deviceinfo query failed. device=%s nextIn=%v err=%+v", d.ID, backoff, err)
+		} else if response == nil {
+			base.Log.Warnf("gb28181 deviceinfo query failed. device=%s nextIn=%v err=empty response", d.ID, backoff)
+		} else {
+			base.Log.Warnf("gb28181 deviceinfo query failed. device=%s code=%d nextIn=%v", d.ID, response.StatusCode(), backoff)
 		}
 	}
+	return
 }
 
 // UpdateChannelStatus 目录订阅消息处理：新增/移除/更新通道或者更改通道状态
@@ -380,7 +422,12 @@ func (d *Device) UpdateChannelPosition(channelId string, gpsTime string, lng str
 }
 
 func (d *Device) SipRequestForResponse(request sip.Request) (sip.Response, error) {
-	return d.sipSvr.RequestWithContext(context.Background(), request)
+	// 默认给所有对外 SIP 请求加超时，避免 context.Background() 导致事务长时间悬挂、资源堆积。
+	// 设备/网络偶发抖动时可通过带超时的接口覆盖该默认值。
+	const defaultSipRequestTimeout = 5 * time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), defaultSipRequestTimeout)
+	defer cancel()
+	return d.sipSvr.RequestWithContext(ctx, request)
 }
 
 func (d *Device) SipRequestForResponseWithTimeout(request sip.Request, timeout time.Duration) (sip.Response, error) {

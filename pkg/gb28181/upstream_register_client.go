@@ -99,14 +99,19 @@ func buildUpstreamRawRegister(sConf *GB28181Config, uConf *GB28181UpstreamConfig
 	if upPort == 0 {
 		upPort = 5061
 	}
-	fmt.Fprintf(&b, "Via: SIP/2.0/UDP %s:%d;branch=z9hG4bK%s\r\n", sConf.MediaConfig.MediaIp, upPort, branch)
+	// 优先使用上级配置中的 media_ip（上级可达的本机 IP），避免多网卡/NAT 场景下填错导致回包异常。
+	localIP := uConf.MediaIP
+	if localIP == "" {
+		localIP = sConf.MediaConfig.MediaIp
+	}
+	fmt.Fprintf(&b, "Via: SIP/2.0/UDP %s:%d;branch=z9hG4bK%s\r\n", localIP, upPort, branch)
 	fmt.Fprintf(&b, "From: <sip:%s@%s>;tag=%s\r\n", deviceID, realm, tag)
 	fmt.Fprintf(&b, "To: <sip:%s@%s>\r\n", deviceID, realm)
 	fmt.Fprintf(&b, "Call-ID: %s\r\n", callID)
 	fmt.Fprintf(&b, "CSeq: %s REGISTER\r\n", cseq)
 	fmt.Fprintf(&b, "Max-Forwards: 70\r\n")
 	fmt.Fprintf(&b, "User-Agent: keith_lalserver\r\n")
-	fmt.Fprintf(&b, "Contact: <sip:%s@%s:%d>\r\n", deviceID, sConf.MediaConfig.MediaIp, upPort)
+	fmt.Fprintf(&b, "Contact: <sip:%s@%s:%d>\r\n", deviceID, localIP, upPort)
 	expires := uConf.RegisterValidity
 	if expires <= 0 {
 		expires = 3600
@@ -144,16 +149,19 @@ func parseWwwAuthenticate(resp string) (realm, nonce string) {
 		lower := strings.ToLower(l)
 		if strings.HasPrefix(lower, "www-authenticate:") {
 			// 示例：WWW-Authenticate: Digest realm="3402000000",algorithm=MD5,nonce="xxxx"
+			//
+			// 注意：realm/nonce 的值可能包含大小写敏感内容（尤其是 nonce）。
+			// 这里只对匹配做 ToLower，但切片取值必须从原始字符串 l 中截取，避免把值转成小写导致鉴权失败。
 			if idx := strings.Index(lower, `realm="`); idx >= 0 {
 				start := idx + len(`realm="`)
 				if end := strings.Index(lower[start:], `"`); end > 0 {
-					realm = lower[start : start+end]
+					realm = l[start : start+end]
 				}
 			}
 			if idx := strings.Index(lower, `nonce="`); idx >= 0 {
 				start := idx + len(`nonce="`)
 				if end := strings.Index(lower[start:], `"`); end > 0 {
-					nonce = lower[start : start+end]
+					nonce = l[start : start+end]
 				}
 			}
 			break
