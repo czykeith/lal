@@ -20,18 +20,18 @@ import (
 // 并且将这些信息打入可执行文件、日志、各协议中的标准版本字段中
 
 // LalVersion 整个lal工程的版本号。注意，该变量由外部脚本修改维护，不要手动在代码中修改
-var LalVersion = "v0.38.4"
+var LalVersion = "v0.90.0"
 
 // ConfVersion lalserver的配置文件的版本号
 var ConfVersion = "v0.4.1"
 
 // HttpApiVersion lalserver的HTTP-API功能的版本号
-var HttpApiVersion = "v0.38.4"
+var HttpApiVersion = "v0.39.0"
 
 // HttpNotifyVersion lalserver的HTTP-Notify功能的版本号
 var HttpNotifyVersion = "v0.2.5"
 
-var HttpWebUiVersion = "v0.0.3"
+var HttpWebUiVersion = "v0.0.4"
 
 var (
 	LalLibraryName    = "lal"

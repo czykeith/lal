@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -239,6 +240,25 @@ type Gb28181Config struct {
 	RetryMaxCount         int  `json:"retry_max_count"`          // 最大重试次数，0=不重试，-1=无限，默认 3
 	RetryFirstDelayMs     int  `json:"retry_first_delay_ms"`     // 首次重试延迟（毫秒），默认 3000
 	RetryMaxDelayMs       int  `json:"retry_max_delay_ms"`       // 退避上限（毫秒），默认 60000
+
+	// UpstreamSipPort 上级 GB28181 消息监听端口（中间平台模式）。
+	// 若为 0，则内部会使用默认值 5061。
+	UpstreamSipPort int `json:"upstream_sip_port"`
+
+	// UpstreamEnable 是否启用 GB28181 上级模式（中间平台 / 级联网关）。
+	// 关闭时不会启动针对上级的 SIP Server，也不会向上级 REGISTER/Keepalive。
+	UpstreamEnable bool `json:"upstream_enable"`
+
+	// Upstreams 上级 GB28181 平台列表（级联）。
+	// 本服务在这些上级眼中以“设备”身份存在，用于实现级联转推。
+	Upstreams []Gb28181UpstreamConfig `json:"upstreams"`
+
+	// UpstreamConfigFile 上级 GB28181 级联配置的独立文件路径（可选）。
+	// 如配置，则优先从该文件中加载上级平台列表及其关联流信息。
+	UpstreamConfigFile string `json:"upstream_config_file"`
+
+	// UpstreamSubs 从独立配置文件中加载的上级平台订阅流列表（只做持久化，不直接传入 gb28181 包）。
+	UpstreamSubs []Gb28181UpstreamSubConfig `json:"-"`
 }
 
 // Gb28181VideoConfig 嵌套视频参数，与 Gb28181Config 平铺字段二选一
@@ -250,6 +270,84 @@ type Gb28181VideoConfig struct {
 	Framerate flexInt `json:"framerate"` // fps
 	Profile   string  `json:"profile"`   // baseline/main/high
 	Level     string  `json:"level"`     // 3.1/4.0
+}
+
+// Gb28181UpstreamConfig logic 层用于持久化的上级 GB28181 平台配置。
+// 会在 gb28181ConfigFromLogic 中映射为 gb28181.GB28181UpstreamConfig。
+type Gb28181UpstreamConfig struct {
+	ID string `json:"id"`
+
+	Enable bool `json:"enable"`
+
+	SipID   string `json:"sip_id"`   // 上级平台自身的国标编码
+	Realm   string `json:"realm"`    // 上级平台域
+	SipIP   string `json:"sip_ip"`   // 上级平台 SIP IP
+	SipPort int    `json:"sip_port"` // 上级平台 SIP 端口
+
+	LocalDeviceID string `json:"local_device_id"`
+
+	Username string `json:"username"`
+	Password string `json:"password"`
+
+	RegisterValidity  int `json:"register_validity"`
+	KeepaliveInterval int `json:"keepalive_interval"`
+
+	MediaIP   string  `json:"media_ip"`
+	MediaPort flexInt `json:"media_port"`
+
+	Comment string `json:"comment"`
+}
+
+// Gb28181UpstreamSubConfig 独立配置文件中，用于描述“上级平台订阅了哪些本地流”的持久化结构。
+type Gb28181UpstreamSubConfig struct {
+	UpstreamID string `json:"upstream_id"` // 上级平台 ID
+	StreamName string `json:"stream_name"` // 本地流名（streamName）
+	ChannelID  string `json:"channel_id"`  // 提供给上级的通道ID（可选，支持非下级GB28181流）
+}
+
+// Gb28181UpstreamConfigFile 独立上级配置文件的整体结构。
+// 例如：conf/gb28181_upstreams.json
+type Gb28181UpstreamConfigFile struct {
+	Upstreams []Gb28181UpstreamConfig    `json:"upstreams"`
+	Subs      []Gb28181UpstreamSubConfig `json:"subs"`
+}
+
+// loadGb28181UpstreamConfigFromFile 从独立的 JSON 文件中加载上级 GB28181 配置及其订阅流信息。
+// 若文件不存在则自动创建一个带空结构的文件；内容为空时返回一个空结构。
+func loadGb28181UpstreamConfigFromFile(path string) (*Gb28181UpstreamConfigFile, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// 文件不存在时自动创建一个空模板：{"upstreams":[],"subs":[]}
+			dir := filepath.Dir(path)
+			if dir != "" && dir != "." {
+				_ = os.MkdirAll(dir, 0o755)
+			}
+			empty := Gb28181UpstreamConfigFile{
+				Upstreams: []Gb28181UpstreamConfig{},
+				Subs:      []Gb28181UpstreamSubConfig{},
+			}
+			b, marshalErr := json.MarshalIndent(empty, "", "  ")
+			if marshalErr == nil {
+				_ = os.WriteFile(path, b, 0o644)
+			}
+			// 返回空结构，方便后续逻辑统一处理
+			return &empty, nil
+		}
+		return nil, err
+	}
+	if len(data) == 0 {
+		// 文件存在但内容为空，返回空结构
+		return &Gb28181UpstreamConfigFile{
+			Upstreams: []Gb28181UpstreamConfig{},
+			Subs:      []Gb28181UpstreamSubConfig{},
+		}, nil
+	}
+	var cfg Gb28181UpstreamConfigFile
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, err
+	}
+	return &cfg, nil
 }
 
 type CommonHttpServerConfig struct {
@@ -280,6 +378,20 @@ func LoadConfAndInitLog(rawContent []byte) *Config {
 	if err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "nazajson unmarshal conf file failed. raw content=%s err=%+v", rawContent, err)
 		base.OsExitAndWaitPressIfWindows(1)
+	}
+
+	// 如果配置了独立的 GB28181 上级配置文件，则尝试加载并合并。
+	if path := config.Gb28181Config.UpstreamConfigFile; path != "" {
+		if upConf, err := loadGb28181UpstreamConfigFromFile(path); err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "load gb28181 upstream config file failed. path=%s err=%+v\n", path, err)
+		} else if upConf != nil {
+			// 覆盖或补充主配置中的 Upstreams。
+			if len(upConf.Upstreams) > 0 {
+				config.Gb28181Config.Upstreams = upConf.Upstreams
+			}
+			// 订阅流列表仅在 logic 层保留，供后续启动 gb28181Server 后按需调用 AddUpstreamSub 使用。
+			config.Gb28181Config.UpstreamSubs = upConf.Subs
+		}
 	}
 
 	// 初始化日志模块，注意，这一步尽量提前，使得后续的日志内容按我们的日志配置输出

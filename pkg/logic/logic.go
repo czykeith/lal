@@ -54,6 +54,10 @@ type ILalServer interface {
 
 	// 从已有流发起转推（仅推，不另外拉）
 	CtrlStartRelayFromStream(info base.ApiCtrlStartRelayFromStreamReq) base.ApiCtrlStartRelayFromStreamResp
+
+	// RequestUpstreamRtpFeed 为非 GB28181 流（如 RTMP/RTSP）向上级转推请求 RTP 喂流。
+	// feedFn 每收到一包 RTP 原始字节即调用一次；返回 cancel 供调用方在会话结束时停止喂流。
+	RequestUpstreamRtpFeed(streamName string, feedFn func(rawRtp []byte)) (cancel func(), err error)
 }
 
 // NewLalServer 创建一个lal server

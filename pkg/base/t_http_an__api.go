@@ -359,3 +359,39 @@ type Gb28181ChannelInfo struct {
 	Status      string `json:"status"`       // 状态：idle/streaming
 	StreamName  string `json:"stream_name"`  // 流名称（如果正在推流）
 }
+
+// ---------- GB28181 上级平台管理（中间平台模式） ----------
+
+// ApiGb28181Upstream 简要描述一个上级 GB28181 平台配置。
+type ApiGb28181Upstream struct {
+	ID            string `json:"id"`              // 逻辑唯一标识
+	Enable        bool   `json:"enable"`          // 是否启用
+	SipID         string `json:"sip_id"`          // 上级平台自身国标编码
+	Realm         string `json:"realm"`           // 上级平台域
+	SipIP         string `json:"sip_ip"`          // 上级平台 SIP IP
+	SipPort       int    `json:"sip_port"`        // 上级平台 SIP 端口
+	LocalDeviceID string `json:"local_device_id"` // 我方在该上级平台注册时使用的设备ID
+	Comment       string `json:"comment"`         // 备注
+}
+
+type ApiGb28181UpstreamListResp struct {
+	ApiRespBasic
+	Data struct {
+		Upstreams []ApiGb28181Upstream `json:"upstreams"`
+	} `json:"data"`
+}
+
+// ApiGb28181UpstreamSub 表示一个上级平台与本地流的订阅关系。
+type ApiGb28181UpstreamSub struct {
+	UpstreamID string `json:"upstream_id"`
+	StreamName string `json:"stream_name"`
+	ChannelID  string `json:"channel_id"` // 提供给上级的通道ID（可选，支持非下级GB28181流）
+}
+
+type ApiGb28181UpstreamSubsResp struct {
+	ApiRespBasic
+	Data struct {
+		UpstreamID string                  `json:"upstream_id"`
+		Subs       []ApiGb28181UpstreamSub `json:"subs"`
+	} `json:"data"`
+}

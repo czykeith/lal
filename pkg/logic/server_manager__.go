@@ -20,11 +20,15 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pion/rtp"
 	"github.com/q191201771/naza/pkg/taskpool"
 
+	"github.com/q191201771/lal/pkg/avc"
 	"github.com/q191201771/lal/pkg/base"
 	"github.com/q191201771/lal/pkg/gb28181"
 	"github.com/q191201771/lal/pkg/gb28181/mediaserver"
+	"github.com/q191201771/lal/pkg/gb28181/mpegps"
+	"github.com/q191201771/lal/pkg/hevc"
 	"github.com/q191201771/lal/pkg/hls"
 	"github.com/q191201771/lal/pkg/httpflv"
 	"github.com/q191201771/lal/pkg/httpts"
@@ -85,6 +89,16 @@ func (a *gbLalAdapter) DelCustomizePubSession(sess mediaserver.CustomizePubSessi
 		return
 	}
 	Log.Warnf("gb28181 del customize pub session ignored: unexpected type %T", sess)
+}
+
+// RequestUpstreamRtpFeed 实现 gb28181.UpstreamRtpFeeder，供非 GB28181 流上级转推时请求 RTP 喂流。
+func (a *gbLalAdapter) RequestUpstreamRtpFeed(streamName string, feedFn func(rawRtp []byte)) (cancel func(), err error) {
+	return a.inner.RequestUpstreamRtpFeed(streamName, feedFn)
+}
+
+// StatGroup 透传 logic 层的 StatGroup 能力，供 gb28181 用于查询任意 streamName 的在线状态。
+func (a *gbLalAdapter) StatGroup(streamName string) *base.StatGroup {
+	return a.inner.StatGroup(streamName)
 }
 
 func NewServerManager(modOption ...ModOption) *ServerManager {
@@ -168,7 +182,24 @@ Doc: %s
 		adapter := &gbLalAdapter{inner: sm}
 		sm.gb28181Server = gb28181.NewGB28181Server(gb28181Conf, adapter)
 		sm.gb28181Server.Start()
-		Log.Infof("gb28181 server started (lalmax).")
+		// 若独立配置文件中定义了上级平台的订阅关系，则在 gb28181Server 启动后进行初始化。
+		// 仅对已启用的上级平台注入订阅，避免因上级 enable=false 导致 "upstream not found" 告警。
+		enabledUpstreamIDs := make(map[string]struct{})
+		for _, u := range sm.config.Gb28181Config.Upstreams {
+			if u.Enable && u.ID != "" {
+				enabledUpstreamIDs[u.ID] = struct{}{}
+			}
+		}
+		for _, sub := range sm.config.Gb28181Config.UpstreamSubs {
+			if _, enabled := enabledUpstreamIDs[sub.UpstreamID]; !enabled {
+				continue
+			}
+			if err := sm.gb28181Server.AddUpstreamSub(sub.UpstreamID, sub.StreamName, sub.ChannelID); err != nil {
+				Log.Warnf("init gb28181 upstream sub failed. upstream=%s stream=%s channel=%s err=%+v",
+					sub.UpstreamID, sub.StreamName, sub.ChannelID, err)
+			}
+		}
+		Log.Infof("gb28181 server started . upsteam_enable=%v", sm.config.Gb28181Config.UpstreamEnable)
 	}
 
 	if sm.config.PprofConfig.Enable {
@@ -541,6 +572,168 @@ func (sm *ServerManager) DelCustomizePubSession(sessionCtx ICustomizePubSessionC
 	group.DelCustomizePubSession(sessionCtx)
 }
 
+func (sm *ServerManager) RequestUpstreamRtpFeed(streamName string, feedFn func(rawRtp []byte)) (cancel func(), err error) {
+	if streamName == "" {
+		return nil, fmt.Errorf("streamName is required")
+	}
+	group := sm.GetGroup("", streamName)
+	if group == nil {
+		return nil, fmt.Errorf("stream not found: %s", streamName)
+	}
+	// 基于 Group 的 AvPacket 订阅，将视频帧打成 PS 并封装为 PS/RTP，喂给上层的 feedFn。
+	subID := fmt.Sprintf("upstream_rtp_%s_%d", streamName, time.Now().UnixNano())
+
+	psMuxer := mpegps.NewPsMuxer()
+	var videoSid uint8
+	var inited bool
+	var started bool
+	var seq uint16
+	psMuxer.OnPacket = func(ps []byte, pts90 uint64) {
+		if len(ps) == 0 {
+			return
+		}
+		// 使用 PS 包的 PTS(90k 时基) 作为 RTP 时间戳，保持与实际帧时间对齐。
+		ts := uint32(pts90 & 0xffffffff)
+		const maxPayload = 1300
+		for off := 0; off < len(ps); {
+			size := len(ps) - off
+			if size > maxPayload {
+				size = maxPayload
+			}
+			end := off + size
+			pkt := &rtp.Packet{
+				Header: rtp.Header{
+					Version:        2,
+					PayloadType:    96,
+					SequenceNumber: seq,
+					Timestamp:      ts,
+					Marker:         end >= len(ps), // 最后一片打 marker
+				},
+				Payload: ps[off:end],
+			}
+			seq++
+			raw, err := pkt.Marshal()
+			if err != nil {
+				return
+			}
+			feedFn(raw)
+			off = end
+		}
+	}
+
+	cancelSub := group.AddAvPacketSubscriber(subID, func(pkt base.AvPacket) {
+		if !pkt.IsVideo() {
+			return
+		}
+		if !inited {
+			switch pkt.PayloadType {
+			case base.AvPacketPtAvc:
+				videoSid = psMuxer.AddStream(mpegps.PsStreamH264)
+			case base.AvPacketPtHevc:
+				videoSid = psMuxer.AddStream(mpegps.PsStreamH265)
+			default:
+				// 非 H264/H265 暂不支持
+				return
+			}
+			inited = true
+		}
+		// 在收到首个关键帧（IDR）之前，不向上级发送任何 PS/RTP，避免对端 HLS 反复报 V not opened。
+		if !started {
+			isKey := false
+			switch pkt.PayloadType {
+			case base.AvPacketPtAvc:
+				isKey = isH264Idr(pkt.Payload)
+			case base.AvPacketPtHevc:
+				isKey = isHevcIdr(pkt.Payload)
+			}
+			if !isKey {
+				return
+			}
+			started = true
+		}
+		pts := uint64(pkt.Pts)
+		dts := uint64(pkt.Timestamp)
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					// mpegps 组件内部存在 panic（如越界写），这里做保护，避免单帧异常导致进程崩溃。
+					Log.Warnf("upstream rtp feed ps muxer panic recovered. streamName=%s panic=%v", streamName, r)
+				}
+			}()
+			_ = psMuxer.Write(videoSid, pkt.Payload, pts, dts)
+		}()
+	})
+
+	return func() { cancelSub() }, nil
+}
+
+// isH264Idr 判断 AnnexB H264 帧中是否包含 IDR 切片。
+func isH264Idr(frame []byte) bool {
+	// 扫描整帧所有 NALU，只要包含 IDR slice（type=5）即可视为关键帧。
+	i := 0
+	n := len(frame)
+	for i+4 <= n {
+		// 查找 start code 0x000001 或 0x00000001
+		if frame[i] == 0x00 && frame[i+1] == 0x00 {
+			if frame[i+2] == 0x01 {
+				i += 3
+			} else if i+3 < n && frame[i+2] == 0x00 && frame[i+3] == 0x01 {
+				i += 4
+			} else {
+				i++
+				continue
+			}
+			// 跳过可能的填充 0x00
+			for i < n && frame[i] == 0x00 {
+				i++
+			}
+			if i >= n {
+				return false
+			}
+			// nalu header 第一个字节
+			t := avc.ParseNaluType(frame[i])
+			if t == avc.NaluTypeIdrSlice {
+				return true
+			}
+			// 继续扫描下一个 start code（当前 NALU 的内容无需逐字节跳过，因为我们在 i++ 的循环里继续找）
+		}
+		i++
+	}
+	return false
+}
+
+// isHevcIdr 判断 AnnexB H265 帧中是否包含 IDR/I 帧。
+func isHevcIdr(frame []byte) bool {
+	// 扫描整帧所有 NALU，只要包含 IRAP/BLA/CRA 等 VCL 即视为关键帧起点。
+	i := 0
+	n := len(frame)
+	for i+5 <= n {
+		if frame[i] == 0x00 && frame[i+1] == 0x00 {
+			if frame[i+2] == 0x01 {
+				i += 3
+			} else if i+3 < n && frame[i+2] == 0x00 && frame[i+3] == 0x01 {
+				i += 4
+			} else {
+				i++
+				continue
+			}
+			for i < n && frame[i] == 0x00 {
+				i++
+			}
+			if i >= n {
+				return false
+			}
+			naluType := hevc.ParseNaluType(frame[i])
+			if naluType >= hevc.NaluTypeSliceBlaWlp && naluType <= hevc.NaluTypeSliceRsvIrapVcl23 {
+				return true
+			}
+			// 继续扫描后续 NALU
+		}
+		i++
+	}
+	return false
+}
+
 func (sm *ServerManager) WithOnHookSession(onHookSession func(uniqueKey string, streamName string) ICustomizeHookSessionContext) {
 	sm.onHookSession = onHookSession
 }
@@ -846,6 +1039,12 @@ func (sm *ServerManager) OnDelHlsSubSession(session *hls.SubSession) {
 	info.HasInSession = group.HasInSession()
 	info.HasOutSession = group.HasOutSession()
 	sm.nhOnSubStop(info)
+
+	// 当最后一个 HLS 订阅者离开，且当前没有任何输入/输出会话时，
+	// 立即停止 HLS Muxer，并触发 HLS 目录清理（包括内存模式下的片段释放），以降低内存占用。
+	if !group.HasInSession() && !group.HasOutSession() && !group.HasHlsSubSession() {
+		group.stopHlsIfNeeded()
+	}
 }
 
 // ----- implement IGroupCreator interface -----------------------------------------------------------------------------
@@ -1053,11 +1252,17 @@ func gb28181ConfigFromLogic(c Gb28181Config) gb28181.GB28181Config {
 			videoLevel = c.Video.Level
 		}
 	}
-	return gb28181.GB28181Config{
-		Enable:                   true,
-		ListenAddr:               "0.0.0.0",
-		SipIP:                    c.LocalSipIp,
-		SipPort:                  sipPort,
+	cfg := gb28181.GB28181Config{
+		Enable:     true,
+		ListenAddr: "0.0.0.0",
+		SipIP:      c.LocalSipIp,
+		SipPort:    sipPort,
+		UpstreamSipPort: func(v int) uint16 {
+			if v <= 0 {
+				return 5061
+			}
+			return uint16(v)
+		}(c.UpstreamSipPort),
 		Serial:                   c.LocalSipId,
 		Realm:                    realm,
 		Username:                 c.Username,
@@ -1081,7 +1286,40 @@ func gb28181ConfigFromLogic(c Gb28181Config) gb28181.GB28181Config {
 		RetryMaxCount:         defaultGb28181RetryMaxCount(c.AutoRetryOnDisconnect, c.RetryMaxCount),
 		RetryFirstDelayMs:     retryFirstDelayMs(c.RetryFirstDelayMs),
 		RetryMaxDelayMs:       retryMaxDelayMs(c.RetryMaxDelayMs),
+		CatalogQueryInterval:  c.CatalogQueryInterval,
+		UpstreamEnable:        c.UpstreamEnable,
 	}
+
+	// 映射上级平台配置（级联）
+	if len(c.Upstreams) > 0 {
+		cfg.Upstreams = make([]gb28181.GB28181UpstreamConfig, 0, len(c.Upstreams))
+		for _, u := range c.Upstreams {
+			up := gb28181.GB28181UpstreamConfig{
+				ID:               u.ID,
+				Enable:           u.Enable,
+				SipID:            u.SipID,
+				Realm:            u.Realm,
+				SipIP:            u.SipIP,
+				SipPort:          uint16(u.SipPort),
+				LocalDeviceID:    u.LocalDeviceID,
+				Username:         u.Username,
+				Password:         u.Password,
+				RegisterValidity: u.RegisterValidity,
+				KeepaliveInterval: func(v int) int {
+					if v <= 0 {
+						return 60
+					}
+					return v
+				}(u.KeepaliveInterval),
+				MediaIP:   u.MediaIP,
+				MediaPort: uint16(u.MediaPort),
+				Comment:   u.Comment,
+			}
+			cfg.Upstreams = append(cfg.Upstreams, up)
+		}
+	}
+
+	return cfg
 }
 
 func defaultGb28181RetryMaxCount(autoRetry bool, v int) int {

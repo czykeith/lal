@@ -9,8 +9,10 @@
 package logic
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -305,9 +307,12 @@ func (sm *ServerManager) CtrlGb28181Invite(info base.ApiCtrlGb28181InviteReq) (r
 		streamIndex = 0
 	}
 
-	// 同一 streamName 已在拉流：直接成功，不再 INVITE、不做 replace（与 AddCustomizePubSession 侧「同 streamName 不替换」一致）。
+	// 先以 device_id + channel_id + stream_name 查找：若存在“有效拉取”的流则直接返回，避免重复 INVITE。
+	// 注：内部实现实际按 (device_id+channel_id+stream_index) 找到当前 INVITE 通道后再比对 stream_name，
+	// 以兼容同一通道的主/子码流。
 	if streamName != "" {
-		if cur := sm.gb28181Server.FindChannelByStreamName(streamName); cur != nil && cur.MediaInfo.IsInvite {
+		if cur := sm.gb28181Server.FindInvitingChannelByRequest(info.DeviceId, info.ChannelId, streamIndex); cur != nil &&
+			cur.MediaInfo.IsInvite && cur.MediaInfo.StreamName == streamName && sm.gb28181Server.HasActiveMediaStream(streamName) {
 			ret.ErrorCode = base.ErrorCodeSucc
 			ret.Desp = base.DespSucc
 			ret.Data.StreamName = streamName
@@ -318,16 +323,41 @@ func (sm *ServerManager) CtrlGb28181Invite(info base.ApiCtrlGb28181InviteReq) (r
 		}
 	}
 
-	// 同设备+通道+码流已在拉流（streamName 可能与请求不一致时仍避免重复 INVITE）
-	if cur := sm.gb28181Server.FindInvitingChannelByRequest(info.DeviceId, info.ChannelId, streamIndex); cur != nil && cur.MediaInfo.IsInvite {
-		ret.ErrorCode = base.ErrorCodeSucc
-		ret.Desp = base.DespSucc
-		ret.Data.StreamName = cur.MediaInfo.StreamName
-		if port := parseGb28181MediaPort(cur.MediaInfo.MediaKey); port > 0 {
-			ret.Data.Port = port
+	// 同一 streamName 已在拉流：直接成功，不再 INVITE、不做 replace（与 AddCustomizePubSession 侧「同 streamName 不替换」一致）。
+	//
+	// 新策略：重复调用时以 “device_id + channel_id + stream_index” 维度清理已存在的拉流，
+	// 同时以 “stream_name” 维度清理可能已存在的流（解决换 streamName 和 streamName 重复冲突）。
+	stopByStreamName := func(sn string) {
+		if sn == "" {
+			return
 		}
-		return
+		ch0 := sm.gb28181Server.FindChannelByStreamName(sn)
+		if ch0 == nil || !ch0.MediaInfo.IsInvite {
+			return
+		}
+		_ = ch0.Bye(sn)
+		// 若是回放流，也同步清理回放会话记录（防残留）。
+		sm.gb28181Server.UnregisterPlaybackSession(sn)
 	}
+	stopByDeviceChannel := func(deviceID, channelID string, idx int) {
+		cur := sm.gb28181Server.FindInvitingChannelByRequest(deviceID, channelID, idx)
+		if cur == nil || !cur.MediaInfo.IsInvite {
+			return
+		}
+		oldSN := cur.MediaInfo.StreamName
+		if oldSN == "" {
+			oldSN = streamName
+		}
+		_ = cur.Bye(oldSN)
+		if oldSN != "" {
+			sm.gb28181Server.UnregisterPlaybackSession(oldSN)
+		}
+	}
+
+	// 1) 先按 device_id + channel_id + stream_index 清理已有拉流（不管旧 streamName）
+	stopByDeviceChannel(info.DeviceId, info.ChannelId, streamIndex)
+	// 2) 再按 stream_name 清理（避免 streamName 被其它通道占用或换名冲突）
+	stopByStreamName(streamName)
 
 	// 内部通道选择目前仅区分主/子（heuristic），因此将 index 映射为主(0) / 子(1)。
 	streamType := 0
@@ -338,6 +368,22 @@ func (sm *ServerManager) CtrlGb28181Invite(info base.ApiCtrlGb28181InviteReq) (r
 	if ch == nil {
 		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
 		ret.Desp = base.DespGb28181DeviceNotFound
+		return
+	}
+
+	// 在发起 INVITE 前先检查设备与通道在线状态：
+	// - 设备必须为 ONLINE；
+	// - 通道必须为 ON（ChannelOnStatus）。
+	if dev := sm.gb28181Server.GetDevice(info.DeviceId); dev != nil {
+		if dev.Status != gb28181.DeviceOnlineStatus {
+			ret.ErrorCode = base.ErrorCodeGb28181InviteFail
+			ret.Desp = "device is offline"
+			return
+		}
+	}
+	if ch.Status != gb28181.ChannelOnStatus {
+		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
+		ret.Desp = "channel is offline"
 		return
 	}
 
@@ -372,6 +418,101 @@ func (sm *ServerManager) CtrlGb28181Invite(info base.ApiCtrlGb28181InviteReq) (r
 	if port := parseGb28181MediaPort(ch.MediaInfo.MediaKey); port > 0 {
 		ret.Data.Port = port
 	}
+	return
+}
+
+// StatGb28181Upstreams 查询 GB28181 上级平台配置列表（中间平台模式）。
+// 注意：当前实现只读主配置与独立 upstream_config_file 中的内容，并不会通过此接口修改配置文件。
+func (sm *ServerManager) StatGb28181Upstreams() (ret base.ApiGb28181UpstreamListResp) {
+	ret.ErrorCode = base.ErrorCodeSucc
+	ret.Desp = base.DespSucc
+
+	conf := sm.config.Gb28181Config
+	upstreams := make([]base.ApiGb28181Upstream, 0, len(conf.Upstreams))
+	for _, u := range conf.Upstreams {
+		upstreams = append(upstreams, base.ApiGb28181Upstream{
+			ID:            u.ID,
+			Enable:        u.Enable,
+			SipID:         u.SipID,
+			Realm:         u.Realm,
+			SipIP:         u.SipIP,
+			SipPort:       u.SipPort,
+			LocalDeviceID: u.LocalDeviceID,
+			Comment:       u.Comment,
+		})
+	}
+	ret.Data.Upstreams = upstreams
+	return
+}
+
+// StatGb28181UpstreamSubs 查询指定上级平台当前的订阅流列表（以 stream_name 为标识）。
+// 数据来源为运行时 gb28181Server 内部的订阅表（而非配置文件）。
+func (sm *ServerManager) StatGb28181UpstreamSubs(upstreamID string) (ret base.ApiGb28181UpstreamSubsResp) {
+	ret.ErrorCode = base.ErrorCodeSucc
+	ret.Desp = base.DespSucc
+
+	if sm.gb28181Server == nil {
+		ret.ErrorCode = base.ErrorCodeGb28181QueryFail
+		ret.Desp = "gb28181 server not enabled"
+		return
+	}
+
+	subs := sm.gb28181Server.ListUpstreamSubs(upstreamID)
+	list := make([]base.ApiGb28181UpstreamSub, 0, len(subs))
+	for _, ssub := range subs {
+		list = append(list, base.ApiGb28181UpstreamSub{
+			UpstreamID: ssub.UpstreamID,
+			StreamName: ssub.StreamName,
+			ChannelID:  ssub.ChannelID,
+		})
+	}
+	ret.Data.UpstreamID = upstreamID
+	ret.Data.Subs = list
+	return
+}
+
+// CtrlGb28181UpstreamSubAdd 为指定上级平台新增订阅流（stream_name 级别）。
+// 注意：这是运行时行为，仅影响当前进程内的订阅表，不会自动写回 upstream_config_file。
+func (sm *ServerManager) CtrlGb28181UpstreamSubAdd(info base.ApiGb28181UpstreamSub) (ret base.ApiRespBasic) {
+	ret.ErrorCode = base.ErrorCodeSucc
+	ret.Desp = base.DespSucc
+
+	if sm.gb28181Server == nil {
+		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
+		ret.Desp = "gb28181 server not enabled"
+		return
+	}
+	if info.UpstreamID == "" || info.StreamName == "" || info.ChannelID == "" {
+		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
+		ret.Desp = "upstream_id, stream_name and channel_id are required and must be non-empty"
+		return
+	}
+	if err := sm.gb28181Server.AddUpstreamSub(info.UpstreamID, info.StreamName, info.ChannelID); err != nil {
+		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
+		ret.Desp = err.Error()
+	}
+	return
+}
+
+// CtrlGb28181UpstreamSubDel 删除指定上级平台的一条订阅关系。
+// 同样仅修改运行时状态，如需持久化请同时更新 upstream_config_file。
+func (sm *ServerManager) CtrlGb28181UpstreamSubDel(info base.ApiGb28181UpstreamSub) (ret base.ApiRespBasic) {
+	ret.ErrorCode = base.ErrorCodeSucc
+	ret.Desp = base.DespSucc
+
+	if sm.gb28181Server == nil {
+		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
+		ret.Desp = "gb28181 server not enabled"
+		return
+	}
+	if err := sm.gb28181Server.RemoveUpstreamSub(info.UpstreamID, info.StreamName); err != nil {
+		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
+		ret.Desp = err.Error()
+		return
+	}
+	// 订阅删除后，立即对当前所有上级会话做一次对齐：
+	// 对于已不在订阅表中的会话（包括非 GB 流转推），主动发送 BYE、关闭转推 Sink，并停止对应的 RTP 喂流。
+	sm.gb28181Server.ReconcileUpstreamSessionsWithSubs()
 	return
 }
 
@@ -492,6 +633,143 @@ func (sm *ServerManager) CtrlGb28181Playback(info base.ApiCtrlGb28181PlaybackReq
 	if port := parseGb28181MediaPort(ch.MediaInfo.MediaKey); port > 0 {
 		ret.Data.Port = port
 	}
+	return
+}
+
+// CtrlGb28181UpstreamsConfSet 覆盖写入 gb28181 上级配置文件（例如 conf/gb28181_upstreams.json）。
+// 注意：该接口只负责写盘，不会自动重启 gb28181Server。
+func (sm *ServerManager) CtrlGb28181UpstreamsConfSet(confFile Gb28181UpstreamConfigFile) (ret base.ApiRespBasic) {
+	ret.ErrorCode = base.ErrorCodeSucc
+	ret.Desp = base.DespSucc
+
+	path := sm.config.Gb28181Config.UpstreamConfigFile
+	if path == "" {
+		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
+		ret.Desp = "gb28181.upstream_config_file is empty"
+		return
+	}
+
+	// 使用与 LoadConfAndInitLog 相同的结构，直接写回 JSON。
+	data, err := json.MarshalIndent(confFile, "", "  ")
+	if err != nil {
+		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
+		ret.Desp = fmt.Sprintf("marshal upstream config failed: %v", err)
+		return
+	}
+
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
+		ret.Desp = fmt.Sprintf("write upstream config file failed: %v", err)
+		return
+	}
+
+	// 写盘成功后，直接应用到运行时（合并 reload 行为）
+	// 覆盖内存配置
+	sm.config.Gb28181Config.Upstreams = confFile.Upstreams
+	sm.config.Gb28181Config.UpstreamSubs = confFile.Subs
+
+	// 若 gb28181 未启用或服务未启动，仅更新配置即可
+	if !sm.config.Gb28181Config.Enable || sm.gb28181Server == nil {
+		return
+	}
+	// 刷新上级平台
+	gbConf := gb28181ConfigFromLogic(sm.config.Gb28181Config)
+	// 使用简单粗暴重载：先清空所有上级相关运行时资源，再按新配置重建。
+	sm.gb28181Server.BrutalReloadUpstreams(gbConf.Upstreams)
+	// 重建订阅（仅对已启用的上级）
+	sm.gb28181Server.ClearAllUpstreamSubs()
+	enabledUpstreamIDs := make(map[string]struct{})
+	for _, u := range sm.config.Gb28181Config.Upstreams {
+		if u.Enable && u.ID != "" {
+			enabledUpstreamIDs[u.ID] = struct{}{}
+		}
+	}
+	for _, sub := range sm.config.Gb28181Config.UpstreamSubs {
+		if _, enabled := enabledUpstreamIDs[sub.UpstreamID]; !enabled {
+			continue
+		}
+		if err := sm.gb28181Server.AddUpstreamSub(sub.UpstreamID, sub.StreamName, sub.ChannelID); err != nil {
+			Log.Warnf("apply gb28181 upstream sub failed. upstream=%s stream=%s channel=%s err=%+v",
+				sub.UpstreamID, sub.StreamName, sub.ChannelID, err)
+		}
+	}
+	// brutal reload 已清空所有会话，此处无需对齐，但保留一次调用以防未来逻辑调整。
+	sm.gb28181Server.ReconcileUpstreamSessionsWithSubs()
+	return
+}
+
+// CtrlGb28181UpstreamsReload 从 upstream_config_file 重新加载上级平台配置，并重启 gb28181 中间平台服务。
+// 实际流程：
+// 1) 读取并解析配置文件到 Gb28181UpstreamConfigFile；
+// 2) 覆盖 sm.config.Gb28181Config.Upstreams / UpstreamSubs；
+// 3) Dispose 旧的 gb28181Server（若存在），再按当前配置新建并 Start；
+// 4) 将 UpstreamSubs 通过 AddUpstreamSub 注入运行时订阅表。
+func (sm *ServerManager) CtrlGb28181UpstreamsReload() (ret base.ApiRespBasic) {
+	ret.ErrorCode = base.ErrorCodeSucc
+	ret.Desp = base.DespSucc
+
+	if !sm.config.Gb28181Config.UpstreamEnable {
+		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
+		ret.Desp = "gb28181.upstream_enable is false, middle platform is disabled, reload not allowed"
+		return
+	}
+
+	path := sm.config.Gb28181Config.UpstreamConfigFile
+	if path == "" {
+		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
+		ret.Desp = "gb28181.upstream_config_file is empty"
+		return
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
+		ret.Desp = fmt.Sprintf("read upstream config file failed: %v", err)
+		return
+	}
+
+	var file Gb28181UpstreamConfigFile
+	if err := json.Unmarshal(data, &file); err != nil {
+		ret.ErrorCode = base.ErrorCodeGb28181InviteFail
+		ret.Desp = fmt.Sprintf("unmarshal upstream config file failed: %v", err)
+		return
+	}
+
+	// 覆盖逻辑配置中的 Upstreams / UpstreamSubs
+	sm.config.Gb28181Config.Upstreams = file.Upstreams
+	sm.config.Gb28181Config.UpstreamSubs = file.Subs
+
+	// 若 gb28181 未启用，仅更新配置即可。
+	if !sm.config.Gb28181Config.Enable || sm.gb28181Server == nil {
+		return
+	}
+
+	// 仅刷新上级平台相关配置，不重启其他 GB28181 服务。
+	gbConf := gb28181ConfigFromLogic(sm.config.Gb28181Config)
+	// 使用简单粗暴重载：先清空所有上级相关运行时资源，再按新配置重建。
+	sm.gb28181Server.BrutalReloadUpstreams(gbConf.Upstreams)
+
+	// 重建运行时订阅表：先清空，再按配置文件重建；仅对已启用的上级注入订阅。
+	sm.gb28181Server.ClearAllUpstreamSubs()
+	enabledUpstreamIDs := make(map[string]struct{})
+	for _, u := range sm.config.Gb28181Config.Upstreams {
+		if u.Enable && u.ID != "" {
+			enabledUpstreamIDs[u.ID] = struct{}{}
+		}
+	}
+	for _, sub := range sm.config.Gb28181Config.UpstreamSubs {
+		if _, enabled := enabledUpstreamIDs[sub.UpstreamID]; !enabled {
+			continue
+		}
+		if err := sm.gb28181Server.AddUpstreamSub(sub.UpstreamID, sub.StreamName, sub.ChannelID); err != nil {
+			Log.Warnf("reload gb28181 upstream sub failed. upstream=%s stream=%s channel=%s err=%+v",
+				sub.UpstreamID, sub.StreamName, sub.ChannelID, err)
+		}
+	}
+
+	// 订阅关系变化后，对当前正在转发的上级播放会话做一次对齐：
+	// 对于已存在但不再被订阅允许的会话，主动发 BYE 并关闭对应的转发 Sink。
+	sm.gb28181Server.ReconcileUpstreamSessionsWithSubs()
 	return
 }
 
