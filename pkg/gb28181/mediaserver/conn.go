@@ -11,8 +11,10 @@ import (
 	"time"
 
 	"github.com/pion/rtp"
+	"github.com/q191201771/lal/pkg/avc"
 	"github.com/q191201771/lal/pkg/base"
 	"github.com/q191201771/lal/pkg/gb28181/mpegps"
+	"github.com/q191201771/lal/pkg/rtprtcp"
 	"github.com/q191201771/lal/pkg/rtsp"
 )
 
@@ -44,16 +46,18 @@ type ILalServer interface {
 }
 
 type Conn struct {
-	conn       net.Conn
-	r          io.Reader
-	check      bool
-	demuxer    *mpegps.PsDemuxer
-	streamName string
-	connKey    string
-	lalServer  ILalServer
-	lalSession CustomizePubSession
-	videoFrame Frame
-	audioFrame Frame
+	conn         net.Conn
+	r            io.Reader
+	check        bool
+	demuxer      *mpegps.PsDemuxer
+	avcUnpacker  rtprtcp.IRtpUnpacker
+	hevcUnpacker rtprtcp.IRtpUnpacker
+	streamName   string
+	connKey      string
+	lalServer    ILalServer
+	lalSession   CustomizePubSession
+	videoFrame   Frame
+	audioFrame   Frame
 
 	observer IGbObserver
 
@@ -244,27 +248,147 @@ func (c *Conn) Serve() (err error) {
 			c.lalSession = session
 		}
 		c.rtpPts = uint64(pkt.Header.Timestamp)
-		// 将该 RTP 包额外转发给已注册的上级 Sink（级联转推）。
-		if c.mediaServer != nil && c.streamName != "" {
-			c.mediaServer.ForwardRtp(c.streamName, pkt)
-		}
 
-		if c.demuxer != nil {
-			if c.psDumpFile != nil {
-				c.psDumpFile.WriteWithType(pkt.Payload, base.DumpTypePsRtpData)
+		// GB28181 下级常见两种承载：
+		// 1) RTP 承载 PS（最常见，PS 内再封装 H264/H265/AAC/G711 等）
+		// 2) RTP 直接承载 H264/H265（少数平台/设备或级联场景）
+		//
+		// 我们在接收端按负载/PT 判定并缓存 streamName->格式，供上级级联 INVITE 动态生成匹配 SDP，
+		// 并在 ForwardRtp 转发时按上级期望重写 PT/SSRC。
+		if isPsPayload(pkt.Payload) {
+			if c.mediaServer != nil && c.streamName != "" {
+				c.mediaServer.SetStreamFormat(c.streamName, StreamPayloadFormatPs)
+				c.mediaServer.ForwardRtp(c.streamName, pkt)
 			}
-			if err := c.demuxer.Input(pkt.Payload); err != nil {
-				// 单包 PS 解析失败不关闭连接，仅打日志并继续收包，提高拉流稳定性
-				var psErr mpegps.Error
-				if errors.As(err, &psErr) && psErr.NeedMore() {
-					// 正常“需要更多数据”，不打印
-				} else {
-					base.Log.Debug("gb28181 ps demux input err, skip packet. streamName=%s err=%v", c.streamName, err)
+
+			if c.demuxer != nil {
+				if c.psDumpFile != nil {
+					c.psDumpFile.WriteWithType(pkt.Payload, base.DumpTypePsRtpData)
+				}
+				if err := c.demuxer.Input(pkt.Payload); err != nil {
+					// 单包 PS 解析失败不关闭连接，仅打日志并继续收包，提高拉流稳定性
+					var psErr mpegps.Error
+					if errors.As(err, &psErr) && psErr.NeedMore() {
+						// 正常“需要更多数据”，不打印
+					} else {
+						base.Log.Debug("gb28181 ps demux input err, skip packet. streamName=%s err=%v", c.streamName, err)
+					}
 				}
 			}
+			continue
+		}
+
+		// 非 PS：按 RTP PayloadType 尝试解包 H264/H265。
+		switch pkt.PayloadType {
+		case 98: // channel.go 当前 INVITE SDP: a=rtpmap:98 H264/90000
+			if c.mediaServer != nil && c.streamName != "" {
+				c.mediaServer.SetStreamFormat(c.streamName, StreamPayloadFormatH264)
+				c.mediaServer.ForwardRtp(c.streamName, pkt)
+			}
+			c.feedRtpAvc(*pkt)
+		case 99: // channel.go 当前 INVITE SDP: a=rtpmap:99 H265/90000
+			if c.mediaServer != nil && c.streamName != "" {
+				c.mediaServer.SetStreamFormat(c.streamName, StreamPayloadFormatH265)
+				c.mediaServer.ForwardRtp(c.streamName, pkt)
+			}
+			c.feedRtpHevc(*pkt)
+		case 96: // 兼容：部分实现使用 96 表示 H264；若不是 PS 则按 H264 处理
+			if c.mediaServer != nil && c.streamName != "" {
+				c.mediaServer.SetStreamFormat(c.streamName, StreamPayloadFormatH264)
+				c.mediaServer.ForwardRtp(c.streamName, pkt)
+			}
+			c.feedRtpAvc(*pkt)
+		default:
+			// 若上级存在 sink，也可以选择转发原包，但无法保证 SDP 匹配；这里先不转发未知格式。
+			// 其它 PT 暂不支持
 		}
 	}
 	return
+}
+
+func isPsPayload(payload []byte) bool {
+	if len(payload) < 4 {
+		return false
+	}
+	// MPEG-PS pack start code: 0x000001BA
+	return payload[0] == 0x00 && payload[1] == 0x00 && payload[2] == 0x01 && payload[3] == 0xBA
+}
+
+func (c *Conn) feedRtpAvc(pkt rtp.Packet) {
+	if c.lalSession == nil {
+		return
+	}
+	if c.avcUnpacker == nil {
+		c.avcUnpacker = rtprtcp.DefaultRtpUnpackerFactory(base.AvPacketPtAvc, 90000, 1024, func(ap base.AvPacket) {
+			annexb, err := avc.Avcc2Annexb(ap.Payload)
+			if err != nil {
+				return
+			}
+			ap.Payload = annexb
+			ap.Pts = ap.Timestamp
+			c.feedRtpVideoAvPacket(ap)
+		})
+	}
+	h := rtprtcp.MakeDefaultRtpHeader()
+	h.PacketType = uint8(pkt.PayloadType)
+	h.Seq = pkt.SequenceNumber
+	h.Timestamp = pkt.Timestamp
+	h.Ssrc = pkt.SSRC
+	h.Mark = boolToUint8(pkt.Marker)
+
+	rp := rtprtcp.MakeRtpPacket(h, pkt.Payload)
+	c.avcUnpacker.Feed(rp)
+}
+
+func (c *Conn) feedRtpHevc(pkt rtp.Packet) {
+	if c.lalSession == nil {
+		return
+	}
+	if c.hevcUnpacker == nil {
+		c.hevcUnpacker = rtprtcp.DefaultRtpUnpackerFactory(base.AvPacketPtHevc, 90000, 1024, func(ap base.AvPacket) {
+			// rtprtcp 解包器输出的是长度前缀格式（AVCC/HVCC 类似结构）；转成 AnnexB 供下游统一处理。
+			annexb, err := avc.Avcc2Annexb(ap.Payload)
+			if err != nil {
+				return
+			}
+			ap.Payload = annexb
+			ap.Pts = ap.Timestamp
+			c.feedRtpVideoAvPacket(ap)
+		})
+	}
+	h := rtprtcp.MakeDefaultRtpHeader()
+	h.PacketType = uint8(pkt.PayloadType)
+	h.Seq = pkt.SequenceNumber
+	h.Timestamp = pkt.Timestamp
+	h.Ssrc = pkt.SSRC
+	h.Mark = boolToUint8(pkt.Marker)
+
+	rp := rtprtcp.MakeRtpPacket(h, pkt.Payload)
+	c.hevcUnpacker.Feed(rp)
+}
+
+func boolToUint8(b bool) uint8 {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+func (c *Conn) feedRtpVideoAvPacket(pkt base.AvPacket) {
+	// rtprtcp 解包器回调的 Timestamp 单位为毫秒，这里保持与 PS→OnFrame 类似的“从0开始”时间戳。
+	c.hasVideo = true
+	ts := uint64(pkt.Timestamp)
+	pts := uint64(pkt.Pts)
+	if c.videoFrame.initDts == 0 {
+		c.videoFrame.initDts = ts
+	}
+	if c.videoFrame.initPts == 0 {
+		c.videoFrame.initPts = pts
+	}
+
+	pkt.Timestamp = int64(ts - c.videoFrame.initDts)
+	pkt.Pts = int64(pts - c.videoFrame.initPts)
+	c.feedAvPacketWithScale(pkt)
 }
 
 func (c *Conn) Demuxer(data []byte) error {

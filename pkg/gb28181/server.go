@@ -851,6 +851,24 @@ func (s *GB28181Server) OnUpstreamInvite(req sip.Request, tx sip.ServerTransacti
 		sess.MediaKey = virtualMediaKey
 	}
 
+	// ---- 可用性校验：避免上级协商成功但永远收不到媒体 ----
+	//
+	// 复用统一口径：HasActiveMediaStream（覆盖 mediaserver 活跃连接与 logic 层统计）。
+	// 对下游 GB28181 流，再额外要求已探测到该 streamName 的承载格式（PS/H264/H265），用于生成匹配 SDP。
+	const sipStatusTemporarilyUnavailable = 480
+	if !s.hasActiveMediaStream(streamName) {
+		base.Log.Warnf("gb28181 upstream invite stream not active. upstream=%s stream=%s", upID, streamName)
+		_ = tx.Respond(sip.NewResponseFromRequest("", req, sipStatusTemporarilyUnavailable, "stream not active", ""))
+		return
+	}
+	if sess.MediaKey != virtualMediaKey {
+		if f, ok := mediasvr.GetStreamFormat(streamName); !ok || f == mediaserver.StreamPayloadFormatUnknown {
+			base.Log.Warnf("gb28181 upstream invite stream format not ready. upstream=%s stream=%s", upID, streamName)
+			_ = tx.Respond(sip.NewResponseFromRequest("", req, sipStatusTemporarilyUnavailable, "stream format not ready", ""))
+			return
+		}
+	}
+
 	// 将上级期望的 SSRC 传入 mediaserver，后续转发时重写 RTP SSRC 与 y= 保持一致。
 	var ssrcUint uint32
 	if remoteSSRC != "" {
@@ -858,7 +876,16 @@ func (s *GB28181Server) OnUpstreamInvite(req sip.Request, tx sip.ServerTransacti
 			ssrcUint = uint32(v)
 		}
 	}
-	sinkID, err := mediasvr.AddUpstreamSink(streamName, remoteIP, remotePort, ssrcUint)
+	// 级联媒体格式：下游 GB28181 流按实际接收格式响应；非下游 GB 流（virtual mediaserver）保持 PS/90000 逻辑。
+	format := mediaserver.StreamPayloadFormatPs
+	if sess.MediaKey != virtualMediaKey {
+		if f, ok := mediasvr.GetStreamFormat(streamName); ok && f != mediaserver.StreamPayloadFormatUnknown {
+			format = f
+		}
+	}
+	pt, rtpmap := format.Rtpmap(90000)
+
+	sinkID, err := mediasvr.AddUpstreamSink(streamName, remoteIP, remotePort, ssrcUint, pt)
 	if err != nil {
 		base.Log.Warnf("gb28181 upstream invite: add sink failed. stream=%s remote=%s:%d err=%+v",
 			streamName, remoteIP, remotePort, err)
@@ -890,14 +917,16 @@ func (s *GB28181Server) OnUpstreamInvite(req sip.Request, tx sip.ServerTransacti
 		}
 	}
 
-	// 构造 200 OK 响应，按 GB28181 标准返回 SDP（参考实际设备侧响应）：
+	// 构造 200 OK 响应，按 GB28181 标准返回 SDP（参考实际设备侧响应）。
+	// - 下游 GB28181 流：根据接收端缓存的格式动态选择 PS/H264/H265
+	// - 非下游 GB 流：保持 PS/90000（兼容常见上级平台只支持 PS 的情况）
 	// v=0
 	// o=<ChannelID> 0 0 IN IP4 <本机媒体IP>
 	// s=Play
 	// c=IN IP4 <本机媒体IP>
 	// t=0 0
-	// m=video <本机媒体端口> RTP/AVP 96
-	// a=rtpmap:96 PS/90000
+	// m=video <本机媒体端口> RTP/AVP <pt>
+	// a=rtpmap:<pt> <codec>/90000
 	// a=sendonly
 	// y=<SSRC>
 	// f=...（可选）
@@ -923,14 +952,16 @@ func (s *GB28181Server) OnUpstreamInvite(req sip.Request, tx sip.ServerTransacti
 		"s=Play\r\n"+
 		"c=IN IP4 %s\r\n"+
 		"t=0 0\r\n"+
-		"m=video %d RTP/AVP 96\r\n"+
-		"a=rtpmap:96 PS/90000\r\n"+
+		"m=video %d RTP/AVP %d\r\n"+
+		"%s\r\n"+
 		"a=sendonly\r\n"+
 		"y=%s\r\n"+
 		"f=v/////a/1/8/1\r\n",
 		channelID, mediaIP,
 		mediaIP,
 		mediaPort,
+		pt,
+		rtpmap,
 		ssrc,
 	)
 

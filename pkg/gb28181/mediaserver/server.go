@@ -39,6 +39,38 @@ type GB28181MediaServer struct {
 
 	// upstreamSinks 记录额外向上级平台转推的目标（key=sinkID）。
 	upstreamSinks sync.Map // map[string]*UpstreamSink
+
+	// streamFormats 缓存本机接收到的下游 GB28181 流媒体承载格式（key=streamName）。
+	// 用于上级级联 INVITE 时动态生成与下游一致的 SDP，并在转发时改写 PT。
+	streamFormats sync.Map // map[string]StreamPayloadFormat
+}
+
+// StreamPayloadFormat 描述 RTP 包负载承载的媒体类型（面向 GB28181 级联的 SDP/转发决策）。
+type StreamPayloadFormat int
+
+const (
+	StreamPayloadFormatUnknown StreamPayloadFormat = iota
+	StreamPayloadFormatPs
+	StreamPayloadFormatH264
+	StreamPayloadFormatH265
+)
+
+func (f StreamPayloadFormat) Rtpmap(clock int) (pt uint8, rtpmap string) {
+	if clock <= 0 {
+		clock = 90000
+	}
+	switch f {
+	case StreamPayloadFormatH264:
+		// 与本项目 GB28181 SDP 约定保持一致：98=H264
+		return 98, fmt.Sprintf("a=rtpmap:98 H264/%d", clock)
+	case StreamPayloadFormatH265:
+		// 与本项目 GB28181 SDP 约定保持一致：99=H265
+		return 99, fmt.Sprintf("a=rtpmap:99 H265/%d", clock)
+	case StreamPayloadFormatPs:
+		fallthrough
+	default:
+		return 96, fmt.Sprintf("a=rtpmap:96 PS/%d", clock)
+	}
 }
 
 // UpstreamSink 描述一条向上级平台转推的 PS/RTP 输出。
@@ -50,6 +82,9 @@ type UpstreamSink struct {
 	RemotePort int
 	// 期望向上级输出的 SSRC（来自上级 INVITE 的 y= 字段），0 表示保持下级原始 SSRC。
 	SSRC uint32
+	// 期望向上级输出的 RTP PayloadType（应与上级 SDP 中 m=video RTP/AVP <pt> 一致）。
+	// 0 表示保持下级原始 PT。
+	PayloadType uint8
 	// 懒加载的 UDP 连接，用于发送 RTP 包
 	conn *net.UDPConn
 }
@@ -164,21 +199,42 @@ func (s *GB28181MediaServer) HasStream(streamName string) bool {
 
 // AddUpstreamSink 为指定 streamName 增加一个向上级平台转推的目标地址。
 // ssrc 用于重写向上级发送的 RTP SSRC（通常与对端 INVITE SDP 中的 y= 一致），0 表示不改写。
-func (s *GB28181MediaServer) AddUpstreamSink(streamName, remoteIP string, remotePort int, ssrc uint32) (string, error) {
+// payloadType 用于重写向上级发送的 RTP PT（通常与对端 INVITE/200OK SDP 中的 m=video PT 一致），0 表示不改写。
+func (s *GB28181MediaServer) AddUpstreamSink(streamName, remoteIP string, remotePort int, ssrc uint32, payloadType uint8) (string, error) {
 	if streamName == "" || remoteIP == "" || remotePort <= 0 {
 		return "", fmt.Errorf("invalid upstream sink params")
 	}
 	id := fmt.Sprintf("%s-%s:%d-%d", streamName, remoteIP, remotePort, time.Now().UnixNano())
 	sink := &UpstreamSink{
-		ID:         id,
-		StreamName: streamName,
-		RemoteIP:   remoteIP,
-		RemotePort: remotePort,
-		SSRC:       ssrc,
+		ID:          id,
+		StreamName:  streamName,
+		RemoteIP:    remoteIP,
+		RemotePort:  remotePort,
+		SSRC:        ssrc,
+		PayloadType: payloadType,
 	}
 	s.upstreamSinks.Store(id, sink)
 	base.Log.Infof("gb28181 mediaserver add upstream sink. key=%s stream=%s remote=%s:%d", id, streamName, remoteIP, remotePort)
 	return id, nil
+}
+
+func (s *GB28181MediaServer) SetStreamFormat(streamName string, format StreamPayloadFormat) {
+	if streamName == "" || format == StreamPayloadFormatUnknown {
+		return
+	}
+	s.streamFormats.Store(streamName, format)
+}
+
+func (s *GB28181MediaServer) GetStreamFormat(streamName string) (StreamPayloadFormat, bool) {
+	if streamName == "" {
+		return StreamPayloadFormatUnknown, false
+	}
+	if v, ok := s.streamFormats.Load(streamName); ok {
+		if f, ok2 := v.(StreamPayloadFormat); ok2 {
+			return f, true
+		}
+	}
+	return StreamPayloadFormatUnknown, false
 }
 
 // RemoveUpstreamSink 移除一个向上级转推目标。
@@ -244,6 +300,9 @@ func (s *GB28181MediaServer) ForwardRtp(streamName string, pkt *rtp.Packet) {
 		outPkt := *pkt
 		if sink.SSRC != 0 {
 			outPkt.SSRC = sink.SSRC
+		}
+		if sink.PayloadType != 0 {
+			outPkt.PayloadType = sink.PayloadType
 		}
 		buf, err := outPkt.Marshal()
 		if err != nil {
