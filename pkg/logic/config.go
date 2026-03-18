@@ -249,6 +249,10 @@ type Gb28181Config struct {
 	// 关闭时不会启动针对上级的 SIP Server，也不会向上级 REGISTER/Keepalive。
 	UpstreamEnable bool `json:"upstream_enable"`
 
+	// UpstreamMaxSinks 单个 mediaserver 允许创建的上级转推 sink 最大数量（防止异常订阅/INVITE 导致内存无界增长）。
+	// 默认 1024。
+	UpstreamMaxSinks int `json:"upstream_max_sinks"`
+
 	// Upstreams 上级 GB28181 平台列表（级联）。
 	// 本服务在这些上级眼中以“设备”身份存在，用于实现级联转推。
 	Upstreams []Gb28181UpstreamConfig `json:"upstreams"`
@@ -496,6 +500,10 @@ func LoadConfAndInitLog(rawContent []byte) *Config {
 	if !j.Exist("rtsp.ws_rtsp_enable") {
 		config.RtspConfig.WsRtspEnable = false
 		Log.Warnf("config rtsp.ws_rtsp_enable not exist. set to default which is %v", config.RtspConfig.WsRtspEnable)
+	}
+	if !j.Exist("gb28181.upstream_max_sinks") {
+		config.Gb28181Config.UpstreamMaxSinks = 1024
+		Log.Warnf("config gb28181.upstream_max_sinks not exist. set to default which is %d", config.Gb28181Config.UpstreamMaxSinks)
 	}
 	if config.HlsConfig.Enable && !j.Exist("hls.cleanup_mode") {
 		Log.Warnf("config hls.cleanup_mode not exist. set to default which is %d", defaultHlsCleanupMode)

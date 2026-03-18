@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pion/rtp"
@@ -38,11 +39,13 @@ type GB28181MediaServer struct {
 	conns sync.Map
 
 	// upstreamSinks 记录额外向上级平台转推的目标（key=sinkID）。
-	upstreamSinks sync.Map // map[string]*UpstreamSink
+	upstreamSinks     sync.Map // map[string]*UpstreamSink
+	upstreamSinkCount atomic.Int64
+	maxUpstreamSinks  int64
 
 	// streamFormats 缓存本机接收到的下游 GB28181 流媒体承载格式（key=streamName）。
 	// 用于上级级联 INVITE 时动态生成与下游一致的 SDP，并在转发时改写 PT。
-	streamFormats sync.Map // map[string]StreamPayloadFormat
+	streamFormats sync.Map // map[string]streamFormatEntry
 }
 
 // StreamPayloadFormat 描述 RTP 包负载承载的媒体类型（面向 GB28181 级联的 SDP/转发决策）。
@@ -73,6 +76,11 @@ func (f StreamPayloadFormat) Rtpmap(clock int) (pt uint8, rtpmap string) {
 	}
 }
 
+type streamFormatEntry struct {
+	Format    StreamPayloadFormat
+	UpdatedAt time.Time
+}
+
 // UpstreamSink 描述一条向上级平台转推的 PS/RTP 输出。
 // 目前仅保存元信息，真正的 RTP 发送逻辑需要在 Conn/OnFrame 里按实际需求补充。
 type UpstreamSink struct {
@@ -87,14 +95,24 @@ type UpstreamSink struct {
 	PayloadType uint8
 	// 懒加载的 UDP 连接，用于发送 RTP 包
 	conn *net.UDPConn
+
+	// 写失败保护：避免对不可达上级地址持续写导致 CPU/日志风暴
+	failCount     int
+	lastFailAt    time.Time
+	disabledUntil time.Time
+	lastLogAt     time.Time
 }
 
-func NewGB28181MediaServer(listenPort int, mediaKey string, observer IGbObserver, lal ILalServer) *GB28181MediaServer {
+func NewGB28181MediaServer(listenPort int, mediaKey string, observer IGbObserver, lal ILalServer, maxUpstreamSinks int) *GB28181MediaServer {
+	if maxUpstreamSinks <= 0 {
+		maxUpstreamSinks = 1024
+	}
 	return &GB28181MediaServer{
-		listenPort: listenPort,
-		lalServer:  lal,
-		observer:   observer,
-		mediaKey:   mediaKey,
+		listenPort:       listenPort,
+		lalServer:        lal,
+		observer:         observer,
+		mediaKey:         mediaKey,
+		maxUpstreamSinks: int64(maxUpstreamSinks),
 	}
 }
 func (s *GB28181MediaServer) GetListenerPort() uint16 {
@@ -204,6 +222,10 @@ func (s *GB28181MediaServer) AddUpstreamSink(streamName, remoteIP string, remote
 	if streamName == "" || remoteIP == "" || remotePort <= 0 {
 		return "", fmt.Errorf("invalid upstream sink params")
 	}
+	// 简单上限保护，避免异常上级 INVITE/订阅导致 sink 无界增长
+	if s.maxUpstreamSinks > 0 && s.upstreamSinkCount.Load() >= s.maxUpstreamSinks {
+		return "", fmt.Errorf("too many upstream sinks")
+	}
 	id := fmt.Sprintf("%s-%s:%d-%d", streamName, remoteIP, remotePort, time.Now().UnixNano())
 	sink := &UpstreamSink{
 		ID:          id,
@@ -214,6 +236,7 @@ func (s *GB28181MediaServer) AddUpstreamSink(streamName, remoteIP string, remote
 		PayloadType: payloadType,
 	}
 	s.upstreamSinks.Store(id, sink)
+	s.upstreamSinkCount.Add(1)
 	base.Log.Infof("gb28181 mediaserver add upstream sink. key=%s stream=%s remote=%s:%d", id, streamName, remoteIP, remotePort)
 	return id, nil
 }
@@ -222,7 +245,7 @@ func (s *GB28181MediaServer) SetStreamFormat(streamName string, format StreamPay
 	if streamName == "" || format == StreamPayloadFormatUnknown {
 		return
 	}
-	s.streamFormats.Store(streamName, format)
+	s.streamFormats.Store(streamName, streamFormatEntry{Format: format, UpdatedAt: time.Now()})
 }
 
 func (s *GB28181MediaServer) GetStreamFormat(streamName string) (StreamPayloadFormat, bool) {
@@ -230,11 +253,24 @@ func (s *GB28181MediaServer) GetStreamFormat(streamName string) (StreamPayloadFo
 		return StreamPayloadFormatUnknown, false
 	}
 	if v, ok := s.streamFormats.Load(streamName); ok {
-		if f, ok2 := v.(StreamPayloadFormat); ok2 {
-			return f, true
+		if e, ok2 := v.(streamFormatEntry); ok2 {
+			// 过期保护：长时间无数据/同名流复用时避免误判旧格式
+			const ttl = 10 * time.Minute
+			if !e.UpdatedAt.IsZero() && time.Since(e.UpdatedAt) > ttl {
+				s.streamFormats.Delete(streamName)
+				return StreamPayloadFormatUnknown, false
+			}
+			return e.Format, true
 		}
 	}
 	return StreamPayloadFormatUnknown, false
+}
+
+func (s *GB28181MediaServer) RemoveStreamFormat(streamName string) {
+	if streamName == "" {
+		return
+	}
+	s.streamFormats.Delete(streamName)
 }
 
 // RemoveUpstreamSink 移除一个向上级转推目标。
@@ -246,6 +282,7 @@ func (s *GB28181MediaServer) RemoveUpstreamSink(id string) {
 		if sink, ok2 := v.(*UpstreamSink); ok2 && sink.conn != nil {
 			_ = sink.conn.Close()
 		}
+		s.upstreamSinkCount.Add(-1)
 		base.Log.Infof("gb28181 mediaserver remove upstream sink. key=%s", id)
 	}
 }
@@ -280,6 +317,10 @@ func (s *GB28181MediaServer) ForwardRtp(streamName string, pkt *rtp.Packet) {
 		if sink.RemoteIP == "" || sink.RemotePort <= 0 {
 			return true
 		}
+		now := time.Now()
+		if !sink.disabledUntil.IsZero() && now.Before(sink.disabledUntil) {
+			return true
+		}
 
 		// 确保 UDP 连接已建立（懒创建）
 		if sink.conn == nil {
@@ -310,7 +351,28 @@ func (s *GB28181MediaServer) ForwardRtp(streamName string, pkt *rtp.Packet) {
 			return true
 		}
 		if _, err = sink.conn.Write(buf); err != nil {
-			base.Log.Warnf("gb28181 ForwardRtp write udp failed. sink=%s err=%+v", sink.ID, err)
+			// 写失败：关闭连接，累计失败次数；短时间连续失败则熔断一段时间再恢复
+			if sink.conn != nil {
+				_ = sink.conn.Close()
+				sink.conn = nil
+			}
+
+			// 失败窗口：5s 内累计到 3 次即熔断 5s
+			if now.Sub(sink.lastFailAt) > 5*time.Second {
+				sink.failCount = 0
+			}
+			sink.failCount++
+			sink.lastFailAt = now
+			if sink.failCount >= 3 {
+				sink.disabledUntil = now.Add(5 * time.Second)
+			}
+
+			// 降噪：每个 sink 最多每秒打印一次
+			if now.Sub(sink.lastLogAt) > time.Second {
+				sink.lastLogAt = now
+				base.Log.Warnf("gb28181 ForwardRtp write udp failed. sink=%s stream=%s remote=%s:%d failCount=%d disabledUntil=%v err=%+v",
+					sink.ID, sink.StreamName, sink.RemoteIP, sink.RemotePort, sink.failCount, sink.disabledUntil, err)
+			}
 		}
 		return true
 	})

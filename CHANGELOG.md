@@ -26,6 +26,9 @@
 - [feat] HTTP API: `/api/ctrl/start_relay_pull`、`/api/ctrl/start_relay` 的 RTSP 客户端倍速 `scale` 参数与 GB28181 回放倍速规则统一（默认 1，有效范围 `[1,8]`，超出返回参数错误）
 - [feat] HTTP API: 新增通用截图接口 `GET /api/ctrl/snapshot?stream_name=xxx`，支持对任意在线流返回最新关键帧 JPEG，用于监控面板与 AI 分析
 - [opt] 截图: 新增 ffmpeg 常驻共享池（配置 `snapshot.ffmpeg_pool_size`），并为截图接口增加并发控制（`snapshot.http_max_in_flight`，超出返回 429）与超时控制（`snapshot.timeout_ms`，超时返回 504），减少高并发下的进程抖动与卡顿
+- [opt] 截图: ffmpeg 解码共享池调整为“并发受控的单次解码”（通过 `snapshot.ffmpeg_pool_size` 限制并发），避免常驻进程连续喂流在异常 AnnexB 输入下可能出现的阻塞/读写错位，提升稳定性
+- [opt] GB28181: SIP 监听失败不再 `Fatalf` 直接退出进程，改为返回错误由上层记录并决定是否继续，提高端口占用/配置错误场景下的可用性
+- [opt] GB28181: 上级转推 sink 增加容量上限与写失败熔断/退避（自动关闭并重连、降噪日志），streamName->format 增加过期保护与断开清理，提升长期运行稳定性与抗滥用能力
 - [opt] 截图: 在 `Group.broadcastByRtmpMsg` 中统一挂接 `remux.Rtmp2AvPacketRemuxer`，只缓存可独立解码的关键帧（H.264 必须同时包含 SPS/PPS），避免 ffmpeg 单帧解码出现 `non-existing PPS`/`no frame` 等错误
 - [opt] GB28181: Invite/重连逻辑幂等化，同一 stream_name 或同一 deviceId+channelId+streamIndex 已在拉流时直接返回成功，避免重复 INVITE 和二次推流
 - [fix] GB28181: 设备主动发 BYE 时从回放会话表正确移除，避免会话残留；修复 PS → AvPacket 在倍速路径下可能导致 AnnexB NALU 被破坏引发 `iterate nalu failed` 的问题

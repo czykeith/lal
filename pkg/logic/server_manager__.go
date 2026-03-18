@@ -181,7 +181,11 @@ Doc: %s
 		gb28181Conf := gb28181ConfigFromLogic(sm.config.Gb28181Config)
 		adapter := &gbLalAdapter{inner: sm}
 		sm.gb28181Server = gb28181.NewGB28181Server(gb28181Conf, adapter)
-		sm.gb28181Server.Start()
+		if err := sm.gb28181Server.Start(); err != nil {
+			Log.Errorf("gb28181 server start failed: %+v", err)
+			// 启动失败则不再注入上级订阅，避免后续 nil/不可用状态引发更多告警
+			return sm
+		}
 		// 若独立配置文件中定义了上级平台的订阅关系，则在 gb28181Server 启动后进行初始化。
 		// 仅对已启用的上级平台注入订阅，避免因上级 enable=false 导致 "upstream not found" 告警。
 		enabledUpstreamIDs := make(map[string]struct{})
@@ -1288,6 +1292,12 @@ func gb28181ConfigFromLogic(c Gb28181Config) gb28181.GB28181Config {
 		RetryMaxDelayMs:       retryMaxDelayMs(c.RetryMaxDelayMs),
 		CatalogQueryInterval:  c.CatalogQueryInterval,
 		UpstreamEnable:        c.UpstreamEnable,
+		UpstreamMaxSinks: func(v int) int {
+			if v <= 0 {
+				return 1024
+			}
+			return v
+		}(c.UpstreamMaxSinks),
 	}
 
 	// 映射上级平台配置（级联）

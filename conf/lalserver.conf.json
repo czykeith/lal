@@ -154,6 +154,7 @@
     "video_level": "4.0",
     "upstream_sip_port": 5061,
     "upstream_enable": true,
+    "upstream_max_sinks": 1024,
     "upstream_config_file": "conf/gb28181_upstreams.json"
   }
 }

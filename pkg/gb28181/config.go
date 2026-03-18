@@ -38,6 +38,10 @@ type GB28181Config struct {
 	// 关闭时不会监听 upstream_sip_port，也不会向上级 REGISTER/Keepalive。
 	UpstreamEnable bool `json:"upstream_enable"`
 
+	// UpstreamMaxSinks 单个 mediaserver 允许创建的上级转推 sink 最大数量（防止异常订阅/INVITE 导致内存无界增长）。
+	// 默认 1024。
+	UpstreamMaxSinks int `json:"upstream_max_sinks"`
+
 	// 上级 GB28181 消息监听端口（中间平台模式下对上级开放的 SIP 端口），仅供自定义 REGISTER 使用。
 	// 设备接入仍使用 sip_port。本字段主要用于自定义 UDP 客户端绑定本地端口，避免与设备侧 5060 端口混用。
 	// 默认 5061。

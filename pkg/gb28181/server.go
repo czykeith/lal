@@ -247,10 +247,14 @@ func (s *GB28181Server) GetConfig() GB28181Config {
 	return s.conf
 }
 
-func (s *GB28181Server) Start() {
+func (s *GB28181Server) Start() (err error) {
 	// 下级设备侧 SIP Server（原有逻辑）
-	s.sipUdpSvr = s.newSipServer("udp", s.conf.SipPort)
-	s.sipTcpSvr = s.newSipServer("tcp", s.conf.SipPort)
+	if s.sipUdpSvr, err = s.newSipServer("udp", s.conf.SipPort); err != nil {
+		return err
+	}
+	if s.sipTcpSvr, err = s.newSipServer("tcp", s.conf.SipPort); err != nil {
+		return err
+	}
 
 	// 上级平台侧（中间平台）仅在启用时启动。
 	if s.conf.UpstreamEnable {
@@ -258,12 +262,15 @@ func (s *GB28181Server) Start() {
 		if s.conf.UpstreamSipPort == 0 {
 			s.conf.UpstreamSipPort = 5061
 		}
-		s.upstreamSipSvr = s.newUpstreamSipServer("udp", s.conf.UpstreamSipPort)
+		if s.upstreamSipSvr, err = s.newUpstreamSipServer("udp", s.conf.UpstreamSipPort); err != nil {
+			return err
+		}
 
 		// 初始化上级 GB28181 平台（级联）客户端
 		s.initUpstreams()
 	}
 	go s.startJob()
+	return nil
 }
 
 // upstreamServer 表示一个上级 GB28181 平台的运行时状态。
@@ -791,11 +798,15 @@ func (s *GB28181Server) OnUpstreamInvite(req sip.Request, tx sip.ServerTransacti
 		return
 	}
 
-	// 在同一上级对同一通道多次发起 INVITE 的场景下，仅保留最后一次“实时播放”请求对应的转发。
-	// 回放（包含 u=<channelId>:0）不受此限制，允许并行存在。
-	if !isPlayback {
-		s.cleanupUpstreamSessionForChannel(upID, channelID)
+	// 区分实时/回放：
+	// - 实时：同一 upstream+channel 仅保留一路转推，新请求到来先清理旧资源再建立。
+	// - 回放：当前上级回放转推尚未实现（计划透传到下游），此处直接返回错误，且不清理实时转推资源。
+	if isPlayback {
+		base.Log.Warnf("gb28181 upstream invite playback not implemented yet. upstream=%s channel=%s stream=%s", upID, channelID, streamName)
+		_ = tx.Respond(sip.NewResponseFromRequest("", req, http.StatusNotImplemented, "playback not implemented", ""))
+		return
 	}
+	s.cleanupUpstreamSessionForChannel(upID, channelID)
 
 	// 记录上级会话（后续通过 mediaserver 将该 streamName 的 PS/RTP 额外推送到上级）。
 	callID, _ := req.CallID()
@@ -1692,7 +1703,7 @@ func (s *GB28181Server) getVirtualMediaServer() *mediaserver.GB28181MediaServer 
 	if port == 0 {
 		port = 30000
 	}
-	s.virtualMediaserver = mediaserver.NewGB28181MediaServer(port, virtualMediaKey, s, s.lalServer)
+	s.virtualMediaserver = mediaserver.NewGB28181MediaServer(port, virtualMediaKey, s, s.lalServer, s.conf.UpstreamMaxSinks)
 	s.MediaServerMap.Store(virtualMediaKey, s.virtualMediaserver)
 	return s.virtualMediaserver
 }
@@ -1926,7 +1937,7 @@ func (s *GB28181Server) BrutalReloadUpstreams(newConfs []GB28181UpstreamConfig) 
 	}
 	s.upstreamsMu.Unlock()
 }
-func (s *GB28181Server) newSipServer(network string, port uint16) gosip.Server {
+func (s *GB28181Server) newSipServer(network string, port uint16) (gosip.Server, error) {
 	srvConf := gosip.ServerConfig{}
 
 	if s.conf.SipIP != "" {
@@ -1939,18 +1950,18 @@ func (s *GB28181Server) newSipServer(network string, port uint16) gosip.Server {
 	sipSvr.OnRequest(sip.BYE, s.OnBye)
 
 	addr := s.conf.ListenAddr + ":" + strconv.Itoa(int(port))
-	err := sipSvr.Listen(network, addr)
-	if err != nil {
-		base.Log.Fatalf("%+v", err)
+	if err := sipSvr.Listen(network, addr); err != nil {
+		base.Log.Errorf("gb28181 sip server listen failed. network=%s addr=%s err=%+v", network, addr, err)
+		return nil, err
 	}
 
 	base.Log.Info(" start sip server listen. addr= " + addr + "  network:" + network)
-	return sipSvr
+	return sipSvr, nil
 }
 
 // newUpstreamSipServer 创建仅用于上级 GB28181 平台交互的 SIP Server，监听 upstream_sip_port。
 // 目前仅使用 UDP 协议，挂载上级专用的 Handler（后续可根据需要扩展）。
-func (s *GB28181Server) newUpstreamSipServer(network string, port uint16) gosip.Server {
+func (s *GB28181Server) newUpstreamSipServer(network string, port uint16) (gosip.Server, error) {
 	srvConf := gosip.ServerConfig{}
 	if s.conf.SipIP != "" {
 		srvConf.Host = s.conf.SipIP
@@ -1966,10 +1977,11 @@ func (s *GB28181Server) newUpstreamSipServer(network string, port uint16) gosip.
 
 	addr := s.conf.ListenAddr + ":" + strconv.Itoa(int(port))
 	if err := sipSvr.Listen(network, addr); err != nil {
-		base.Log.Fatalf("%+v", err)
+		base.Log.Errorf("gb28181 upstream sip server listen failed. network=%s addr=%s err=%+v", network, addr, err)
+		return nil, err
 	}
 	base.Log.Info(" start upstream sip server listen. addr= " + addr + "  network:" + network)
-	return sipSvr
+	return sipSvr, nil
 }
 func (s *GB28181Server) Dispose() {
 	s.disposeOnce.Do(
@@ -2016,7 +2028,7 @@ func (s *GB28181Server) OnStartMediaServer(netWork string, singlePort bool, devi
 	if mediasvr == nil {
 		if singlePort {
 			if isTcpFlag {
-				mediasvr = mediaserver.NewGB28181MediaServer(int(s.conf.MediaConfig.ListenPort), fmt.Sprintf("%s%d", "tcp", s.conf.MediaConfig.ListenPort), s, s.lalServer)
+				mediasvr = mediaserver.NewGB28181MediaServer(int(s.conf.MediaConfig.ListenPort), fmt.Sprintf("%s%d", "tcp", s.conf.MediaConfig.ListenPort), s, s.lalServer, s.conf.UpstreamMaxSinks)
 				listener, err = s.tcpAvailConnPool.ListenWithPort(s.conf.MediaConfig.ListenPort)
 				if err != nil {
 					base.Log.Error("gb28181 media server tcp Listen failed:%s", err.Error())
@@ -2024,7 +2036,7 @@ func (s *GB28181Server) OnStartMediaServer(netWork string, singlePort bool, devi
 				}
 				s.MediaServerMap.Store(fmt.Sprintf("%s%d", "tcp", s.conf.MediaConfig.ListenPort), mediasvr)
 			} else {
-				mediasvr = mediaserver.NewGB28181MediaServer(int(s.conf.MediaConfig.ListenPort), fmt.Sprintf("%s%d", "udp", s.conf.MediaConfig.ListenPort), s, s.lalServer)
+				mediasvr = mediaserver.NewGB28181MediaServer(int(s.conf.MediaConfig.ListenPort), fmt.Sprintf("%s%d", "udp", s.conf.MediaConfig.ListenPort), s, s.lalServer, s.conf.UpstreamMaxSinks)
 				listener, err = s.udpAvailConnPool.ListenWithPort(s.conf.MediaConfig.ListenPort)
 				if err != nil {
 					base.Log.Error("gb28181 media server udp Listen failed:%s", err.Error())
@@ -2049,7 +2061,7 @@ func (s *GB28181Server) OnStartMediaServer(netWork string, singlePort bool, devi
 				}
 				mediaKey = fmt.Sprintf("%s%d", "udp", port)
 			}
-			mediasvr = mediaserver.NewGB28181MediaServer(int(port), mediaKey, s, s.lalServer)
+			mediasvr = mediaserver.NewGB28181MediaServer(int(port), mediaKey, s, s.lalServer, s.conf.UpstreamMaxSinks)
 			s.MediaServerMap.Store(fmt.Sprintf("%s%s", deviceId, channelId), mediasvr)
 		}
 		go mediasvr.Start(listener)
@@ -2121,6 +2133,14 @@ func (s *GB28181Server) OnStreamActive(streamName string, mediaKey string) {
 func (s *GB28181Server) OnStreamInactive(streamName string, mediaKey string) {
 	if streamName == "" {
 		return
+	}
+	// 清理 mediaserver 内的 streamName->format 缓存，避免长时间运行增长及下次同名流误判格式。
+	if mediaKey != "" {
+		if v, ok := s.MediaServerMap.Load(mediaKey); ok {
+			if ms, ok2 := v.(*mediaserver.GB28181MediaServer); ok2 && ms != nil {
+				ms.RemoveStreamFormat(streamName)
+			}
+		}
 	}
 	s.streamMediasvrIndexMu.Lock()
 	delete(s.streamMediasvrIndex, streamName)
