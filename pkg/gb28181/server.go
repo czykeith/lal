@@ -6,6 +6,7 @@ import (
 	"crypto/md5"
 	"encoding/xml"
 	"fmt"
+	"math/rand"
 	"net"
 	"net/http"
 	"strconv"
@@ -284,6 +285,11 @@ type upstreamServer struct {
 
 	// 用于优雅退出 runUpstreamLoop 的控制通道。
 	stopCh chan struct{}
+
+	// 上级平台注册失败后的退避重试控制，避免在上级不可用/鉴权异常时频繁重试消耗资源。
+	registerRetryCount  int
+	registerNextRetryAt time.Time
+	registerLastLogAt   time.Time
 }
 
 // UpstreamStreamSub 表示某个上级平台对本节点某一路 streamName 的订阅关系。
@@ -460,13 +466,50 @@ func (s *GB28181Server) runUpstreamLoop(up *upstreamServer) {
 			return
 		}
 
+		// 注册失败退避：未到下次重试时间则跳过，避免固定频率打 REGISTER。
+		now := time.Now()
+		if !up.registerNextRetryAt.IsZero() && now.Before(up.registerNextRetryAt) {
+			continue
+		}
+
 		prevRegisterAt := up.lastRegisterOKAt
 
 		// 注册与续注册
 		if err := s.ensureUpstreamRegister(up); err != nil {
-			base.Log.Warnf("gb28181 upstream register failed. id=%s err=%+v", up.conf.ID, err)
+			up.registerRetryCount++
+
+			// 指数退避 + 抖动，上限 5 分钟；鉴权失败适当拉长，避免刷爆上级。
+			baseDelay := 3 * time.Second
+			backoff := baseDelay
+			for i := 0; i < up.registerRetryCount && i < 10; i++ {
+				backoff *= 2
+			}
+			lower := strings.ToLower(err.Error())
+			if strings.Contains(lower, "auth register failed") || strings.Contains(lower, "unauthorized") {
+				if backoff < 30*time.Second {
+					backoff = 30 * time.Second
+				}
+			}
+			if backoff > 5*time.Minute {
+				backoff = 5 * time.Minute
+			}
+			// jitter: 0.8~1.2
+			j := 0.8 + rand.New(rand.NewSource(now.UnixNano())).Float64()*0.4
+			backoff = time.Duration(float64(backoff) * j)
+			up.registerNextRetryAt = now.Add(backoff)
+
+			// 日志限速：至少间隔 10s 打一次，且带上下一次重试时间。
+			if up.registerLastLogAt.IsZero() || now.Sub(up.registerLastLogAt) >= 10*time.Second {
+				up.registerLastLogAt = now
+				base.Log.Warnf("gb28181 upstream register failed. id=%s retry=%d nextIn=%v err=%+v",
+					up.conf.ID, up.registerRetryCount, backoff, err)
+			}
 			continue
 		}
+		// 注册成功：清空退避状态
+		up.registerRetryCount = 0
+		up.registerNextRetryAt = time.Time{}
+		up.registerLastLogAt = time.Time{}
 		// 首次注册成功后，主动向上级上报一次 Catalog 信息，方便上级立即感知本节点可用通道。
 		if prevRegisterAt.IsZero() && !up.lastRegisterOKAt.IsZero() {
 			if err := s.sendUpstreamCatalog(up); err != nil {

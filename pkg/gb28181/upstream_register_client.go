@@ -48,7 +48,7 @@ func doUpstreamRegisterOnce(sConf *GB28181Config, uConf *GB28181UpstreamConfig, 
 	defer conn.Close()
 
 	raw := buildUpstreamRawRegister(sConf, uConf, deviceID, realm, nonce, withAuth)
-	base.Log.Infof("gb28181 upstream raw REGISTER (withAuth=%v) >>>\n%s", withAuth, raw)
+	base.Log.Debugf("gb28181 upstream raw REGISTER (withAuth=%v) >>>\n%s", withAuth, raw)
 
 	if _, err = conn.Write([]byte(raw)); err != nil {
 		return
@@ -62,7 +62,7 @@ func doUpstreamRegisterOnce(sConf *GB28181Config, uConf *GB28181UpstreamConfig, 
 	}
 
 	resp := string(buf[:n])
-	base.Log.Infof("gb28181 upstream raw REGISTER response <<<\n%s", resp)
+	base.Log.Debugf("gb28181 upstream raw REGISTER response <<<\n%s", resp)
 
 	statusCode := 0
 	if _, e := fmt.Sscanf(resp, "SIP/2.0 %d", &statusCode); e != nil {
