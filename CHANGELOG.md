@@ -6,8 +6,15 @@
 - [feat] 上级配置热更新：新增 `/api/ctrl/gb28181_upstreams_conf_set` 和 `/api/ctrl/gb28181_upstreams_reload`，支持覆盖写入上级配置文件并在不中断下级 GB28181 服务的前提下，增删改上级平台和订阅关系
 - [feat] 上级 Catalog 兼容非 GB 流：上报给上级的平台目录以 `stream_name` 为核心，自动兼容 RTMP/RTSP/Relay 等非 GB 流，在线状态统一以“pub 或 pull 有实际数据”为准
 - [feat] 上级 INVITE/BYE 对非 GB 流的转推：支持上级对任意已订阅的本地流发起 INVITE，内部将 AvPacket 封装为 PS/RTP 级联推送到上级；收到 STOP/BYE 或订阅删除时自动停止对应转推并释放资源
+- [opt] `gb28181_invite` 幂等与替换：重复调用时优先按 `device_id+channel_id+stream_name(+stream_index)` 命中且“有数据”则直接返回；否则先按 `device_id+channel_id+stream_index` 清理旧会话，再按 `stream_name` 清理冲突流后重新拉流（解决换 streamName 与 streamName 冲突）
 - [opt] GB28181 上级性能：为 `streamName → mediaserver`、`SipIP → upstreamID`、`(upstreamID, channelID) → 会话` 等路径增加索引，减少遍历，提高 INVITE/Catalog 等高频操作的查找性能
 - [opt] 转推链路健壮性：对上级 INVITE 的 SDP/Subject 解析、错误响应码、会话清理（包括虚拟 mediaserver 生命周期）进行了完善，避免因异常 INVITE/BYE 或配置变更导致会话/端口泄漏
+- [opt] 上级 REGISTER 失败退避：注册失败采用指数退避 + 抖动 + 日志限速，避免上级不可用/鉴权异常时频繁重试消耗资源；REGISTER 原始报文日志降为 Debug
+- [fix] 上级 REGISTER 鉴权解析：修复 `WWW-Authenticate` 解析将 `nonce/realm` 误转小写导致鉴权失败的问题（nonce 大小写敏感）
+- [opt] 上级 REGISTER Via/Contact 本机 IP：优先使用上级配置的 `media_ip`（上级可达的本机 IP）填充 Via/Contact，降低多网卡/NAT 场景回包异常概率
+- [opt] SIP 请求超时：为设备侧 SIP 请求默认增加超时，避免 `context.Background()` 造成事务悬挂与资源堆积；上级侧 Keepalive/Catalog/BYE 等请求统一加短超时
+- [opt] DeviceInfo 查询退避：设备信息查询改为单次尝试 + 指数退避 + 抖动 + 成功冷却 + 日志限速，避免离线设备造成持续请求消耗
+- [opt] 非 GB 转推防崩溃：为 PS 打包（psMuxer.Write）增加 panic recover 保护，避免异常帧触发 mpegps panic 导致进程崩溃
 - [doc] README/CHANGELOG：补充 GB28181 中间平台整体设计说明、上级配置文件结构示例及相关 HTTP API 文档，统一中文说明和英文索引
 
 #### v0.38.4 (2026-03)
