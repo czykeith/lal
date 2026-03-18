@@ -32,8 +32,12 @@ func convertAnnexbToJPEG(frame *SnapshotFrame) ([]byte, error) {
 
 	cmd := exec.Command(
 		"ffmpeg",
+		"-hide_banner",
 		"-loglevel", "error",
+		"-nostdin",
+		"-threads", "1",
 		"-f", codec, "-i", "pipe:0",
+		"-an", "-sn",
 		"-frames:v", "1",
 		"-f", "mjpeg",
 		"pipe:1",

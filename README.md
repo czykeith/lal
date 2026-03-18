@@ -160,6 +160,42 @@ LAL 提供了丰富的 HTTP API 接口，用于控制和管理流媒体服务。
 
 转推功能支持从 RTSP 或 RTMP 拉流，然后转推到 RTMP 或 RTSP。
 
+### 截图 API
+
+#### 获取截图
+
+**接口地址：** `GET /api/ctrl/snapshot?stream_name=xxx`
+
+**返回：**
+- 成功时返回 JPEG 图片（`Content-Type: image/jpeg`）
+- 失败时返回纯文本错误信息
+
+**状态码：**
+- `200`: 成功
+- `400`: 缺少 `stream_name`
+- `404`: 没有可用截图（流不存在或尚未缓存到可独立解码的关键帧）
+- `429`: 截图请求并发超过上限（busy，快速失败避免排队卡顿）
+- `504`: 截图处理超时（包含等待并发槽位/等待解码/ffmpeg 解码耗时）
+- `503`: 解码失败或内部错误
+
+#### 截图相关配置（conf.json）
+
+配置路径：`snapshot`
+
+```json
+{
+  "snapshot": {
+    "ffmpeg_pool_size": 2,
+    "http_max_in_flight": 16,
+    "timeout_ms": 3000
+  }
+}
+```
+
+- `ffmpeg_pool_size`: ffmpeg 截图解码共享池大小（按 H264/H265 分别启动同等数量 worker；`0` 表示退化为单次拉起 ffmpeg，不推荐）
+- `http_max_in_flight`: 截图接口最大并发数（超过返回 `429`）
+- `timeout_ms`: 截图接口超时（超过返回 `504`）
+
 #### 启动转推
 
 **接口地址：** `POST /api/ctrl/start_relay`

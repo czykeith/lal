@@ -9,8 +9,10 @@
 package logic
 
 import (
+	"context"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"html/template"
 	"io"
 	"net"
@@ -31,13 +33,20 @@ type HttpApiServer struct {
 	addr string
 	sm   *ServerManager
 
+	snapshotSem chan struct{}
+
 	ln net.Listener
 }
 
 func NewHttpApiServer(addr string, sm *ServerManager) *HttpApiServer {
+	semSize := 16
+	if sm != nil && sm.Config() != nil && sm.Config().SnapshotConfig.HttpMaxInFlight > 0 {
+		semSize = sm.Config().SnapshotConfig.HttpMaxInFlight
+	}
 	return &HttpApiServer{
-		addr: addr,
-		sm:   sm,
+		addr:        addr,
+		sm:          sm,
+		snapshotSem: make(chan struct{}, semSize),
 	}
 }
 
@@ -146,16 +155,28 @@ func (h *HttpApiServer) ctrlSnapshotHandler(w http.ResponseWriter, req *http.Req
 		return
 	}
 
-	frame, ok := h.sm.GetSnapshotFrame(streamName)
-	if !ok || frame == nil || len(frame.Data) == 0 {
-		w.WriteHeader(http.StatusNotFound)
-		_, _ = w.Write([]byte("no snapshot for stream"))
+	// 并发控制：超出上限直接快速失败，避免排队导致卡顿。
+	select {
+	case h.snapshotSem <- struct{}{}:
+		defer func() { <-h.snapshotSem }()
+	default:
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte("snapshot busy"))
 		return
 	}
 
-	jpg, err := convertAnnexbToJPEG(frame)
+	jpg, err := h.sm.GetSnapshotJpeg(streamName)
 	if err != nil || len(jpg) == 0 {
-		w.WriteHeader(http.StatusInternalServerError)
+		if err == ErrSnapshotNotFound {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte("no snapshot for stream"))
+			return
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			w.WriteHeader(http.StatusGatewayTimeout)
+		} else {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
 		if err != nil {
 			_, _ = w.Write([]byte("snapshot decode failed: " + err.Error()))
 		} else {
@@ -165,7 +186,8 @@ func (h *HttpApiServer) ctrlSnapshotHandler(w http.ResponseWriter, req *http.Req
 	}
 
 	w.Header().Set("Content-Type", "image/jpeg")
-	w.Header().Set("Cache-Control", "no-cache")
+	// 允许客户端短缓存，减少重复请求；服务端仍按关键帧时间戳做缓存复用。
+	w.Header().Set("Cache-Control", "max-age=1")
 	_, _ = w.Write(jpg)
 }
 

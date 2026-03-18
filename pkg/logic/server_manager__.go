@@ -93,7 +93,6 @@ func NewServerManager(modOption ...ModOption) *ServerManager {
 		exitChan:        make(chan struct{}, 1),
 	}
 	sm.groupManager = NewSimpleGroupManager(sm)
-	sm.snapshotStore = NewSnapshotStore()
 
 	sm.option = defaultOption
 	for _, fn := range modOption {
@@ -114,6 +113,9 @@ Doc: %s
 	}
 	sm.config = LoadConfAndInitLog(rawContent)
 	base.LogoutStartInfo()
+
+	// 初始化截图缓存（依赖配置中的 ffmpeg 共享池大小）
+	sm.snapshotStore = NewSnapshotStore(sm.config.SnapshotConfig.FfmpegPoolSize)
 
 	if sm.config.HlsConfig.Enable && sm.config.HlsConfig.UseMemoryAsDiskFlag {
 		Log.Infof("hls use memory as disk.")
@@ -926,6 +928,16 @@ func (sm *ServerManager) GetSnapshotFrame(streamName string) (*SnapshotFrame, bo
 		return nil, false
 	}
 	return sm.snapshotStore.Get(streamName)
+}
+
+// GetSnapshotJpeg 提供给 HTTP API：返回最新关键帧对应的 JPEG（带缓存与并发去抖）。
+func (sm *ServerManager) GetSnapshotJpeg(streamName string) ([]byte, error) {
+	if sm.snapshotStore == nil {
+		return nil, ErrSnapshotNotFound
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(sm.config.SnapshotConfig.TimeoutMs)*time.Millisecond)
+	defer cancel()
+	return sm.snapshotStore.GetJpeg(ctx, streamName)
 }
 
 func (sm *ServerManager) GetGroup(appName string, streamName string) *Group {

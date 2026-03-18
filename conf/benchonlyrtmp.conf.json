@@ -57,6 +57,11 @@
     "enable": false,
     "addr": ":8083"
   },
+  "snapshot": {
+    "ffmpeg_pool_size": 2,
+    "http_max_in_flight": 16,
+    "timeout_ms": 3000
+  },
   "server_id": "1",
   "http_notify": {
     "enable": false,

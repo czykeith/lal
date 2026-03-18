@@ -67,6 +67,7 @@ type Config struct {
 	StaticRelayPullConfig StaticRelayPullConfig `json:"static_relay_pull"`
 
 	HttpApiConfig    HttpApiConfig    `json:"http_api"`
+	SnapshotConfig   SnapshotConfig   `json:"snapshot"`
 	ServerId         string           `json:"server_id"`
 	HttpNotifyConfig HttpNotifyConfig `json:"http_notify"`
 	SimpleAuthConfig SimpleAuthConfig `json:"simple_auth"`
@@ -153,6 +154,21 @@ type StaticRelayPullConfig struct {
 type HttpApiConfig struct {
 	Enable bool   `json:"enable"`
 	Addr   string `json:"addr"`
+}
+
+type SnapshotConfig struct {
+	// FfmpegPoolSize 截图解码使用的 ffmpeg 常驻共享池大小（按 H264/H265 各启动同等数量的 worker）。
+	// - 0 表示禁用共享池并退回到“单次拉起 ffmpeg”（不推荐）
+	// - 建议取值 2~8
+	FfmpegPoolSize int `json:"ffmpeg_pool_size"`
+
+	// HttpMaxInFlight 截图接口允许的最大并发请求数（超过立即返回 busy，避免排队卡顿）。
+	// 建议取值 >= FfmpegPoolSize，典型 8~32。
+	HttpMaxInFlight int `json:"http_max_in_flight"`
+
+	// TimeoutMs 截图接口处理超时（包含等待并发槽位 + 等待去抖 + ffmpeg 解码时间）。
+	// 建议 1500~5000。
+	TimeoutMs int `json:"timeout_ms"`
 }
 
 type HttpNotifyConfig struct {
@@ -352,6 +368,18 @@ func LoadConfAndInitLog(rawContent []byte) *Config {
 	mergeCommonHttpAddrConfig(&config.HlsConfig.CommonHttpAddrConfig, &config.DefaultHttpConfig.CommonHttpAddrConfig)
 
 	// 为缺失的字段中的一些特定字段，设置特定默认值
+	if !j.Exist("snapshot.ffmpeg_pool_size") {
+		config.SnapshotConfig.FfmpegPoolSize = 2
+		Log.Warnf("config snapshot.ffmpeg_pool_size not exist. set to default which is %d", config.SnapshotConfig.FfmpegPoolSize)
+	}
+	if !j.Exist("snapshot.http_max_in_flight") {
+		config.SnapshotConfig.HttpMaxInFlight = 16
+		Log.Warnf("config snapshot.http_max_in_flight not exist. set to default which is %d", config.SnapshotConfig.HttpMaxInFlight)
+	}
+	if !j.Exist("snapshot.timeout_ms") {
+		config.SnapshotConfig.TimeoutMs = 3000
+		Log.Warnf("config snapshot.timeout_ms not exist. set to default which is %d", config.SnapshotConfig.TimeoutMs)
+	}
 	if config.HlsConfig.Enable && !j.Exist("hls.cleanup_mode") {
 		Log.Warnf("config hls.cleanup_mode not exist. set to default which is %d", defaultHlsCleanupMode)
 		config.HlsConfig.CleanupMode = defaultHlsCleanupMode
