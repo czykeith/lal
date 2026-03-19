@@ -3368,13 +3368,15 @@ func (s *GB28181Server) StoreDevice(id string, req sip.Request) (d *Device) {
 			RegisterTime:    now,
 			UpdateTime:      now,
 			LastKeepaliveAt: now,
-			Status:          DeviceRegisterStatus,
-			addr:            deviceAddr,
-			sipIP:           sipIp,
-			mediaIP:         mediaIp,
-			NetAddr:         deviceIp,
-			conf:            s.conf,
-			network:         strings.ToLower(req.Transport()),
+			// 设备已被接入侧接纳（REGISTER 成功路径或 QuickLogin 从 MESSAGE 创建），应视为在线。
+			// 若后续超过心跳/活跃阈值，会由 statusCheck 切为 OFFLINE 或删除。
+			Status:  DeviceOnlineStatus,
+			addr:    deviceAddr,
+			sipIP:   sipIp,
+			mediaIP: mediaIp,
+			NetAddr: deviceIp,
+			conf:    s.conf,
+			network: strings.ToLower(req.Transport()),
 		}
 		if d.network == "udp" {
 			d.sipSvr = s.sipUdpSvr
@@ -3402,7 +3404,8 @@ func (s *GB28181Server) RecoverDevice(d *Device, req sip.Request) {
 	servIp := req.Recipient().Host()
 	sipIp := s.conf.SipIP
 	mediaIp := sipIp
-	d.Status = DeviceRegisterStatus
+	// Recover 场景多为设备重新发起 REGISTER/MESSAGE 等活跃行为，恢复为在线。
+	d.Status = DeviceOnlineStatus
 	d.sipIP = sipIp
 	d.mediaIP = mediaIp
 	d.NetAddr = deviceIp
