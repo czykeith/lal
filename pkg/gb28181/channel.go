@@ -195,13 +195,6 @@ f字段中视、音频参数段之间不需空格分割。
 
 // Invite 发起 INVITE。sdpConf 可选：非 nil 时用其生成 SDP 的 f=/fmtp，否则用 channel.conf（保证 API 调用时传入服务器配置可使视频参数生效）。
 func (channel *Channel) Invite(opt *InviteOptions, streamName string, playInfo *PlayInfo, sdpConf *GB28181Config) (code int, err error) {
-	// 同一 streamName 已在拉流：直接成功，不再发 INVITE、不覆盖 MediaInfo/SSRC，避免设备再推一路 RTP
-	// 导致第二路 Conn AddCustomizePubSession 失败（ErrDupInStream）或误杀第一路。
-	if channel.MediaInfo.IsInvite && channel.MediaInfo.StreamName == streamName {
-		base.Log.Debugf("gb28181 Invite idempotent skip, streamName=%s channel=%s", streamName, channel.ChannelId)
-		return http.StatusOK, nil
-	}
-
 	d := channel.device
 	sdpCfg := channel.conf
 	if sdpConf != nil {
@@ -211,6 +204,27 @@ func (channel *Channel) Invite(opt *InviteOptions, streamName string, playInfo *
 	s := "Play"
 	if opt != nil && !opt.IsLive() {
 		s = "Playback"
+	}
+
+	// 幂等处理：若同一 streamName 已标记为 IsInvite，则优先判断“本机是否真的已经存在活跃拉流连接”。
+	// 仅当 mediaserver 中存在该 streamName 的活跃连接时才跳过 INVITE；否则视为“僵尸/半开”状态，
+	// 允许通过重发 INVITE 触发重建，避免你描述的“重发也替换不了重新拉取”。
+	if channel.MediaInfo.IsInvite && channel.MediaInfo.StreamName == streamName {
+		if channel.observer != nil && playInfo != nil {
+			if ms := channel.observer.OnStartMediaServer(playInfo.NetWork, playInfo.SinglePort, channel.device.ID, channel.ChannelId); ms != nil {
+				if ms.HasStream(streamName) {
+					base.Log.Debugf("gb28181 Invite idempotent skip (active), streamName=%s channel=%s", streamName, channel.ChannelId)
+					return http.StatusOK, nil
+				}
+			}
+		}
+		base.Log.Warnf("gb28181 Invite idempotent not safe (stale), will restart. streamName=%s channel=%s",
+			streamName, channel.ChannelId)
+		if channel.ackReq != nil {
+			_ = channel.Bye(streamName)
+		} else {
+			_ = channel.byeClear()
+		}
 	}
 
 	//然后按顺序生成，一个channel最大999 方便排查问题,也能保证唯一性
@@ -248,6 +262,10 @@ func (channel *Channel) Invite(opt *InviteOptions, streamName string, playInfo *
 	channel.MediaInfo.SinglePort = playInfo.SinglePort
 	channel.MediaInfo.DumpFileName = playInfo.DumpFileName
 	channel.MediaInfo.MediaKey = fmt.Sprintf("%s%d", playInfo.NetWork, mediaserver.GetListenerPort())
+	if channel.observer != nil {
+		// 启动 INVITE 后立即同步索引，确保首个 RTP 包到达时能被快速校验与绑定。
+		channel.observer.OnInviteMediaInfoSet(channel.MediaInfo)
+	}
 
 	sdpInfo := []string{
 		"v=0",
@@ -351,6 +369,10 @@ func (channel *Channel) Invite(opt *InviteOptions, streamName string, playInfo *
 				base.Log.Errorf("gb28181 MediaServer stop err:%s", err.Error())
 			}
 		}
+		if channel.observer != nil {
+			// 先移除索引，再清理 MediaInfo，避免并发 RTP 首包落入过期状态。
+			channel.observer.OnInviteMediaInfoClear(channel.MediaInfo)
+		}
 		channel.MediaInfo.Clear()
 		channel.playInfo = nil
 
@@ -391,6 +413,10 @@ func (channel *Channel) Invite(opt *InviteOptions, streamName string, playInfo *
 		}
 		// 这里以最终 SSRC 覆盖（通常等于请求侧生成的 SSRC；若设备返回 y>0 则以设备返回为准）
 		channel.MediaInfo.Ssrc = opt.SSRC
+		if channel.observer != nil {
+			// 设备若返回 y>0，则 SSRC 可能发生变化，需要更新索引。
+			channel.observer.OnInviteMediaInfoSet(channel.MediaInfo)
+		}
 
 		ackReq := sip.NewAckRequest("", invite, inviteRes, "", nil)
 		//保存一下播放信息
@@ -404,6 +430,10 @@ func (channel *Channel) Invite(opt *InviteOptions, streamName string, playInfo *
 			if err = channel.observer.OnStopMediaServer(playInfo.NetWork, playInfo.SinglePort, channel.device.ID, channel.ChannelId, ""); err != nil {
 				base.Log.Errorf("gb28181 MediaServer stop err:%s", err.Error())
 			}
+		}
+		if channel.observer != nil {
+			// 停止 INVITE 后移除索引，避免 CheckSsrc/GetMediaInfoByKey 命中过期状态。
+			channel.observer.OnInviteMediaInfoClear(channel.MediaInfo)
 		}
 		channel.MediaInfo.Clear()
 		channel.playInfo = nil
@@ -516,6 +546,10 @@ func (channel *Channel) stopMediaServer() (err error) {
 func (channel *Channel) byeClear() (err error) {
 	err = channel.stopMediaServer()
 	channel.ackReq = nil
+	if channel.observer != nil {
+		// 通道停止前先移除索引，再清理 MediaInfo。
+		channel.observer.OnInviteMediaInfoClear(channel.MediaInfo)
+	}
 	channel.MediaInfo.Clear()
 	return
 }
@@ -536,6 +570,9 @@ func (channel *Channel) Bye(streamName string) (err error) {
 	}
 	channel.stopMediaServer()
 	// 无论是否存在 ackReq，都视为“停止动作已执行”（幂等），避免 API 层因重复 stop 或竞态导致失败。
+	if channel.observer != nil {
+		channel.observer.OnInviteMediaInfoClear(channel.MediaInfo)
+	}
 	channel.MediaInfo.Clear()
 	channel.playInfo = nil
 	return err

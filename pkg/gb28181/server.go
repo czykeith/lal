@@ -27,6 +27,12 @@ import (
 type IMediaOpObserver interface {
 	OnStartMediaServer(netWork string, singlePort bool, deviceId string, channelId string) *mediaserver.GB28181MediaServer
 	OnStopMediaServer(netWork string, singlePort bool, deviceId string, channelId string, StreamName string) error
+	// OnInviteMediaInfoSet 在 Channel 发起 INVITE 并写入 IsInvite/SSRC/MediaKey 等关键信息后调用，
+	// 用于维护快速索引，避免后续 RTP 首包校验时全量遍历 Devices/channelMap。
+	OnInviteMediaInfoSet(info mediaserver.MediaInfo)
+	// OnInviteMediaInfoClear 在 Channel 停止回放/点播并清理 MediaInfo 前调用，
+	// 用于维护快速索引的移除逻辑。
+	OnInviteMediaInfoClear(info mediaserver.MediaInfo)
 }
 type GB28181Server struct {
 	conf              GB28181Config
@@ -92,6 +98,15 @@ type GB28181Server struct {
 	// logic 层通过 UpstreamRtpFeeder 向其中喂 RTP，由 ForwardRtp 发往上级。
 	virtualMediaserverMu sync.Mutex
 	virtualMediaserver   *mediaserver.GB28181MediaServer
+
+	// inviteMediaIndex 用于加速 mediaserver.Conn 首包校验：
+	// - CheckSsrc(ssrc) => O(1) 查找 mediaserver.MediaInfo
+	// - GetMediaInfoByKey(mediaKey) => O(1) 查找 mediaserver.MediaInfo
+	// 否则将需要扫描 Devices/channelMap，设备多时会带来明显性能开销。
+	inviteMediaIndexMu   sync.RWMutex
+	inviteBySsrc         map[uint32]mediaserver.MediaInfo
+	inviteByMediaKey     map[string]mediaserver.MediaInfo
+	inviteMediaKeyToSsrc map[string]uint32
 }
 
 const virtualMediaKey = "virtual_non_gb"
@@ -225,6 +240,9 @@ func NewGB28181Server(conf GB28181Config, lal mediaserver.ILalServer) *GB28181Se
 		streamMediasvrIndex:       make(map[string]*mediaserver.GB28181MediaServer),
 		upstreamsByIP:             make(map[string]string),
 		upstreamSessionsByChannel: make(map[string]map[string]*UpstreamSession),
+		inviteBySsrc:              make(map[uint32]mediaserver.MediaInfo),
+		inviteByMediaKey:          make(map[string]mediaserver.MediaInfo),
+		inviteMediaKeyToSsrc:      make(map[string]uint32),
 	}
 	gb28181Server.tcpAvailConnPool.onListenWithPort = func(port uint16) (net.Listener, error) {
 		return net.Listen("tcp", fmt.Sprintf(":%d", port))
@@ -2146,13 +2164,66 @@ func (s *GB28181Server) OnStreamInactive(streamName string, mediaKey string) {
 	delete(s.streamMediasvrIndex, streamName)
 	s.streamMediasvrIndexMu.Unlock()
 }
+
+func (s *GB28181Server) OnInviteMediaInfoSet(info mediaserver.MediaInfo) {
+	// 仅对有效 INVITE 记录维护索引
+	if !info.IsInvite || info.StreamName == "" || info.MediaKey == "" {
+		return
+	}
+
+	s.inviteMediaIndexMu.Lock()
+	defer s.inviteMediaIndexMu.Unlock()
+
+	// 如果同一个 MediaKey 的 SSRC 发生变化，需要先移除旧 SSRC 映射
+	if oldSsrc, ok := s.inviteMediaKeyToSsrc[info.MediaKey]; ok && oldSsrc != info.Ssrc {
+		if oldSsrc != 0 {
+			delete(s.inviteBySsrc, oldSsrc)
+		}
+	}
+
+	s.inviteByMediaKey[info.MediaKey] = info
+	if info.Ssrc != 0 {
+		s.inviteBySsrc[info.Ssrc] = info
+	}
+	s.inviteMediaKeyToSsrc[info.MediaKey] = info.Ssrc
+}
+
+func (s *GB28181Server) OnInviteMediaInfoClear(info mediaserver.MediaInfo) {
+	if info.MediaKey == "" {
+		return
+	}
+
+	s.inviteMediaIndexMu.Lock()
+	defer s.inviteMediaIndexMu.Unlock()
+
+	// 以 MediaKey 作为主键移除：确保不会因为调用方传入的 info.Ssrc 不一致而残留旧映射。
+	if oldSsrc, ok := s.inviteMediaKeyToSsrc[info.MediaKey]; ok && oldSsrc != 0 {
+		delete(s.inviteBySsrc, oldSsrc)
+	}
+	delete(s.inviteByMediaKey, info.MediaKey)
+	delete(s.inviteMediaKeyToSsrc, info.MediaKey)
+}
+
 func (s *GB28181Server) CheckSsrc(ssrc uint32) (*mediaserver.MediaInfo, bool) {
+	if ssrc == 0 {
+		return nil, false
+	}
+
+	// 先走索引，避免全量遍历
+	s.inviteMediaIndexMu.RLock()
+	if info, ok := s.inviteBySsrc[ssrc]; ok && info.IsInvite {
+		cp := info
+		s.inviteMediaIndexMu.RUnlock()
+		return &cp, true
+	}
+	s.inviteMediaIndexMu.RUnlock()
+
+	// fallback：兼容索引未同步/历史数据残留
 	var isValidSsrc bool
 	var mediaInfo *mediaserver.MediaInfo
-
 	Devices.Range(func(_, value any) bool {
 		d := value.(*Device)
-		d.channelMap.Range(func(key, value any) bool {
+		d.channelMap.Range(func(_, value any) bool {
 			ch := value.(*Channel)
 			if ch.MediaInfo.IsInvite && ch.MediaInfo.Ssrc == ssrc {
 				isValidSsrc = true
@@ -2166,17 +2237,28 @@ func (s *GB28181Server) CheckSsrc(ssrc uint32) (*mediaserver.MediaInfo, bool) {
 		}
 		return true
 	})
-
 	if isValidSsrc {
 		return mediaInfo, true
 	}
-
 	return nil, false
 }
 func (s *GB28181Server) GetMediaInfoByKey(key string) (*mediaserver.MediaInfo, bool) {
+	if key == "" {
+		return nil, false
+	}
+
+	// 先走索引，避免全量遍历
+	s.inviteMediaIndexMu.RLock()
+	if info, ok := s.inviteByMediaKey[key]; ok && info.IsInvite {
+		cp := info
+		s.inviteMediaIndexMu.RUnlock()
+		return &cp, true
+	}
+	s.inviteMediaIndexMu.RUnlock()
+
+	// fallback：兼容索引未同步/历史数据残留
 	var isValidMediaInfo bool
 	var mediaInfo *mediaserver.MediaInfo
-
 	Devices.Range(func(_, value any) bool {
 		d := value.(*Device)
 		d.channelMap.Range(func(_, value any) bool {
@@ -2193,11 +2275,9 @@ func (s *GB28181Server) GetMediaInfoByKey(key string) (*mediaserver.MediaInfo, b
 		}
 		return true
 	})
-
 	if isValidMediaInfo {
 		return mediaInfo, true
 	}
-
 	return nil, false
 }
 
