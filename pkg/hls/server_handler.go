@@ -34,6 +34,8 @@ type ServerHandler struct {
 	mutex             sync.Mutex
 	subSessionTimeout time.Duration
 	subSessionHashKey string
+	disposeOnce       sync.Once
+	disposeChan       chan struct{}
 }
 
 func NewServerHandler(outPath, urlPattern, subSessionHashKey string, subSessionTimeoutMs int, observer IHlsServerHandlerObserver) *ServerHandler {
@@ -47,6 +49,7 @@ func NewServerHandler(outPath, urlPattern, subSessionHashKey string, subSessionT
 		sessionMap:        make(map[string]*SubSession),
 		subSessionTimeout: time.Duration(subSessionTimeoutMs) * time.Millisecond,
 		subSessionHashKey: subSessionHashKey,
+		disposeChan:       make(chan struct{}),
 	}
 	go sh.runLoop()
 	return sh
@@ -258,9 +261,28 @@ func (s *ServerHandler) CloseSubSessionByUniqueKey(uniqueKey string) bool {
 func (s *ServerHandler) runLoop() {
 	// TODO(chef): [refactor] 也许可以弄到group中管理超时，和其他协议的session管理方式保持一致 202211
 	ticker := time.NewTicker(1 * time.Second)
-	for range ticker.C {
-		s.clearExpireSession()
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			s.clearExpireSession()
+		case <-s.disposeChan:
+			return
+		}
 	}
+}
+
+func (s *ServerHandler) Dispose() {
+	s.disposeOnce.Do(func() {
+		close(s.disposeChan)
+		s.mutex.Lock()
+		defer s.mutex.Unlock()
+		for sessionIdHash, session := range s.sessionMap {
+			session.Dispose()
+			s.observer.OnDelHlsSubSession(session)
+			delete(s.sessionMap, sessionIdHash)
+		}
+	})
 }
 
 // m3u8文件用这个也行

@@ -360,10 +360,18 @@ func (group *Group) pullIfNeeded() (string, error) {
 	group.pullProxy.pullingSessionId = uk
 
 	go func(rtPullUrl string, rtIsPullByRtmp bool, rtRtmpSession *rtmp.PullSession, rtRtspSession *rtsp.PullSession) {
+		// 全局限并发：只控制 Start 握手阶段的并发数量，不限制拉流总路数
+		acquired := false
+		releaseSlotIfNeeded := func() {
+			if acquired {
+				releasePullStartSlot()
+				acquired = false
+			}
+		}
 		defer func() {
 			if r := recover(); r != nil {
 				Log.Errorf("[%s] relay pull goroutine panic recovered, panic=%+v", uk, r)
-				releasePullStartSlot()
+				// 注意：panic 时 session 可能尚未 Start/Add，确保释放资源避免泄露
 				if rtRtmpSession != nil {
 					rtRtmpSession.Dispose()
 					group.DelRtmpPullSession(rtRtmpSession)
@@ -375,9 +383,9 @@ func (group *Group) pullIfNeeded() (string, error) {
 				group.onPullSessionExitedLocked(uk, fmt.Errorf("panic recovered: %v", r))
 				group.mutex.Unlock()
 			}
+			// 无论正常/异常路径，兜底释放 slot（若前面已释放则无操作）
+			releaseSlotIfNeeded()
 		}()
-		// 全局限并发：只控制 Start 握手阶段的并发数量，不限制拉流总路数
-		acquired := false
 		if ok := acquirePullStartSlot(maxWaitPullStartSlot); !ok {
 			// 排队超时：说明系统处于高压（或上游长期不可用），不要一直堵在这里
 			err := errors.New("wait pull start slot timeout")
@@ -394,11 +402,6 @@ func (group *Group) pullIfNeeded() (string, error) {
 			return
 		}
 		acquired = true
-		defer func() {
-			if acquired {
-				releasePullStartSlot()
-			}
-		}()
 
 		// 可能在排队期间被StopPull/autoStop取消，这里二次确认
 		group.mutex.Lock()
@@ -421,8 +424,8 @@ func (group *Group) pullIfNeeded() (string, error) {
 		if rtIsPullByRtmp {
 			// TODO(chef): 处理数据回调，是否应该等待Add成功之后。避免竞态条件中途加入了其他in session
 			err := rtRtmpSession.Start(rtPullUrl)
-			// Start 阶段结束，释放并发slot（由 defer 统一释放）
-			acquired = false
+			// Start 握手阶段结束，立即释放并发 slot（不占用到会话结束）
+			releaseSlotIfNeeded()
 			if err != nil {
 				Log.Errorf("[%s] relay pull fail. err=%v", rtRtmpSession.UniqueKey(), err)
 				group.mutex.Lock()
@@ -441,8 +444,8 @@ func (group *Group) pullIfNeeded() (string, error) {
 		}
 
 		err := rtRtspSession.Start(rtPullUrl)
-		// Start 阶段结束，释放并发slot（由 defer 统一释放）
-		acquired = false
+		// Start 握手阶段结束，立即释放并发 slot（不占用到会话结束）
+		releaseSlotIfNeeded()
 		if err != nil {
 			Log.Errorf("[%s] relay pull fail. err=%v", rtRtspSession.UniqueKey(), err)
 			group.mutex.Lock()

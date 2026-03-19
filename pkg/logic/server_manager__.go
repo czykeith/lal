@@ -529,6 +529,10 @@ func (sm *ServerManager) Dispose() {
 		sm.httpServerManager.Dispose()
 		sm.httpServerManager = nil
 	}
+	if sm.hlsServerHandler != nil {
+		sm.hlsServerHandler.Dispose()
+		sm.hlsServerHandler = nil
+	}
 
 	// 关闭 pprof 服务器
 	if sm.pprofServer != nil {

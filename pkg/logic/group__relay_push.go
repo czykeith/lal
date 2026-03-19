@@ -112,12 +112,16 @@ func (group *Group) startPushIfNeeded() {
 			err := pushSession.Start(u2)
 			if err != nil {
 				Log.Errorf("[%s] relay push done. err=%v", pushSession.UniqueKey(), err)
+				// Start 失败时，确保释放底层资源，避免在目标不可达/频繁触发时累积。
+				_ = pushSession.Dispose()
 				group.DelRtmpPushSession(u, pushSession)
 				return
 			}
 			group.AddRtmpPushSession(u, pushSession)
 			err = <-pushSession.WaitChan()
 			Log.Infof("[%s] relay push done. err=%v", pushSession.UniqueKey(), err)
+			// WaitChan 返回后也主动 Dispose 一次，确保连接与内部 goroutine 及时退出（幂等）。
+			_ = pushSession.Dispose()
 			group.DelRtmpPushSession(u, pushSession)
 		}(url, urlWithParam)
 	}

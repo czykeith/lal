@@ -56,6 +56,7 @@ type GB28181Server struct {
 
 	MediaServerMap sync.Map
 	disposeOnce    sync.Once
+	jobExitChan    chan struct{}
 
 	// streamMediasvrIndex 维护 streamName -> GB28181MediaServer 的快速索引，
 	// 用于加速上级 INVITE 查找 mediaserver 以及 Catalog 状态判断。
@@ -243,6 +244,7 @@ func NewGB28181Server(conf GB28181Config, lal mediaserver.ILalServer) *GB28181Se
 		inviteBySsrc:              make(map[uint32]mediaserver.MediaInfo),
 		inviteByMediaKey:          make(map[string]mediaserver.MediaInfo),
 		inviteMediaKeyToSsrc:      make(map[string]uint32),
+		jobExitChan:               make(chan struct{}),
 	}
 	gb28181Server.tcpAvailConnPool.onListenWithPort = func(port uint16) (net.Listener, error) {
 		return net.Listen("tcp", fmt.Sprintf(":%d", port))
@@ -2047,6 +2049,20 @@ func (s *GB28181Server) newUpstreamSipServer(network string, port uint16) (gosip
 func (s *GB28181Server) Dispose() {
 	s.disposeOnce.Do(
 		func() {
+			// 停止后台定时任务 goroutine
+			if s.jobExitChan != nil {
+				close(s.jobExitChan)
+			}
+			// 停止所有上级平台注册/保活 goroutine
+			s.upstreamsMu.Lock()
+			for _, up := range s.upstreams {
+				if up != nil && up.stopCh != nil {
+					close(up.stopCh)
+					up.stopCh = nil
+				}
+			}
+			s.upstreamsMu.Unlock()
+
 			s.MediaServerMap.Range(func(_, value any) bool {
 				mediaServer := value.(*mediaserver.GB28181MediaServer)
 				mediaServer.Dispose()
@@ -2407,8 +2423,14 @@ func (s *GB28181Server) startJob() {
 		catalogIntervalSec = 180
 	}
 	catalogTick := time.NewTicker(time.Duration(catalogIntervalSec) * time.Second)
+	defer statusTick.Stop()
+	defer banTick.Stop()
+	defer recoveryTick.Stop()
+	defer catalogTick.Stop()
 	for {
 		select {
+		case <-s.jobExitChan:
+			return
 		case <-banTick.C:
 			if s.conf.Username != "" || s.conf.Password != "" {
 				s.removeBanDevice()
