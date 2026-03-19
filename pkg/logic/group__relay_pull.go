@@ -377,6 +377,7 @@ func (group *Group) pullIfNeeded() (string, error) {
 			}
 		}()
 		// 全局限并发：只控制 Start 握手阶段的并发数量，不限制拉流总路数
+		acquired := false
 		if ok := acquirePullStartSlot(maxWaitPullStartSlot); !ok {
 			// 排队超时：说明系统处于高压（或上游长期不可用），不要一直堵在这里
 			err := errors.New("wait pull start slot timeout")
@@ -392,6 +393,12 @@ func (group *Group) pullIfNeeded() (string, error) {
 			}
 			return
 		}
+		acquired = true
+		defer func() {
+			if acquired {
+				releasePullStartSlot()
+			}
+		}()
 
 		// 可能在排队期间被StopPull/autoStop取消，这里二次确认
 		group.mutex.Lock()
@@ -407,8 +414,8 @@ func (group *Group) pullIfNeeded() (string, error) {
 		if rtIsPullByRtmp {
 			// TODO(chef): 处理数据回调，是否应该等待Add成功之后。避免竞态条件中途加入了其他in session
 			err := rtRtmpSession.Start(rtPullUrl)
-			// Start 阶段结束，释放并发slot（无论成功失败）
-			releasePullStartSlot()
+			// Start 阶段结束，释放并发slot（由 defer 统一释放）
+			acquired = false
 			if err != nil {
 				Log.Errorf("[%s] relay pull fail. err=%v", rtRtmpSession.UniqueKey(), err)
 				group.mutex.Lock()
@@ -427,8 +434,8 @@ func (group *Group) pullIfNeeded() (string, error) {
 		}
 
 		err := rtRtspSession.Start(rtPullUrl)
-		// Start 阶段结束，释放并发slot（无论成功失败）
-		releasePullStartSlot()
+		// Start 阶段结束，释放并发slot（由 defer 统一释放）
+		acquired = false
 		if err != nil {
 			Log.Errorf("[%s] relay pull fail. err=%v", rtRtspSession.UniqueKey(), err)
 			group.mutex.Lock()
