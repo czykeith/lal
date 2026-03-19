@@ -15,6 +15,9 @@ import (
 type IGbObserver interface {
 	CheckSsrc(ssrc uint32) (*MediaInfo, bool)
 	GetMediaInfoByKey(key string) (*MediaInfo, bool)
+	// BindMediaKeySsrc 在首包校验失败但 mediaKey 能定位到 MediaInfo 且其 Ssrc 未可靠设定（通常 y=0）时，
+	// 允许将真实 RTP SSRC 绑定到该 mediaKey，避免后续多连接/重连再次失败。
+	BindMediaKeySsrc(mediaKey string, ssrc uint32)
 	NotifyClose(streamName string)
 	// GetPlaybackScale 返回指定回放流当前配置的倍速，未配置时返回 1.0。
 	GetPlaybackScale(streamName string) float64

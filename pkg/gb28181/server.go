@@ -2281,6 +2281,34 @@ func (s *GB28181Server) GetMediaInfoByKey(key string) (*mediaserver.MediaInfo, b
 	return nil, false
 }
 
+// BindMediaKeySsrc 把真实 RTP SSRC 绑定到指定 mediaserver.mediaKey 上。
+// 主要用于部分下游设备在 INVITE/200OK 的 y= 字段不可靠（例如 y=0）时，
+// 让后续 conn/重连也能通过 SSRC 校验。
+func (s *GB28181Server) BindMediaKeySsrc(mediaKey string, ssrc uint32) {
+	if mediaKey == "" || ssrc == 0 {
+		return
+	}
+
+	s.inviteMediaIndexMu.Lock()
+	defer s.inviteMediaIndexMu.Unlock()
+
+	// 仅当该 mediaKey 在 INVITE 生命周期内存在时才绑定。
+	info, ok := s.inviteByMediaKey[mediaKey]
+	if !ok || !info.IsInvite {
+		return
+	}
+
+	oldSsrc := info.Ssrc
+	if oldSsrc != 0 && oldSsrc != ssrc {
+		delete(s.inviteBySsrc, oldSsrc)
+	}
+
+	info.Ssrc = ssrc
+	s.inviteByMediaKey[mediaKey] = info
+	s.inviteBySsrc[ssrc] = info
+	s.inviteMediaKeyToSsrc[mediaKey] = ssrc
+}
+
 func (s *GB28181Server) NotifyClose(streamName string) {
 	var ok bool
 	var chFound *Channel

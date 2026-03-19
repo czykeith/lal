@@ -77,6 +77,13 @@ type Conn struct {
 	scaleQueue *rtsp.AvPacketQueue
 	hasAudio   bool
 	hasVideo   bool
+
+	// hevcFallbackLogAt 限制“99 payload type 但兜底为 AVC”日志刷屏。
+	hevcFallbackLogAt time.Time
+
+	// psFormatSet 记录是否已为当前连接把 streamName 的格式缓存为 PS。
+	// 避免在高帧率下对同一 streamName 反复调用 SetStreamFormat。
+	psFormatSet bool
 }
 
 func NewConn(conn net.Conn, observer IGbObserver, lal ILalServer) *Conn {
@@ -189,6 +196,8 @@ func (c *Conn) Serve() (err error) {
 					// 此时按 mediaKey 兜底：如果找到 MediaInfo 且 Ssrc 仍为 0，则把当前 SSRC 绑定进去并视为有效。
 					if miByKey, ok2 := c.observer.GetMediaInfoByKey(c.key); ok2 {
 						if miByKey.Ssrc == 0 {
+							// 同步更新上层索引，避免后续 conn/重连再次失败。
+							c.observer.BindMediaKeySsrc(c.key, pkt.SSRC)
 							miByKey.Ssrc = pkt.SSRC
 							mediaInfo = miByKey
 							ok = true
@@ -255,27 +264,50 @@ func (c *Conn) Serve() (err error) {
 		//
 		// 我们在接收端按负载/PT 判定并缓存 streamName->格式，供上级级联 INVITE 动态生成匹配 SDP，
 		// 并在 ForwardRtp 转发时按上级期望重写 PT/SSRC。
-		if isPsPayload(pkt.Payload) {
-			if c.mediaServer != nil && c.streamName != "" {
-				c.mediaServer.SetStreamFormat(c.streamName, StreamPayloadFormatPs)
-				c.mediaServer.ForwardRtp(c.streamName, pkt)
+		// PS 识别策略：
+		// - 优先用 pack start code 快速判断（isPsPayload）
+		// - 若 payload type=96（你下发 SDP 里对应 PS/90000），即使单包不一定以 pack start 开头，
+		//   也先尝试走 PS demux，只有 demux 明确“不像 PS”（且非 NeedMore）时才回退到 AVC/HEVC。
+		tryPs := isPsPayload(pkt.Payload) || pkt.PayloadType == 96
+		if tryPs && c.demuxer != nil {
+			acceptedAsPs := false
+			var inputErr error
+			if c.psDumpFile != nil {
+				c.psDumpFile.WriteWithType(pkt.Payload, base.DumpTypePsRtpData)
 			}
-
-			if c.demuxer != nil {
-				if c.psDumpFile != nil {
-					c.psDumpFile.WriteWithType(pkt.Payload, base.DumpTypePsRtpData)
-				}
-				if err := c.demuxer.Input(pkt.Payload); err != nil {
-					// 单包 PS 解析失败不关闭连接，仅打日志并继续收包，提高拉流稳定性
-					var psErr mpegps.Error
-					if errors.As(err, &psErr) && psErr.NeedMore() {
-						// 正常“需要更多数据”，不打印
+			if inputErr = c.demuxer.Input(pkt.Payload); inputErr != nil {
+				var psErr mpegps.Error
+				// NeedMore 表示这是“正常的分片”，可以继续当作 PS 累积解封装。
+				if errors.As(inputErr, &psErr) {
+					if psErr.NeedMore() {
+						acceptedAsPs = true
 					} else {
-						base.Log.Debug("gb28181 ps demux input err, skip packet. streamName=%s err=%v", c.streamName, err)
+						// 若设备在 PT=96 宣称为 PS，但 demux 返回非 NeedMore 错误：
+						// - 更像 H264：回退 AVC 解封装
+						// - 更不像 H264：仍按 PS 继续（避免错误回退导致无法恢复）
+						if pkt.PayloadType == 96 && looksLikeH264RtpPayload(pkt.Payload) {
+							acceptedAsPs = false
+						} else {
+							acceptedAsPs = true
+						}
 					}
 				}
+			} else {
+				acceptedAsPs = true
 			}
-			continue
+
+			if acceptedAsPs {
+				if c.mediaServer != nil && c.streamName != "" {
+					// streamName->format 对上级 SDP 生成是“按需缓存”，不需要每包都覆盖 UpdatedAt。
+					if !c.psFormatSet {
+						c.mediaServer.SetStreamFormat(c.streamName, StreamPayloadFormatPs)
+						c.psFormatSet = true
+					}
+					c.mediaServer.ForwardRtp(c.streamName, pkt)
+				}
+				continue
+			}
+			// 若未被接受为 PS，则继续按 PT 走后续 AVC/HEVC 解封装。
 		}
 
 		// 非 PS：按 RTP PayloadType 尝试解包 H264/H265。
@@ -287,11 +319,26 @@ func (c *Conn) Serve() (err error) {
 			}
 			c.feedRtpAvc(*pkt)
 		case 99: // channel.go 当前 INVITE SDP: a=rtpmap:99 H265/90000
-			if c.mediaServer != nil && c.streamName != "" {
-				c.mediaServer.SetStreamFormat(c.streamName, StreamPayloadFormatH265)
-				c.mediaServer.ForwardRtp(c.streamName, pkt)
+			// 部分下游会“把 H264 包错误地标成 99”，导致 HEVC unpacker 报 unknown nalu type。
+			// 这里按负载形态兜底：若更像 H264，则走 AVC 解封装器。
+			if looksLikeH264RtpPayload(pkt.Payload) {
+				// 每秒最多打一条，避免高码率设备导致日志刷屏。
+				if c.hevcFallbackLogAt.IsZero() || time.Since(c.hevcFallbackLogAt) > time.Second {
+					c.hevcFallbackLogAt = time.Now()
+					base.Log.Warnf("gb28181 payload type=99 but looks like H264, fallback to AVC. streamName=%s remote=%s", c.streamName, c.connKey)
+				}
+				if c.mediaServer != nil && c.streamName != "" {
+					c.mediaServer.SetStreamFormat(c.streamName, StreamPayloadFormatH264)
+					c.mediaServer.ForwardRtp(c.streamName, pkt)
+				}
+				c.feedRtpAvc(*pkt)
+			} else {
+				if c.mediaServer != nil && c.streamName != "" {
+					c.mediaServer.SetStreamFormat(c.streamName, StreamPayloadFormatH265)
+					c.mediaServer.ForwardRtp(c.streamName, pkt)
+				}
+				c.feedRtpHevc(*pkt)
 			}
-			c.feedRtpHevc(*pkt)
 		case 96: // 兼容：部分实现使用 96 表示 H264；若不是 PS 则按 H264 处理
 			if c.mediaServer != nil && c.streamName != "" {
 				c.mediaServer.SetStreamFormat(c.streamName, StreamPayloadFormatH264)
@@ -312,6 +359,36 @@ func isPsPayload(payload []byte) bool {
 	}
 	// MPEG-PS pack start code: 0x000001BA
 	return payload[0] == 0x00 && payload[1] == 0x00 && payload[2] == 0x01 && payload[3] == 0xBA
+}
+
+// looksLikeH264RtpPayload 做一个非常轻量的“形态判断”，用于应对部分设备把 H264
+// 包错误地标成了我们期望的 H265 payload type（例如 payload type=99）。
+// 这里只在兜底场景下使用，尽量避免误判导致走错解封装器。
+func looksLikeH264RtpPayload(payload []byte) bool {
+	// single NAL unit or FU-A both have meaningful nal_unit_type bits in the first/second byte.
+	if len(payload) < 1 {
+		return false
+	}
+	b0 := payload[0]
+	// forbidden_zero_bit should be 0 for H264
+	if (b0 & 0x80) != 0 {
+		return false
+	}
+	nt := b0 & 0x1f // nal_unit_type (5 bits)
+	// common single NALU types: 1..23 (24..31 reserved)
+	if nt >= 1 && nt <= 23 {
+		return true
+	}
+	// STAP-A
+	if nt == 24 {
+		return true
+	}
+	// FU-A indicator has nal_unit_type = 28
+	if nt == 28 && len(payload) >= 2 {
+		innerType := payload[1] & 0x1f
+		return innerType >= 1 && innerType <= 23
+	}
+	return false
 }
 
 func (c *Conn) feedRtpAvc(pkt rtp.Packet) {

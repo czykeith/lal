@@ -393,9 +393,11 @@ func (channel *Channel) Invite(opt *InviteOptions, streamName string, playInfo *
 					yv := strings.TrimSpace(ls[1])
 					if _ssrc, err := strconv.ParseInt(yv, 10, 0); err == nil {
 						// 部分设备返回 y=0000000000 或 y=0，但 RTP 实际 SSRC 非 0。
-						// 这里仅在 y>0 时覆盖，否则保留请求侧生成的 SSRC。
+						// 这里将 y<=0 视为“不可靠”，把期望 SSRC 置空，让首个 RTP 包按 mediaKey 兜底绑定真实 SSRC。
 						if _ssrc > 0 {
 							opt.SSRC = uint32(_ssrc)
+						} else {
+							opt.SSRC = 0
 						}
 					} else {
 						base.Log.Error("parse invite response y failed, err:", err)
