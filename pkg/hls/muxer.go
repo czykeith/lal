@@ -238,7 +238,21 @@ func (m *Muxer) updateFragment(ts uint64, boundary bool, frame *mpegts.Frame) er
 		discont = false
 
 		// 已经有TS切片，切片时长没有达到设置的阈值，则不开启新的切片
-		if f.duration < float64(m.config.FragmentDurationMs)/1000 {
+		fragmentDurationSec := float64(m.config.FragmentDurationMs) / 1000
+		if f.duration < fragmentDurationSec {
+			return nil
+		}
+
+		// safety: 当 boundary（由上层根据视频关键帧判断）长时间不触发时，
+		// fragment 可能会持续写入而不 close/open，从而在 memory-as-disk 模式下导致单文件无限增长。
+		// 在 CleanupModeAsap 下，按时间阈值强制切片，保证文件系统内的 ts 文件数量/大小有上界。
+		if !boundary && m.config.CleanupMode == CleanupModeAsap {
+			if err := m.closeFragment(false); err != nil {
+				return err
+			}
+			if err := m.openFragment(ts, discont); err != nil {
+				return err
+			}
 			return nil
 		}
 	}

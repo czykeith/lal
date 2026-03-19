@@ -134,6 +134,15 @@ Doc: %s
 	if sm.config.HlsConfig.Enable && sm.config.HlsConfig.UseMemoryAsDiskFlag {
 		Log.Infof("hls use memory as disk.")
 		hls.SetUseMemoryAsDiskFlag(true)
+		// 内存文件系统无法像磁盘那样通过 OS 及时回收历史文件，
+		// 若使用 CleanupModeInTheEnd/Never，会导致 ts 分片文件在 muxer 生命周期内持续累积，
+		// 引发内存占用无限增长风险。
+		// 因此在 memory-as-disk 模式下强制使用 asap 清理策略，按 fragment 周期删除过期 ts 文件。
+		if sm.config.HlsConfig.CleanupMode == hls.CleanupModeNever || sm.config.HlsConfig.CleanupMode == hls.CleanupModeInTheEnd {
+			Log.Warnf("hls cleanup_mode override for memory-as-disk. old=%d -> new=%d",
+				sm.config.HlsConfig.CleanupMode, hls.CleanupModeAsap)
+			sm.config.HlsConfig.CleanupMode = hls.CleanupModeAsap
+		}
 	}
 
 	if sm.config.RecordConfig.EnableFlv {
@@ -440,6 +449,12 @@ func (sm *ServerManager) RunLoop() error {
 			})
 			sm.lastStatAllGroup = sgs
 			sm.lastStatAllGroupAt = time.Now()
+
+			// 周期性清理截图缓存中长期不再更新的 streamName，防止长时间运行时 map 无限增长。
+			// 这对 memory-as-disk 场景也有帮助：避免业务侧不断出现新 streamName 时 heap 线性上涨。
+			if sm.snapshotStore != nil && tickCount%30 == 0 {
+				_ = sm.snapshotStore.Cleanup(10*time.Minute, time.Now())
+			}
 
 			// 定时打印一些group相关的debug日志
 			if sm.config.DebugConfig.LogGroupIntervalSec > 0 &&

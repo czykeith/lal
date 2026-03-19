@@ -26,6 +26,8 @@ var (
 
 type snapshotItem struct {
 	frame *SnapshotFrame
+	// lastUpdateAt 用于回收长期不再更新的 streamName 项，避免 map 随 streamName 无限增长。
+	lastUpdateAt time.Time
 
 	mu sync.Mutex
 	// jpg 缓存对应的 frame.Timestamp
@@ -56,6 +58,33 @@ func NewSnapshotStore(ffmpegPoolSize int) *SnapshotStore {
 	}
 }
 
+// Cleanup 释放长期不再更新的条目，避免内存随 streamName 长期累积。
+// ttl<=0 表示不清理。
+func (s *SnapshotStore) Cleanup(ttl time.Duration, now time.Time) (removed int) {
+	if s == nil || ttl <= 0 {
+		return 0
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for streamName, item := range s.m {
+		if item == nil {
+			delete(s.m, streamName)
+			removed++
+			continue
+		}
+		// 未曾更新过的项也清理掉
+		if item.lastUpdateAt.IsZero() || now.Sub(item.lastUpdateAt) > ttl {
+			delete(s.m, streamName)
+			removed++
+		}
+	}
+	return removed
+}
+
 // Update 覆盖指定 streamName 的最新关键帧。
 // 约定：调用方只在确认是「带 SPS/PPS/VPS 的关键帧」时才调用。
 func (s *SnapshotStore) Update(streamName string, pkt base.AvPacket) {
@@ -79,6 +108,7 @@ func (s *SnapshotStore) Update(streamName string, pkt base.AvPacket) {
 		item = &snapshotItem{}
 		s.m[streamName] = item
 	}
+	item.lastUpdateAt = time.Now()
 	item.frame = &SnapshotFrame{
 		PayloadType: pkt.PayloadType,
 		Timestamp:   pkt.Timestamp,

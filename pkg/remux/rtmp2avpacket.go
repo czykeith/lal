@@ -81,10 +81,15 @@ func (r *Rtmp2AvPacketRemuxer) feedVideo(msg base.RtmpMsg, arg interface{}) erro
 		return err
 	}
 
-	var out []byte
+	// 预分配输出缓冲，减少 append 扩容导致的高频分配/拷贝（pprof alloc_space 会非常明显）。
+	// 经验估计：AVCC payload 转 AnnexB 后总长度 ~= payload + 4bytes start code * NAL 个数，再加可能的参数集。
+	// 这里用 payload 长度 + spspps + 少量冗余做 cap，避免大多数情况下触发扩容。
+	payload := msg.Payload[5:]
+	capHint := len(payload) + len(r.spspps) + 256
+	out := make([]byte, 0, capHint)
 	var vps, sps, pps []byte
 	appendSpsppsFlag := false
-	err = h2645.IterateNaluAvcc(msg.Payload[5:], func(nal []byte) {
+	err = h2645.IterateNaluAvcc(payload, func(nal []byte) {
 		nalType := h2645.ParseNaluType(isH264, nal[0])
 
 		if isH264 {
