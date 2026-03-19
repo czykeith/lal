@@ -22,6 +22,15 @@ func (group *Group) startHlsIfNeeded() {
 		return
 	}
 
+	// memory-as-disk 模式下，如果频繁 stop/start 拉流导致 muxer 重建，
+	// 旧的 ts/m3u8 文件可能不在新 muxer 的环形队列视野内，难以及时被 asap 策略淘汰，
+	// 进而造成内存文件系统中历史文件累积。
+	// 在创建新 muxer 前先清空该 streamName 的输出目录，保证占用有上界。
+	if group.hlsMuxer == nil && group.config.HlsConfig.UseMemoryAsDiskFlag {
+		outPath := hls.PathStrategy.GetMuxerOutPath(group.config.HlsConfig.OutPath, group.streamName)
+		_ = hls.RemoveAll(outPath)
+	}
+
 	group.hlsMuxer = hls.NewMuxer(group.streamName, &group.config.HlsConfig.MuxerConfig, group)
 	group.hlsMuxer.Start()
 }
