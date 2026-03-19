@@ -326,6 +326,49 @@ type UpstreamStreamSub struct {
 	CreateAt   time.Time
 }
 
+// UpstreamStatus 用于向外部查询上级平台注册/在线状态。
+// 注意：该结构仅用于状态查询的返回值，不应被外部持有后再修改。
+type UpstreamStatus struct {
+	ID string
+
+	Registered bool
+	LastOKAt   time.Time
+
+	RetryCount int
+	NextRetry  time.Time
+}
+
+// ListUpstreamStatus 返回所有上级平台的运行时状态快照。
+func (s *GB28181Server) ListUpstreamStatus() []UpstreamStatus {
+	if s == nil {
+		return nil
+	}
+
+	now := time.Now()
+	out := make([]UpstreamStatus, 0)
+	s.upstreamsMu.RLock()
+	defer s.upstreamsMu.RUnlock()
+
+	for id, up := range s.upstreams {
+		if up == nil {
+			continue
+		}
+		validSec := up.conf.RegisterValidity
+		if validSec <= 0 {
+			validSec = 3600
+		}
+		registered := !up.lastRegisterOKAt.IsZero() && now.Sub(up.lastRegisterOKAt) < time.Duration(validSec)*time.Second
+		out = append(out, UpstreamStatus{
+			ID:         id,
+			Registered: registered,
+			LastOKAt:   up.lastRegisterOKAt,
+			RetryCount: up.registerRetryCount,
+			NextRetry:  up.registerNextRetryAt,
+		})
+	}
+	return out
+}
+
 // UpstreamSession 记录一次上级点播会话的信息（仅信令侧，不含实际 RTP 转发实现）。
 type UpstreamSession struct {
 	UpstreamID string

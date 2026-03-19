@@ -428,9 +428,18 @@ func (sm *ServerManager) StatGb28181Upstreams() (ret base.ApiGb28181UpstreamList
 	ret.Desp = base.DespSucc
 
 	conf := sm.config.Gb28181Config
+
+	// 取运行时状态快照（可能为空：未启用上级模式或服务未启动）
+	statusByID := make(map[string]gb28181.UpstreamStatus)
+	if sm.gb28181Server != nil {
+		for _, st := range sm.gb28181Server.ListUpstreamStatus() {
+			statusByID[st.ID] = st
+		}
+	}
+
 	upstreams := make([]base.ApiGb28181Upstream, 0, len(conf.Upstreams))
 	for _, u := range conf.Upstreams {
-		upstreams = append(upstreams, base.ApiGb28181Upstream{
+		item := base.ApiGb28181Upstream{
 			ID:            u.ID,
 			Enable:        u.Enable,
 			SipID:         u.SipID,
@@ -439,7 +448,18 @@ func (sm *ServerManager) StatGb28181Upstreams() (ret base.ApiGb28181UpstreamList
 			SipPort:       u.SipPort,
 			LocalDeviceID: u.LocalDeviceID,
 			Comment:       u.Comment,
-		})
+		}
+		if st, ok := statusByID[u.ID]; ok {
+			item.Registered = st.Registered
+			item.RetryCount = st.RetryCount
+			if !st.LastOKAt.IsZero() {
+				item.LastOKAt = st.LastOKAt.Format(time.RFC3339Nano)
+			}
+			if !st.NextRetry.IsZero() {
+				item.NextRetryAt = st.NextRetry.Format(time.RFC3339Nano)
+			}
+		}
+		upstreams = append(upstreams, item)
 	}
 	ret.Data.Upstreams = upstreams
 	return

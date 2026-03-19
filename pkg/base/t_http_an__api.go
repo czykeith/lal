@@ -372,6 +372,12 @@ type ApiGb28181Upstream struct {
 	SipPort       int    `json:"sip_port"`        // 上级平台 SIP 端口
 	LocalDeviceID string `json:"local_device_id"` // 我方在该上级平台注册时使用的设备ID
 	Comment       string `json:"comment"`         // 备注
+
+	// 运行时状态字段（可选，合并到 /api/stat/gb28181_upstreams 返回中）
+	Registered  bool   `json:"registered,omitempty"`    // 是否注册成功（在有效期内）
+	LastOKAt    string `json:"last_ok_at,omitempty"`    // 最近一次 REGISTER 成功时间（RFC3339Nano）
+	RetryCount  int    `json:"retry_count,omitempty"`   // 失败重试次数（运行时）
+	NextRetryAt string `json:"next_retry_at,omitempty"` // 下次重试时间（RFC3339Nano）
 }
 
 type ApiGb28181UpstreamListResp struct {
