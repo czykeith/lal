@@ -81,9 +81,10 @@ type Conn struct {
 	// hevcFallbackLogAt 限制“99 payload type 但兜底为 AVC”日志刷屏。
 	hevcFallbackLogAt time.Time
 
-	// psFormatSet 记录是否已为当前连接把 streamName 的格式缓存为 PS。
-	// 避免在高帧率下对同一 streamName 反复调用 SetStreamFormat。
-	psFormatSet bool
+	// psFormatLastUpdated 记录 PS 格式缓存的最近一次刷新时间，用于避免 GetStreamFormat TTL 误清理。
+	// 避免在高帧率下对同一 streamName 反复调用 SetStreamFormat，但仍需要定期刷新 UpdatedAt，
+	// 否则 GetStreamFormat 的 TTL 可能导致“流还在却格式缓存被清理”的问题。
+	psFormatLastUpdated time.Time
 }
 
 func NewConn(conn net.Conn, observer IGbObserver, lal ILalServer) *Conn {
@@ -299,9 +300,11 @@ func (c *Conn) Serve() (err error) {
 			if acceptedAsPs {
 				if c.mediaServer != nil && c.streamName != "" {
 					// streamName->format 对上级 SDP 生成是“按需缓存”，不需要每包都覆盖 UpdatedAt。
-					if !c.psFormatSet {
+					// 但仍要定期刷新 UpdatedAt，避免 GetStreamFormat TTL 清理导致级联 INVITE SDP 生成失败。
+					// 这里以 30 秒刷新一次，平衡性能与稳定性（TTL=10min）。
+					if c.psFormatLastUpdated.IsZero() || time.Since(c.psFormatLastUpdated) > 30*time.Second {
 						c.mediaServer.SetStreamFormat(c.streamName, StreamPayloadFormatPs)
-						c.psFormatSet = true
+						c.psFormatLastUpdated = time.Now()
 					}
 					c.mediaServer.ForwardRtp(c.streamName, pkt)
 				}
