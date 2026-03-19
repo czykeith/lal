@@ -405,6 +405,13 @@ func (group *Group) pullIfNeeded() (string, error) {
 		if !group.pullProxy.isSessionPulling || group.pullProxy.pullingSessionId != uk {
 			group.mutex.Unlock()
 			// 已被取消或被新attempt覆盖，直接返回
+			// 注意：此时 session 已创建但尚未 Start/Add 进 group，需要主动 Dispose，避免 stop/start 频繁时累积对象。
+			if rtRtmpSession != nil {
+				rtRtmpSession.Dispose()
+			}
+			if rtRtspSession != nil {
+				rtRtspSession.Dispose()
+			}
 			return
 		}
 		// 真正开始Start，才计入尝试次数（用于重试上限判断）
