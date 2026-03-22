@@ -184,6 +184,25 @@ $ffplay http://127.0.0.1:8080/live/test110.ts
 
 **调优建议（系统层）：** 提高进程 **fd 上限**、合理设置 **TCP backlog / somaxconn**；单流转发仍在 `Group` 内串行，多路不同流之间方可并行扩展。
 
+### 出站握手并发（`relay_pull_concurrency`）
+
+**检查结论（logic 层「拉流」路径）：** 服务端出站拉流**只有** `pullIfNeeded` 一条实现（`start_relay_pull`、静态 `static_relay_pull`、`start_relay` 的拉流半段均走此路径），且 API 仅支持 **`rtmp://` / `rtsp://`**，不存在另一套并行的 PullSession 限额。`pkg/logic` 内亦无 HTTP-FLV 回源拉流（`httpflv.PullSession` 仅用于测试/示例程序）。
+
+为缓解大量同时 **TCP/RTMP/RTSP 握手**带来的本机临时端口、TIME_WAIT 与上游压力，使用**全局槽位**限制「正在 `Start()` 的握手」并发（握手完成后即释放槽位，不限制已建立好的总路数）。配置位于 `conf/lalserver.conf.json`：
+
+| 字段 | 说明 |
+|------|------|
+| `max_concurrent_pull_start` | 同时处于上述握手阶段的会话数上限（拉流 + 下述静态推流）；`0` 表示默认 **512**。 |
+| `max_wait_pull_start_slot_ms` | 等待槽位的最长毫秒数；`0` 表示默认 **120000**（120 秒）。 |
+
+**一并纳入同一槽位的其它出站握手：** 配置项 **`relay_push`**（静态转推地址列表）在独立 goroutine 里执行 RTMP **`PushSession::Start`**，已与回源拉流共用上述限制，避免仅限制拉流时推流侧仍瞬间打满连接。
+
+**未纳入范围（说明）：** `POST /api/ctrl/start_relay` 在 **`Group` 互斥锁持有期间同步**调用推流 `Start()`；若在此处再阻塞等待全局握手槽位，可能与拉流成功后的 `Add*PullSession`（需同一把锁）形成**锁顺序死锁**，因此该 API 的**推流半段**当前**不**使用本槽位。若需限制「API 转推」的并发建连，需单独重构推流启动时机后再评估。
+
+**其它并发（不同问题域）：** 如截图接口的 `snapshot.ffmpeg_pool_size` / `http_max_in_flight`、HTTP Notify 线程池等，与回源/转推握手无关。
+
+若机器或上游较脆弱，可将握手并发调小；若路数多且易在排队阶段超时失败，可适当调大等待时间或并发上限。
+
 ## HTTP API
 
 LAL 提供了丰富的 HTTP API 接口，用于控制和管理流媒体服务。默认 API 地址为 `http://127.0.0.1:10001`（可在配置文件中修改）。

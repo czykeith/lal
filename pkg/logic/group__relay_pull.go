@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/q191201771/lal/pkg/base"
@@ -89,15 +90,41 @@ const (
 	// Windows 上很容易出现临时端口耗尽、TIME_WAIT堆积、上游accept/backlog扛不住等问题，
 	// 表现为：大量拉流失败或拉到一半频繁中断。
 	//
-	// 通过限并发让拉流分批建立，整体成功率和稳定性会明显提升。
-	defaultMaxConcurrentPullStart = 128
-	// 获取并发slot的最长等待时间，避免大量goroutine永久阻塞在排队上（会影响停止/切流的及时性）。
-	maxWaitPullStartSlot = 15 * time.Second
+	// 通过限并发让拉流分批建立，整体成功率和稳定性会明显提升。具体上限可在配置 relay_pull_concurrency 中覆盖。
+	defaultMaxConcurrentPullStart = 512
+	// 获取并发 slot 的默认最长等待时间（毫秒），避免大量 goroutine 永久阻塞在排队上（会影响停止/切流的及时性）。
+	defaultMaxWaitPullStartSlotMs = 120000
 )
 
-var pullStartSem = make(chan struct{}, defaultMaxConcurrentPullStart)
+var (
+	pullStartSem         chan struct{}
+	maxWaitPullStartSlot time.Duration
+	initPullStartOnce    sync.Once
+)
+
+// InitRelayPullConcurrency 根据配置初始化握手阶段并发限制；应在 LoadConfAndInitLog 中调用一次。
+// maxConcurrentPullStart、maxWaitPullStartSlotMs 任一为 0 时使用 defaultMaxConcurrentPullStart / defaultMaxWaitPullStartSlotMs。
+func InitRelayPullConcurrency(maxConcurrentPullStart int, maxWaitPullStartSlotMs int) {
+	initPullStartOnce.Do(func() {
+		n := maxConcurrentPullStart
+		if n <= 0 {
+			n = defaultMaxConcurrentPullStart
+		}
+		wms := maxWaitPullStartSlotMs
+		if wms <= 0 {
+			wms = defaultMaxWaitPullStartSlotMs
+		}
+		pullStartSem = make(chan struct{}, n)
+		maxWaitPullStartSlot = time.Duration(wms) * time.Millisecond
+		Log.Infof("relay_pull_concurrency (relay pull + static relay_push handshake): max_concurrent_pull_start=%d, max_wait_pull_start_slot_ms=%d", n, wms)
+	})
+}
 
 func acquirePullStartSlot(timeout time.Duration) bool {
+	if pullStartSem == nil {
+		// 兼容性兜底：未走 LoadConfAndInitLog 的测试或异常路径
+		InitRelayPullConcurrency(0, 0)
+	}
 	if timeout <= 0 {
 		pullStartSem <- struct{}{}
 		return true

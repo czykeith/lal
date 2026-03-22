@@ -55,17 +55,18 @@ func (v *flexInt) UnmarshalJSON(data []byte) error {
 }
 
 type Config struct {
-	ConfVersion           string                `json:"conf_version"`
-	RtmpConfig            RtmpConfig            `json:"rtmp"`
-	InSessionConfig       InSessionConfig       `json:"in_session"`
-	DefaultHttpConfig     DefaultHttpConfig     `json:"default_http"`
-	HttpflvConfig         HttpflvConfig         `json:"httpflv"`
-	HlsConfig             HlsConfig             `json:"hls"`
-	HttptsConfig          HttptsConfig          `json:"httpts"`
-	RtspConfig            RtspConfig            `json:"rtsp"`
-	RecordConfig          RecordConfig          `json:"record"`
-	RelayPushConfig       RelayPushConfig       `json:"relay_push"`
-	StaticRelayPullConfig StaticRelayPullConfig `json:"static_relay_pull"`
+	ConfVersion                string                     `json:"conf_version"`
+	RtmpConfig                 RtmpConfig                 `json:"rtmp"`
+	InSessionConfig            InSessionConfig            `json:"in_session"`
+	DefaultHttpConfig          DefaultHttpConfig          `json:"default_http"`
+	HttpflvConfig              HttpflvConfig              `json:"httpflv"`
+	HlsConfig                  HlsConfig                  `json:"hls"`
+	HttptsConfig               HttptsConfig               `json:"httpts"`
+	RtspConfig                 RtspConfig                 `json:"rtsp"`
+	RecordConfig               RecordConfig               `json:"record"`
+	RelayPushConfig            RelayPushConfig            `json:"relay_push"`
+	StaticRelayPullConfig      StaticRelayPullConfig      `json:"static_relay_pull"`
+	RelayPullConcurrencyConfig RelayPullConcurrencyConfig `json:"relay_pull_concurrency"`
 
 	HttpApiConfig    HttpApiConfig    `json:"http_api"`
 	SnapshotConfig   SnapshotConfig   `json:"snapshot"`
@@ -150,6 +151,17 @@ type RelayPushConfig struct {
 type StaticRelayPullConfig struct {
 	Enable bool   `json:"enable"`
 	Addr   string `json:"addr"`
+}
+
+// RelayPullConcurrencyConfig 限制出站「握手阶段」的并发与排队等待，与 relay_pull_concurrency 配置项对应。
+// 覆盖范围：(1) 回源拉流 pullIfNeeded 中 RTMP/RTSP PullSession::Start；(2) 配置项 relay_push 触发的静态 RTMP 转推 PushSession::Start。
+// 未配置或某项为 0 时使用内置默认值（当前为 512 路并发、120s 排队超时）。
+// 注意：HTTP API start_relay 在持 Group 锁路径下同步推流 Start，为避免与拉流 Add 回调产生锁顺序死锁，该路径暂未接入本槽位（见 README）。
+type RelayPullConcurrencyConfig struct {
+	// MaxConcurrentPullStart 同时处于上述「正在 Start()」握手阶段的会话数上限；0 表示使用默认 512。
+	MaxConcurrentPullStart int `json:"max_concurrent_pull_start"`
+	// MaxWaitPullStartSlotMs 等待获取上述并发槽位的最长毫秒数；0 表示使用默认 120000（120 秒）。
+	MaxWaitPullStartSlotMs int `json:"max_wait_pull_start_slot_ms"`
 }
 
 type HttpApiConfig struct {
@@ -560,6 +572,8 @@ func LoadConfAndInitLog(rawContent []byte) *Config {
 	}
 	compactRawContent := strings.Join(tlines, " ")
 	Log.Infof("load conf succ. raw content=%s parsed=%+v", compactRawContent, config)
+
+	InitRelayPullConcurrency(config.RelayPullConcurrencyConfig.MaxConcurrentPullStart, config.RelayPullConcurrencyConfig.MaxWaitPullStartSlotMs)
 
 	return config
 }

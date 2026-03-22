@@ -97,19 +97,50 @@ func (group *Group) startPushIfNeeded() {
 
 		go func(u, u2 string) {
 			var pushSession *rtmp.PushSession
+			acquired := false
+			releaseSlotIfNeeded := func() {
+				if acquired {
+					releasePullStartSlot()
+					acquired = false
+				}
+			}
+			// 排队超时或 panic 在尚未 Add 时，需把 isPushing 复位，否则该目标 URL 永远不会再触发转推
+			clearPushingFlag := func() {
+				group.mutex.Lock()
+				if group.url2PushProxy != nil {
+					if p := group.url2PushProxy[u]; p != nil {
+						p.isPushing = false
+					}
+				}
+				group.mutex.Unlock()
+			}
 			defer func() {
 				if r := recover(); r != nil {
 					Log.Errorf("[%s] relay push goroutine panic recovered, url=%s panic=%+v", group.UniqueKey, u2, r)
 					if pushSession != nil {
 						group.DelRtmpPushSession(u, pushSession)
+					} else {
+						clearPushingFlag()
 					}
 				}
+				releaseSlotIfNeeded()
 			}()
+			// 与回源拉流共用出站握手槽位（relay_pull_concurrency），避免大量静态 relay_push 同时 TCP/RTMP 握手打满本机端口或压垮上游
+			if ok := acquirePullStartSlot(maxWaitPullStartSlot); !ok {
+				Log.Warnf("[%s] relay push: wait outbound handshake slot timeout, abort. url=%s", group.UniqueKey, u2)
+				clearPushingFlag()
+				return
+			}
+			acquired = true
+
 			pushSession = rtmp.NewPushSession(func(option *rtmp.PushSessionOption) {
 				option.PushTimeoutMs = RelayPushTimeoutMs
 				option.WriteAvTimeoutMs = RelayPushWriteAvTimeoutMs
 			})
 			err := pushSession.Start(u2)
+			// 握手阶段结束立即释放槽位（与 relay pull 一致，不占用到推流会话结束）
+			releaseSlotIfNeeded()
+
 			if err != nil {
 				Log.Errorf("[%s] relay push done. err=%v", pushSession.UniqueKey(), err)
 				// Start 失败时，确保释放底层资源，避免在目标不可达/频繁触发时累积。

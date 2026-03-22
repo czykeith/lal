@@ -1,5 +1,6 @@
 #### v0.39.0 (2026-03)
 
+- [feat] 出站握手并发：新增配置 `relay_pull_concurrency`（`max_concurrent_pull_start`、`max_wait_pull_start_slot_ms`），用于回源拉流（RTMP/RTSP `PullSession::Start`）及**静态** `relay_push`（RTMP `PushSession::Start`）的握手限流与排队超时；未配置或填 `0` 时默认 **512** / **120s**（较原拉流默认 128 / 15s 放宽）。`start_relay` API 推流半段因持锁同步 Start 暂未共用该槽位（见 README）
 - [feat] HLS：新增配置项 `hls.max_fragment_duration_ms`（`0` 表示 `2×fragment_duration_ms`，无效时内部按 3000ms 推算双倍），超过软上限后在**下一关键帧边界**再切（有视频轨）或**下一音频 boundary** 再切（纯音频阶段），并可在 m3u8 中插入 `#EXT-X-DISCONTINUITY`，抑制 GOP 过长时单 TS 无限膨胀
 - [opt] HLS：切片时长估计统一用分片内最大时间戳（`fragLastTs`）校准 **EXTINF**；`fragment_duration_ms≤0` 时保持「主要按 boundary 切分」语义；时间戳强制切分仅在时间轴驱动帧上判定（有视频后主要为视频帧）；兼顾纯视频 / 纯音频 / 音视频
 - [opt] logic：收流相关回调不再与每秒 Tick、`StatAllGroup` 缓存共用 `ServerManager.mutex`，统计缓存改用独立 `statMu`，提升多路收流并发与稳定性

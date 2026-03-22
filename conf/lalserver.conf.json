@@ -80,6 +80,11 @@
     "enable": false,
     "addr": ""
   },
+  "# relay_pull_concurrency": "回源拉流 RTMP/RTSP 与静态 relay_push 的 RTMP 握手共用此并发/排队；start_relay API 推流段除外，详见 README",
+  "relay_pull_concurrency": {
+    "max_concurrent_pull_start": 512,
+    "max_wait_pull_start_slot_ms": 120000
+  },
   "http_api": {
     "enable": true,
     "addr": ":10001"
