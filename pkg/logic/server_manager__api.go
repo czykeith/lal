@@ -40,10 +40,17 @@ func (sm *ServerManager) StatLalInfo() base.LalInfo {
 }
 
 func (sm *ServerManager) StatAllGroup() (sgs []base.StatGroup) {
-	sm.mutex.Lock()
-	defer sm.mutex.Unlock()
+	sm.statMu.RLock()
+	if sm.lastStatAllGroup != nil {
+		sgs = make([]base.StatGroup, len(sm.lastStatAllGroup))
+		copy(sgs, sm.lastStatAllGroup)
+		sm.statMu.RUnlock()
+		return
+	}
+	sm.statMu.RUnlock()
 
-	// 如果已有缓存，直接返回一份拷贝，避免修改底层切片。
+	sm.statMu.Lock()
+	defer sm.statMu.Unlock()
 	if sm.lastStatAllGroup != nil {
 		sgs = make([]base.StatGroup, len(sm.lastStatAllGroup))
 		copy(sgs, sm.lastStatAllGroup)
@@ -62,8 +69,6 @@ func (sm *ServerManager) StatAllGroup() (sgs []base.StatGroup) {
 }
 
 func (sm *ServerManager) StatGroup(streamName string) *base.StatGroup {
-	sm.mutex.Lock()
-	defer sm.mutex.Unlock()
 	g := sm.getGroup("", streamName)
 	if g == nil {
 		return nil

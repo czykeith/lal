@@ -172,6 +172,18 @@ $ffplay http://127.0.0.1:8080/live/test110.ts
 
 **补充：** 输入时间戳大幅跳跃或异常回绕时，仍会**立即**强制切段并标记不连续（与上游 `remux` 的 `boundary` 无关）；`max_fragment_duration_ms` 解决的是「长时间无合适边界」导致的单段过长，二者互补。支持**纯视频 / 纯音频 / 音视频**；纯视频时边界通常由上游在关键帧置位。
 
+### 收流并发与稳定性（logic / ServerManager）
+
+高并发收流时，原先 **RTMP/RTSP/HTTP-FLV/HTTP-TS/HLS** 等会话回调与 **每秒全表 Tick**（遍历 Group、刷新统计）共用 **`ServerManager` 同一把全局互斥锁**，容易在路数较多时相互阻塞，表现为建连/握手排队、并发上限偏低。
+
+当前实现要点：
+
+- **收流相关 observer 回调**（如 `OnNewRtmpPubSession`、`OnDelRtspPubSession`、各协议 Sub 增删等）**不再**在回调路径上持有该全局锁；**Group 注册**仍由 `SimpleGroupManager`、**单路转发**仍由各 `Group` 内部锁保证线程安全。
+- **定时 Tick** 与 **`/api/stat/all_group` 所用 `StatAllGroup` 缓存**改用独立的 **`statMu`（读写锁）** 仅保护 `lastStatAllGroup`，避免统计读写与海量收流抢同一把锁。
+- **HTTP Notify** 侧用于执行 `OnPubStart` / `OnSubStart` 等回调的 **taskpool** 由单 worker 调整为 **多 worker（默认可扩至 32）**，减轻高并发建连时通知排队。
+
+**调优建议（系统层）：** 提高进程 **fd 上限**、合理设置 **TCP backlog / somaxconn**；单流转发仍在 `Group` 内串行，多路不同流之间方可并行扩展。
+
 ## HTTP API
 
 LAL 提供了丰富的 HTTP API 接口，用于控制和管理流媒体服务。默认 API 地址为 `http://127.0.0.1:10001`（可在配置文件中修改）。

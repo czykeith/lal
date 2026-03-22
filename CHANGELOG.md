@@ -1,5 +1,10 @@
 #### v0.39.0 (2026-03)
 
+- [feat] HLS：新增配置项 `hls.max_fragment_duration_ms`（`0` 表示 `2×fragment_duration_ms`，无效时内部按 3000ms 推算双倍），超过软上限后在**下一关键帧边界**再切（有视频轨）或**下一音频 boundary** 再切（纯音频阶段），并可在 m3u8 中插入 `#EXT-X-DISCONTINUITY`，抑制 GOP 过长时单 TS 无限膨胀
+- [opt] HLS：切片时长估计统一用分片内最大时间戳（`fragLastTs`）校准 **EXTINF**；`fragment_duration_ms≤0` 时保持「主要按 boundary 切分」语义；时间戳强制切分仅在时间轴驱动帧上判定（有视频后主要为视频帧）；兼顾纯视频 / 纯音频 / 音视频
+- [opt] logic：收流相关回调不再与每秒 Tick、`StatAllGroup` 缓存共用 `ServerManager.mutex`，统计缓存改用独立 `statMu`，提升多路收流并发与稳定性
+- [opt] Notify：HTTP Notify 执行池由单 worker 调整为多 worker（默认可扩至 32），缓解高并发建连时通知滞后
+- [doc] README：补充 HLS 字段说明（含 `max_fragment_duration_ms`）及收流并发/锁设计说明；`lalserver.conf.json` 示例增加 `max_fragment_duration_ms`
 - [feat] GB28181 中间平台：支持作为“虚拟设备”向多个上级 GB28181 平台注册、心跳保活与级联转推，实现下级设备/本地流统一汇聚后再上报
 - [feat] GB28181 上级订阅：引入独立的上级配置文件 `gb28181_upstreams.json`，支持配置多上级平台账号信息及其订阅的本地流（`upstream_id + stream_name + channel_id` 唯一）
 - [feat] GB28181 上级管理 API：新增 `/api/stat/gb28181_upstreams`、`/api/stat/gb28181_upstream_subs`、`/api/ctrl/gb28181_upstream_sub_add`、`/api/ctrl/gb28181_upstream_sub_del` 等接口，用于运行时管理上级平台与订阅列表

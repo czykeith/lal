@@ -57,7 +57,10 @@ type ServerManager struct {
 	gb28181Server *gb28181.GB28181Server
 	exitChan      chan struct{}
 
-	mutex         sync.Mutex
+	// mutex：HTTP API 控制类、Dispose 等与收流无关的全局临界区（避免与收流抢同一把锁）
+	mutex sync.Mutex
+	// statMu：仅保护 lastStatAllGroup 缓存；收流路径不再碰 mutex，提升并发路数与稳定性
+	statMu        sync.RWMutex
 	groupManager  IGroupManager
 	snapshotStore *SnapshotStore
 	// 缓存最近一次 StatAllGroup 的结果，避免高频 HTTP 调用时重复遍历所有 Group 计算统计。
@@ -427,7 +430,8 @@ func (sm *ServerManager) RunLoop() error {
 		case <-t.C:
 			tickCount++
 
-			sm.mutex.Lock()
+			// 不在此处持有 sm.mutex：避免每秒全表遍历与上千路收流回调互斥，显著抬高收流并发上限。
+			// groupManager.Iterate / Len 内部自带互斥。
 
 			// 关闭空闲的group
 			sm.groupManager.Iterate(func(group *Group) bool {
@@ -447,8 +451,11 @@ func (sm *ServerManager) RunLoop() error {
 				sgs = append(sgs, group.GetStat(math.MaxInt32))
 				return true
 			})
-			sm.lastStatAllGroup = sgs
+			sm.statMu.Lock()
+			sm.lastStatAllGroup = make([]base.StatGroup, len(sgs))
+			copy(sm.lastStatAllGroup, sgs)
 			sm.lastStatAllGroupAt = time.Now()
+			sm.statMu.Unlock()
 
 			// 周期性清理截图缓存中长期不再更新的 streamName，防止长时间运行时 map 无限增长。
 			// 这对 memory-as-disk 场景也有帮助：避免业务侧不断出现新 streamName 时 heap 线性上涨。
@@ -472,8 +479,6 @@ func (sm *ServerManager) RunLoop() error {
 					})
 				}
 			}
-
-			sm.mutex.Unlock()
 
 			// 定时通过http notify发送group相关的信息
 			if uis != 0 && (tickCount%uis) == 0 {
@@ -553,10 +558,7 @@ func (sm *ServerManager) Dispose() {
 	//	sm.hlsServer.Dispose()
 	//}
 
-	// 清理所有 group，使用 defer 确保 mutex 解锁
-	sm.mutex.Lock()
-	defer sm.mutex.Unlock()
-
+	// groupManager.Iterate 内部持锁，与 Tick 中遍历互斥，无需再套 sm.mutex（避免与收流路径历史耦合）
 	sm.groupManager.Iterate(func(group *Group) bool {
 		if group != nil {
 			group.Dispose()
@@ -579,15 +581,11 @@ func (sm *ServerManager) Dispose() {
 // ---------------------------------------------------------------------------------------------------------------------
 
 func (sm *ServerManager) AddCustomizePubSession(streamName string) (ICustomizePubSessionContext, error) {
-	sm.mutex.Lock()
-	defer sm.mutex.Unlock()
 	group := sm.getOrCreateGroup("", streamName)
 	return group.AddCustomizePubSession(streamName)
 }
 
 func (sm *ServerManager) DelCustomizePubSession(sessionCtx ICustomizePubSessionContext) {
-	sm.mutex.Lock()
-	defer sm.mutex.Unlock()
 	group := sm.getGroup("", sessionCtx.StreamName())
 	if group == nil {
 		return
@@ -764,9 +762,6 @@ func (sm *ServerManager) WithOnHookSession(onHookSession func(uniqueKey string, 
 // ----- implement rtmp.IServerObserver interface -----------------------------------------------------------------------
 
 func (sm *ServerManager) OnRtmpConnect(session *rtmp.ServerSession, opa rtmp.ObjectPairArray) {
-	sm.mutex.Lock()
-	defer sm.mutex.Unlock()
-
 	var info base.RtmpConnectInfo
 	info.SessionId = session.UniqueKey()
 	info.RemoteAddr = session.GetStat().RemoteAddr
@@ -777,9 +772,6 @@ func (sm *ServerManager) OnRtmpConnect(session *rtmp.ServerSession, opa rtmp.Obj
 }
 
 func (sm *ServerManager) OnNewRtmpPubSession(session *rtmp.ServerSession) error {
-	sm.mutex.Lock()
-	defer sm.mutex.Unlock()
-
 	info := base.Session2PubStartInfo(session)
 
 	// 先做simple auth鉴权
@@ -800,9 +792,6 @@ func (sm *ServerManager) OnNewRtmpPubSession(session *rtmp.ServerSession) error 
 }
 
 func (sm *ServerManager) OnDelRtmpPubSession(session *rtmp.ServerSession) {
-	sm.mutex.Lock()
-	defer sm.mutex.Unlock()
-
 	group := sm.getGroup(session.AppName(), session.StreamName())
 	if group == nil {
 		return
@@ -817,9 +806,6 @@ func (sm *ServerManager) OnDelRtmpPubSession(session *rtmp.ServerSession) {
 }
 
 func (sm *ServerManager) OnNewRtmpSubSession(session *rtmp.ServerSession) error {
-	sm.mutex.Lock()
-	defer sm.mutex.Unlock()
-
 	info := base.Session2SubStartInfo(session)
 
 	if err := sm.option.Authentication.OnSubStart(info); err != nil {
@@ -837,9 +823,6 @@ func (sm *ServerManager) OnNewRtmpSubSession(session *rtmp.ServerSession) error 
 }
 
 func (sm *ServerManager) OnDelRtmpSubSession(session *rtmp.ServerSession) {
-	sm.mutex.Lock()
-	defer sm.mutex.Unlock()
-
 	group := sm.getGroup(session.AppName(), session.StreamName())
 	if group == nil {
 		return
@@ -856,9 +839,6 @@ func (sm *ServerManager) OnDelRtmpSubSession(session *rtmp.ServerSession) {
 // ----- implement IHttpServerHandlerObserver interface -----------------------------------------------------------------
 
 func (sm *ServerManager) OnNewHttpflvSubSession(session *httpflv.SubSession) error {
-	sm.mutex.Lock()
-	defer sm.mutex.Unlock()
-
 	info := base.Session2SubStartInfo(session)
 
 	if err := sm.option.Authentication.OnSubStart(info); err != nil {
@@ -876,9 +856,6 @@ func (sm *ServerManager) OnNewHttpflvSubSession(session *httpflv.SubSession) err
 }
 
 func (sm *ServerManager) OnDelHttpflvSubSession(session *httpflv.SubSession) {
-	sm.mutex.Lock()
-	defer sm.mutex.Unlock()
-
 	group := sm.getGroup(session.AppName(), session.StreamName())
 	if group == nil {
 		return
@@ -893,9 +870,6 @@ func (sm *ServerManager) OnDelHttpflvSubSession(session *httpflv.SubSession) {
 }
 
 func (sm *ServerManager) OnNewHttptsSubSession(session *httpts.SubSession) error {
-	sm.mutex.Lock()
-	defer sm.mutex.Unlock()
-
 	info := base.Session2SubStartInfo(session)
 
 	if err := sm.option.Authentication.OnSubStart(info); err != nil {
@@ -914,9 +888,6 @@ func (sm *ServerManager) OnNewHttptsSubSession(session *httpts.SubSession) error
 }
 
 func (sm *ServerManager) OnDelHttptsSubSession(session *httpts.SubSession) {
-	sm.mutex.Lock()
-	defer sm.mutex.Unlock()
-
 	group := sm.getGroup(session.AppName(), session.StreamName())
 	if group == nil {
 		return
@@ -941,9 +912,6 @@ func (sm *ServerManager) OnDelRtspSession(session *rtsp.ServerCommandSession) {
 }
 
 func (sm *ServerManager) OnNewRtspPubSession(session *rtsp.PubSession) error {
-	sm.mutex.Lock()
-	defer sm.mutex.Unlock()
-
 	info := base.Session2PubStartInfo(session)
 
 	if err := sm.option.Authentication.OnPubStart(info); err != nil {
@@ -963,8 +931,6 @@ func (sm *ServerManager) OnNewRtspPubSession(session *rtsp.PubSession) error {
 }
 
 func (sm *ServerManager) OnDelRtspPubSession(session *rtsp.PubSession) {
-	sm.mutex.Lock()
-	defer sm.mutex.Unlock()
 	group := sm.getGroup(session.AppName(), session.StreamName())
 	if group == nil {
 		return
@@ -979,9 +945,6 @@ func (sm *ServerManager) OnDelRtspPubSession(session *rtsp.PubSession) {
 }
 
 func (sm *ServerManager) OnNewRtspSubSessionDescribe(session *rtsp.SubSession) (ok bool, sdp []byte) {
-	sm.mutex.Lock()
-	defer sm.mutex.Unlock()
-
 	info := base.Session2SubStartInfo(session)
 
 	if err := sm.option.Authentication.OnSubStart(info); err != nil {
@@ -1002,17 +965,12 @@ func (sm *ServerManager) OnNewRtspSubSessionDescribe(session *rtsp.SubSession) (
 }
 
 func (sm *ServerManager) OnNewRtspSubSessionPlay(session *rtsp.SubSession) error {
-	sm.mutex.Lock()
-	defer sm.mutex.Unlock()
-
 	group := sm.getOrCreateGroup(session.AppName(), session.StreamName())
 	group.HandleNewRtspSubSessionPlay(session)
 	return nil
 }
 
 func (sm *ServerManager) OnDelRtspSubSession(session *rtsp.SubSession) {
-	sm.mutex.Lock()
-	defer sm.mutex.Unlock()
 	group := sm.getGroup(session.AppName(), session.StreamName())
 	if group == nil {
 		return
@@ -1027,9 +985,6 @@ func (sm *ServerManager) OnDelRtspSubSession(session *rtsp.SubSession) {
 }
 
 func (sm *ServerManager) OnNewHlsSubSession(session *hls.SubSession) error {
-	sm.mutex.Lock()
-	defer sm.mutex.Unlock()
-
 	info := base.Session2SubStartInfo(session)
 
 	if err := sm.option.Authentication.OnSubStart(info); err != nil {
@@ -1048,9 +1003,6 @@ func (sm *ServerManager) OnNewHlsSubSession(session *hls.SubSession) error {
 }
 
 func (sm *ServerManager) OnDelHlsSubSession(session *hls.SubSession) {
-	sm.mutex.Lock()
-	defer sm.mutex.Unlock()
-
 	group := sm.getGroup(session.AppName(), session.StreamName())
 	if group == nil {
 		return
@@ -1163,8 +1115,6 @@ func (sm *ServerManager) GetSnapshotJpeg(streamName string) ([]byte, error) {
 }
 
 func (sm *ServerManager) GetGroup(appName string, streamName string) *Group {
-	sm.mutex.Lock()
-	defer sm.mutex.Unlock()
 	return sm.getGroup(appName, streamName)
 }
 

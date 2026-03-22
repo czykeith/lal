@@ -29,9 +29,10 @@ func (sm *ServerManager) nhInitNotifyHandler() {
 		sm.option.NotifyHandler = NewHttpNotify(sm.config.HttpNotifyConfig, sm.config.ServerId)
 	}
 
+	// 多 worker：高并发收流时 OnPubStart/OnSubStart 等通知密集入队，单 worker 会造成通知滞后甚至间接影响业务观感
 	sm.notifyHandlerThread, _ = taskpool.NewPool(func(option *taskpool.Option) {
-		option.InitWorkerNum = 1
-		option.MaxWorkerNum = 1
+		option.InitWorkerNum = 4
+		option.MaxWorkerNum = 32
 	})
 }
 
