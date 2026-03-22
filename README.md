@@ -125,6 +125,53 @@ $ffplay http://127.0.0.1:8080/hls/test110.m3u8
 $ffplay http://127.0.0.1:8080/live/test110.ts
 ```
 
+### HLS 配置说明（`hls`）
+
+主配置文件：`conf/lalserver.conf.json` 中的 `hls` 对象（HTTP/HTTPS 监听等可与 `default_http` 合并，详见加载逻辑）。完整字段亦可对照 [ConfigBrief / LALServer](https://pengrl.com/lal/#/ConfigBrief)。
+
+#### 示例片段
+
+```json
+"hls": {
+  "enable": true,
+  "enable_https": true,
+  "http_listen_addr": ":8080",
+  "https_listen_addr": ":4433",
+  "https_cert_file": "./conf/cert.pem",
+  "https_key_file": "./conf/key.pem",
+  "url_pattern": "/hls/",
+  "out_path": "./lal_record/hls/",
+  "fragment_duration_ms": 3000,
+  "max_fragment_duration_ms": 0,
+  "fragment_num": 6,
+  "delete_threshold": 6,
+  "cleanup_mode": 2,
+  "use_memory_as_disk_flag": false,
+  "sub_session_timeout_ms": 30000,
+  "sub_session_hash_key": ""
+}
+```
+
+#### 字段说明
+
+| 字段 | 说明 |
+|------|------|
+| `enable` / `enable_https` | 是否启用 HTTP / HTTPS 上的 HLS。 |
+| `http_listen_addr` / `https_listen_addr` | HTTP(S) 监听地址；未单独配置时可继承 `default_http`。 |
+| `https_cert_file` / `https_key_file` | HTTPS 证书与私钥路径。 |
+| `url_pattern` | HLS URL 路径前缀，例如 `/hls/`。 |
+| `out_path` | TS、m3u8 输出根目录。 |
+| `fragment_duration_ms` | **目标分片时长（毫秒）**。在已达到该时长且上游给出**切片边界**（通常为视频关键帧，`boundary=true`）时切换到下一个 TS。设为 **`0` 或 ≤0** 时：不按「目标时长」阻塞，主要随 `boundary` 切分（便于 GOP 对齐、首屏更快）；建议仍与推流 GOP 合理搭配。 |
+| `max_fragment_duration_ms` | **单段 TS 时长软上限（毫秒）**，用于避免 GOP 过长或边界稀疏时单文件无限增大。**`0`**：使用 `2 × fragment_duration_ms`；若 `fragment_duration_ms` 也未有效设置，内部按 3000ms 推算双倍作为默认上限。超过上界后**不会**在非边界处硬切：已有视频轨时在**下一视频关键帧边界**再切（可能带 `#EXT-X-DISCONTINUITY`）；尚无视频（纯音频阶段）时在**下一音频 boundary** 再切。若需弱化该行为，可设为较大值（如 `3600000`）。 |
+| `fragment_num` | 直播 `playlist.m3u8` 中保留的 TS 条数。 |
+| `delete_threshold` | 列表滑出后，磁盘上额外保留的过期 TS 数量（与内部环形队列策略相关）。 |
+| `cleanup_mode` | `0` 不清理、`1` 结束时清理、`2` 尽快删除（直播常用 `2`）。 |
+| `use_memory_as_disk_flag` | 使用内存模拟磁盘写切片（减磁盘 I/O）；与 `cleanup_mode`、会话拉流等组合时参见代码与官方文档。 |
+| `sub_session_timeout_ms` | 带 `session` 的 HLS 子会话超时（毫秒）。 |
+| `sub_session_hash_key` | 子会话 id 哈希盐；非空时建议同时配置合理的超时。 |
+
+**补充：** 输入时间戳大幅跳跃或异常回绕时，仍会**立即**强制切段并标记不连续（与上游 `remux` 的 `boundary` 无关）；`max_fragment_duration_ms` 解决的是「长时间无合适边界」导致的单段过长，二者互补。支持**纯视频 / 纯音频 / 音视频**；纯视频时边界通常由上游在关键帧置位。
+
 ## HTTP API
 
 LAL 提供了丰富的 HTTP API 接口，用于控制和管理流媒体服务。默认 API 地址为 `http://127.0.0.1:10001`（可在配置文件中修改）。

@@ -40,6 +40,11 @@ type MuxerConfig struct {
 	FragmentNum        int    `json:"fragment_num"`
 	DeleteThreshold    int    `json:"delete_threshold"`
 	CleanupMode        int    `json:"cleanup_mode"` // TODO chef: lalserver的模式1的逻辑是在上层做的，应该重构到hls模块中
+
+	// MaxFragmentDurationMs 单个 TS 在 m3u8 中允许的最大时长（毫秒）上界，用于避免长期无关键帧 boundary 时单文件无限增长。
+	// 0 表示取 2 * fragment_duration_ms（若 fragment_duration_ms 无效则按 3000ms 推算双倍）。
+	// 达到该上界后不会立即在非关键帧切开，而是标记在下一视频关键帧 boundary 再切，并带 #EXT-X-DISCONTINUITY。
+	MaxFragmentDurationMs int `json:"max_fragment_duration_ms"`
 }
 
 const (
@@ -81,6 +86,15 @@ type Muxer struct {
 	frags  []fragmentInfo // frags TS文件的固定大小环形队列，记录TS的信息
 
 	patpmt []byte
+
+	// 是否已收到过视频轨（用于切片时间轴：有视频后仅按视频时间戳推进切片决策，避免与音频 PTS 混用导致抖动）
+	videoSeen bool
+	// 当前分片内观察到的最大时间戳（90kHz），用于 close 时校准 EXTINF
+	fragLastTs uint64
+	// 分片已超过 MaxFragmentDurationMs 上界，等待下一关键帧 boundary 再切（有视频时）
+	forceCutOnNextKey bool
+	// 纯音频时尚无视频轨，超长分片在下一 audio boundary 再切（不等视频关键帧）
+	forceCutOnNextAudioBoundary bool
 }
 
 // 记录fragment的一些信息，注意，写m3u8文件时可能还需要用到历史fragment的信息
@@ -150,28 +164,26 @@ func (m *Muxer) FeedPatPmt(b []byte) {
 
 func (m *Muxer) FeedMpegts(tsPackets []byte, frame *mpegts.Frame, boundary bool) {
 	//Log.Debugf("> FeedMpegts. boundary=%v, frame=%p, sid=%d", boundary, frame, frame.Sid)
+	// 支持：纯视频、纯音频、音视频。纯视频时仅有 StreamIdVideo 帧，boundary 通常由 remux 在关键帧上置位。
+	if frame.Sid == mpegts.StreamIdVideo {
+		m.videoSeen = true
+	}
+	clockTs := m.fragmentClockTs(frame)
+	if err := m.updateFragment(clockTs, boundary, frame); err != nil {
+		Log.Errorf("[%s] update fragment error. err=%+v", m.UniqueKey, err)
+		return
+	}
 	if frame.Sid == mpegts.StreamIdAudio {
-		// TODO(chef): 为什么音频用pts，视频用dts
-		if err := m.updateFragment(frame.Pts, boundary, frame); err != nil {
-			Log.Errorf("[%s] update fragment error. err=%+v", m.UniqueKey, err)
-			return
-		}
 		if !m.opened {
 			Log.Warnf("[%s] FeedMpegts A not opened. boundary=%t", m.UniqueKey, boundary)
 			return
 		}
-		//Log.Debugf("[%s] WriteFrame A. dts=%d, len=%d", m.UniqueKey, frame.DTS, len(frame.Raw))
 	} else {
-		if err := m.updateFragment(frame.Dts, boundary, frame); err != nil {
-			Log.Errorf("[%s] update fragment error. err=%+v", m.UniqueKey, err)
-			return
-		}
 		if !m.opened {
 			// 走到这，可能是第一个包并且boundary为false
 			Log.Warnf("[%s] FeedMpegts V not opened. boundary=%t, key=%t", m.UniqueKey, boundary, frame.Key)
 			return
 		}
-		//Log.Debugf("[%s] WriteFrame V. dts=%d, len=%d", m.UniqueKey, frame.Dts, len(frame.Raw))
 	}
 
 	if err := m.fragment.WriteFile(tsPackets); err != nil {
@@ -198,65 +210,159 @@ func (m *Muxer) OutPath() string {
 func (m *Muxer) updateFragment(ts uint64, boundary bool, frame *mpegts.Frame) error {
 	discont := true
 
-	// 如果已经有TS切片，检查是否需要强制开启新的切片，以及切片是否发生跳跃
-	// 注意，音频和视频是在一起检查的
 	if m.opened {
 		f := m.getCurrFrag()
+		discont = false
 
-		// 以下情况，强制开启新的分片：
-		// 1. 当前时间戳 - 当前分片的初始时间戳 > 配置中单个ts分片时长的10倍
-		//    原因可能是：
-		//        1. 当前包的时间戳发生了大的跳跃
-		//        2. 一直没有I帧导致没有合适的时间重新切片，堆积的包达到阈值
-		// 2. 往回跳跃超过了阈值
-		//
-		maxfraglen := uint64(m.config.FragmentDurationMs * 90 * 10)
-		if (ts > m.fragTs && ts-m.fragTs > maxfraglen) || (m.fragTs > ts && m.fragTs-ts > negMaxfraglen) {
-			Log.Warnf("[%s] force fragment split. fragTs=%d, ts=%d, frame=%s", m.UniqueKey, m.fragTs, ts, frame.DebugString())
+		// 先推进「分片内最大时间戳」，再用 (fragLastTs-fragTs) 更新时长估计。
+		// 音视频都贡献 fragLastTs，避免「先音频开片、视频 DTS 仍小于 fragTs」时 f.duration 卡住，
+		// 导致首段/后续段迟迟达不到 fragment_duration、影响秒开与 m3u8 更新节奏。
+		m.updateFragLastTs(ts)
+		if m.fragLastTs > m.fragTs {
+			span := float64(m.fragLastTs-m.fragTs) / 90000
+			if span > f.duration {
+				f.duration = span
+			}
+		}
 
+		// 时间戳异常强制切：仅在 drivesFragmentTimeline 帧上判断（纯视频时帧帧均为视频，等价全程检测；纯音频阶段用音频帧）
+		if m.drivesFragmentTimeline(frame) {
+			if m.shouldForceSplitByTimestamp(ts) {
+				Log.Warnf("[%s] force fragment split. fragTs=%d, ts=%d, frame=%s", m.UniqueKey, m.fragTs, ts, frame.DebugString())
+				m.forceCutOnNextKey = false
+				m.forceCutOnNextAudioBoundary = false
+				if err := m.closeFragment(false); err != nil {
+					return err
+				}
+				if err := m.openFragment(ts, true); err != nil {
+					return err
+				}
+				m.updateFragLastTs(ts)
+				return nil
+			}
+		}
+
+		// 超过单段时长上界：有视频时等下一「关键帧 boundary」再切（纯视频流即下一 Key）；无视频（纯音频）时不能等关键帧，改由下一 audio boundary 直接切。
+		if f.duration >= m.maxFragmentDurationSec() {
+			if m.videoSeen {
+				m.forceCutOnNextKey = true
+			} else {
+				m.forceCutOnNextAudioBoundary = true
+			}
+		}
+
+		// 未达到目标分片时长则不在此处切分，除非已排队「下一关键帧强制切」或「纯音频下一 boundary 强制切」
+		if f.duration < m.fragmentTargetSec() {
+			if !(boundary && (m.forceCutOnNextKey || m.forceCutOnNextAudioBoundary)) {
+				return nil
+			}
+		}
+	}
+
+	if boundary {
+		needCut := false
+		discontNext := true
+		if m.opened {
+			f := m.getCurrFrag()
+			discontNext = discont
+			if m.forceCutOnNextKey {
+				needCut = true
+				discontNext = true
+				m.forceCutOnNextKey = false
+			} else if m.forceCutOnNextAudioBoundary {
+				needCut = true
+				discontNext = true
+				m.forceCutOnNextAudioBoundary = false
+			} else if f.duration >= m.fragmentTargetSec() {
+				needCut = true
+			}
+		} else {
+			needCut = true
+			discontNext = true
+		}
+
+		if needCut {
 			if err := m.closeFragment(false); err != nil {
 				return err
 			}
-			if err := m.openFragment(ts, true); err != nil {
+			if err := m.openFragment(ts, discontNext); err != nil {
 				return err
 			}
 		}
-
-		// 更新当前分片的时间长度
-		//
-		// TODO chef:
-		// f.duration（也即写入m3u8中记录分片时间长度）的做法我觉得有问题
-		// 此处用最新收到的数据更新f.duration
-		// 但是假设fragment翻滚，数据可能是写入下一个分片中
-		// 是否就导致了f.duration和实际分片时间长度不一致
-		if ts > m.fragTs {
-			duration := float64(ts-m.fragTs) / 90000
-			if duration > f.duration {
-				f.duration = duration
-			}
-		}
-		discont = false
-
-		// 已经有TS切片，切片时长没有达到设置的阈值，则不开启新的切片
-		if f.duration < float64(m.config.FragmentDurationMs)/1000 {
-			return nil
-		}
 	}
 
-	// 开启新的fragment
-	// 此时的情况是，上层认为是合适的开启分片的时机（比如是I帧），并且
-	// 1. 当前是第一个分片
-	// 2. 当前不是第一个分片，但是上一个分片已经达到配置时长
-	if boundary {
-		if err := m.closeFragment(false); err != nil {
-			return err
-		}
-		if err := m.openFragment(ts, discont); err != nil {
-			return err
-		}
-	}
-
+	m.updateFragLastTs(ts)
 	return nil
+}
+
+// fragmentClockTs 用于 HLS 切片决策的时间戳（90kHz）：视频用 DTS（与送入顺序单调一致）；纯视频时仅有视频帧。音频用 PTS。
+func (m *Muxer) fragmentClockTs(frame *mpegts.Frame) uint64 {
+	if frame.Sid == mpegts.StreamIdAudio {
+		return frame.Pts
+	}
+	return frame.Dts
+}
+
+// drivesFragmentTimeline 为 true 时，本帧参与「时间戳强制切」判断：纯视频时恒为视频帧；有音频且已有视频后仅视频帧；纯音频阶段为音频帧。
+func (m *Muxer) drivesFragmentTimeline(frame *mpegts.Frame) bool {
+	if frame.Sid == mpegts.StreamIdVideo {
+		return true
+	}
+	return !m.videoSeen
+}
+
+// safetyFragmentDurationMs 仅用于时间戳强制切分倍率、max 片长默认值；避免 fragment_duration_ms==0 时乘数为 0。
+// 与 fragmentTargetSec 解耦：配置为 0 时仍保持原版「仅靠 boundary 切分、不按目标时长阻塞」的语义，利于秒开/GOP 对齐。
+func (m *Muxer) safetyFragmentDurationMs() int {
+	if m.config.FragmentDurationMs <= 0 {
+		return 3000
+	}
+	return m.config.FragmentDurationMs
+}
+
+func (m *Muxer) fragmentTargetSec() float64 {
+	if m.config.FragmentDurationMs <= 0 {
+		return 0
+	}
+	return float64(m.config.FragmentDurationMs) / 1000
+}
+
+func (m *Muxer) maxFragmentDurationSec() float64 {
+	maxMs := m.config.MaxFragmentDurationMs
+	if maxMs <= 0 {
+		if m.config.FragmentDurationMs <= 0 {
+			maxMs = m.safetyFragmentDurationMs() * 2
+		} else {
+			maxMs = m.config.FragmentDurationMs * 2
+		}
+	}
+	return float64(maxMs) / 1000
+}
+
+func (m *Muxer) shouldForceSplitByTimestamp(ts uint64) bool {
+	fdMs := m.safetyFragmentDurationMs()
+	maxfraglen := uint64(fdMs * 90 * 10)
+	return (ts > m.fragTs && ts-m.fragTs > maxfraglen) || (m.fragTs > ts && m.fragTs-ts > negMaxfraglen)
+}
+
+func (m *Muxer) updateFragLastTs(ts uint64) {
+	if !m.opened {
+		return
+	}
+	if ts > m.fragLastTs {
+		m.fragLastTs = ts
+	}
+}
+
+// finalizeClosingFragmentDuration 在关闭文件前用整段内最大时间戳校准 EXTINF，减轻与真实媒体跨度不一致的问题
+func (m *Muxer) finalizeClosingFragmentDuration() {
+	f := m.getCurrFrag()
+	if m.fragLastTs > m.fragTs {
+		d := float64(m.fragLastTs-m.fragTs) / 90000
+		if d > f.duration {
+			f.duration = d
+		}
+	}
 }
 
 // openFragment
@@ -291,6 +397,7 @@ func (m *Muxer) openFragment(ts uint64, discont bool) error {
 	frag.duration = 0
 
 	m.fragTs = ts
+	m.fragLastTs = ts
 
 	if m.observer == nil {
 		return nil
@@ -321,6 +428,8 @@ func (m *Muxer) closeFragment(isLast bool) error {
 		// 注意，首次调用closeFragment时，有可能opened为false
 		return nil
 	}
+
+	m.finalizeClosingFragmentDuration()
 
 	if err := m.fragment.CloseFile(); err != nil {
 		return err
@@ -416,7 +525,7 @@ func (m *Muxer) writeRecordPlaylist() {
 
 func (m *Muxer) writePlaylist(isLast bool) {
 	// 找出时长最长的fragment
-	maxFrag := float64(m.config.FragmentDurationMs) / 1000
+	maxFrag := m.fragmentTargetSec()
 	m.iterateFragsInPlaylist(func(frag *fragmentInfo) {
 		if frag.duration > maxFrag {
 			maxFrag = frag.duration + 0.5
